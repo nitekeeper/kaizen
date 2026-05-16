@@ -1,0 +1,8 @@
+{
+  "name": "kaizen",
+  "version": "0.1.0",
+  "description": "Multi-agent improvement plugin — runs Atelier's methodology against any git repository by URL",
+  "author": {
+    "name": "nitekeeper"
+  }
+}

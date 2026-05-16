@@ -1,8 +1,39 @@
+# Plugin-internal state
 .ai/memex.db
 .ai/memex.db-shm
 .ai/memex.db-wal
 experiment/
+
+# Python
 __pycache__/
 *.pyc
 .pytest_cache/
+
+# Worktrees
 .worktrees/
+
+# Editors / IDEs
+.idea/                 # JetBrains (PhpStorm, WebStorm, IntelliJ, PyCharm, GoLand, etc.)
+.vscode/               # Visual Studio Code
+.vs/                   # Visual Studio
+.fleet/                # JetBrains Fleet
+*.sublime-project
+*.sublime-workspace
+*.code-workspace
+.history/              # VS Code Local History extension
+*.iml                  # JetBrains module files
+
+# Editor swap/backup/lock files
+*.swp
+*.swo
+*.swn
+*~
+.#*
+\#*\#
+.netrwhist
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db

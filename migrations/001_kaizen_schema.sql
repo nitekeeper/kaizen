@@ -42,8 +42,8 @@ CREATE TABLE cycles (
 CREATE TABLE abandonments (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
   cycle_id            INTEGER NOT NULL REFERENCES cycles(id) ON DELETE CASCADE,
-  phase_reached       TEXT NOT NULL,
-  reason              TEXT NOT NULL,
+  phase_reached       TEXT NOT NULL CHECK (phase_reached IN ('agenda','meeting','implementation','test')),
+  reason              TEXT NOT NULL CHECK (reason IN ('no_consensus','destructive_rejected','tests_unrecoverable','other')),
   detail              TEXT NOT NULL,
   report_memex_slug   TEXT,
   created_at          TEXT NOT NULL

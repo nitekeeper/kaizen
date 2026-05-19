@@ -171,34 +171,81 @@ def test_runs_status_check_rejects_invalid(tmp_path):
             conn.commit()
 
 
-def test_abandonments_reason_and_phase_are_free_text(tmp_path):
-    """abandonments.reason and abandonments.phase_reached have no CHECK — accept any string."""
+def test_abandonments_phase_reached_check_rejects_invalid(tmp_path):
     db_path = str(tmp_path / "test.db")
     apply_migrations(db_path, MIGRATIONS_DIR)
     with closing(get_connection(db_path)) as conn:
         project_id = _insert_project(conn)
         conn.execute(
             "INSERT INTO runs (project_id, branch, cycles_requested, started_at, status) "
-            "VALUES (?, 'kaizen/test', 1, datetime('now'), 'running')",
-            (project_id,),
+            "VALUES (?, 'kaizen/test', 1, datetime('now'), 'running')", (project_id,)
         )
         run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.execute(
             "INSERT INTO cycles (run_id, cycle_n, status, started_at) "
-            "VALUES (?, 1, 'abandoned', datetime('now'))",
-            (run_id,),
+            "VALUES (?, 1, 'abandoned', datetime('now'))", (run_id,)
         )
         cycle_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.commit()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO abandonments (cycle_id, phase_reached, reason, detail, created_at) "
+                "VALUES (?, 'invalid-phase', 'no_consensus', 'detail', datetime('now'))",
+                (cycle_id,)
+            )
+            conn.commit()
 
-        # Arbitrary strings should be accepted.
+
+def test_abandonments_reason_check_rejects_push_failed(tmp_path):
+    """push_failed is a run-level event, not a cycle abandonment reason."""
+    db_path = str(tmp_path / "test.db")
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    with closing(get_connection(db_path)) as conn:
+        project_id = _insert_project(conn)
         conn.execute(
-            "INSERT INTO abandonments (cycle_id, phase_reached, reason, detail, created_at) "
-            "VALUES (?, 'totally-made-up-phase', 'totally-made-up-reason', 'detail', datetime('now'))",
-            (cycle_id,),
+            "INSERT INTO runs (project_id, branch, cycles_requested, started_at, status) "
+            "VALUES (?, 'kaizen/test', 1, datetime('now'), 'running')", (project_id,)
         )
+        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "INSERT INTO cycles (run_id, cycle_n, status, started_at) "
+            "VALUES (?, 1, 'abandoned', datetime('now'))", (run_id,)
+        )
+        cycle_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
         conn.commit()
-        count = conn.execute(
-            "SELECT COUNT(*) FROM abandonments WHERE cycle_id = ?", (cycle_id,)
-        ).fetchone()[0]
-        assert count == 1
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO abandonments (cycle_id, phase_reached, reason, detail, created_at) "
+                "VALUES (?, 'meeting', 'push_failed', 'detail', datetime('now'))",
+                (cycle_id,)
+            )
+            conn.commit()
+
+
+def test_abandonments_valid_values_accepted(tmp_path):
+    """All four valid phase_reached and reason combinations must work."""
+    db_path = str(tmp_path / "test.db")
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    with closing(get_connection(db_path)) as conn:
+        project_id = _insert_project(conn)
+        conn.execute(
+            "INSERT INTO runs (project_id, branch, cycles_requested, started_at, status) "
+            "VALUES (?, 'kaizen/test', 1, datetime('now'), 'running')", (project_id,)
+        )
+        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            "INSERT INTO cycles (run_id, cycle_n, status, started_at) "
+            "VALUES (?, 1, 'abandoned', datetime('now'))", (run_id,)
+        )
+        cycle_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+        valid_phases = ('agenda', 'meeting', 'implementation', 'test')
+        valid_reasons = ('no_consensus', 'destructive_rejected', 'tests_unrecoverable', 'other')
+        for phase in valid_phases:
+            for reason in valid_reasons:
+                conn.execute(
+                    "INSERT INTO abandonments (cycle_id, phase_reached, reason, detail, created_at) "
+                    "VALUES (?, ?, ?, 'detail', datetime('now'))",
+                    (cycle_id, phase, reason),
+                )
+        conn.commit()

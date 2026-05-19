@@ -20,12 +20,14 @@ def test_all_tables_created(tmp_path):
 
 
 def test_migration_recorded(tmp_path):
-    """The kaizen schema migration filename is recorded."""
+    """All kaizen migration filenames are recorded."""
     db_path = str(tmp_path / "test.db")
     apply_migrations(db_path, MIGRATIONS_DIR)
     with closing(get_connection(db_path)) as conn:
-        row = conn.execute("SELECT filename FROM migrations").fetchone()
-    assert row[0] == "001_kaizen_schema.sql"
+        rows = conn.execute("SELECT filename FROM migrations ORDER BY filename").fetchall()
+    filenames = [row[0] for row in rows]
+    assert "001_kaizen_schema.sql" in filenames
+    assert "002_add_fk_indexes.sql" in filenames
 
 
 def test_migration_is_idempotent(tmp_path):
@@ -35,7 +37,18 @@ def test_migration_is_idempotent(tmp_path):
     apply_migrations(db_path, MIGRATIONS_DIR)  # must not raise
     with closing(get_connection(db_path)) as conn:
         count = conn.execute("SELECT COUNT(*) FROM migrations").fetchone()[0]
-    assert count == 1
+    assert count == 2
+
+
+def test_fk_indexes_created(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    with closing(get_connection(db_path)) as conn:
+        indexes = {row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()}
+    for expected_idx in ("idx_runs_project_id", "idx_cycles_run_id", "idx_abandonments_cycle_id"):
+        assert expected_idx in indexes, f"Missing index {expected_idx!r}"
 
 
 def test_apply_migrations_closes_connection_on_error(tmp_path, monkeypatch):

@@ -169,13 +169,13 @@ class TestRunSetup:
         # Second run should also succeed without error
         assert run_setup() == 0
 
-        # Migrations table should still have exactly 1 row
+        # Migrations table should still have exactly 2 rows (001 + 002)
         conn = sqlite3.connect(db_path)
         try:
             count = conn.execute("SELECT COUNT(*) FROM migrations").fetchone()[0]
         finally:
             conn.close()
-        assert count == 1
+        assert count == 2
 
     def test_failure_blocks_migration(self, monkeypatch, tmp_path, capsys):
         # git missing → run_setup returns 1 and never creates the DB

@@ -14,7 +14,8 @@ def run_tests_in_clone(clone_dir: Path, test_command: str) -> tuple[bool, int]:
     test_command is split with shlex.split (POSIX rules) and executed as a
     subprocess with cwd=clone_dir.
 
-    NOTE: The pass-count regex `r"(\\d+) passed"` matches pytest's summary line.
+    NOTE: Pass-count uses regex r"={3,}\\s+(\\d+) passed" to match pytest's
+    summary separator line (e.g. "=== 5 passed in 0.12s ===").
     Other test runners (npm, cargo, go test) produce different output and will
     yield count=0 even when passing. When kaizen supports non-pytest runners,
     add per-runner parsers here.

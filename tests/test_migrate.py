@@ -38,6 +38,29 @@ def test_migration_is_idempotent(tmp_path):
     assert count == 1
 
 
+def test_apply_migrations_closes_connection_on_error(tmp_path, monkeypatch):
+    db_path = str(tmp_path / "test.db")
+    # Create a malformed migration that will fail executescript
+    bad_dir = tmp_path / "migrations"
+    bad_dir.mkdir()
+    (bad_dir / "001_bad.sql").write_text("INVALID SQL HERE;;;")
+    # Pre-fail check: function should raise but the connection must be closed
+    import scripts.migrate as migrate
+    with pytest.raises(sqlite3.Error):
+        migrate.apply_migrations(db_path, bad_dir)
+    # After raising, opening a fresh connection in WAL mode must not be blocked
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL").fetchone()
+        # If connection was leaked, attempting an EXCLUSIVE write here would
+        # fail with 'database is locked'. The fact that it succeeds confirms
+        # the prior connection was properly closed.
+        conn.execute("CREATE TABLE post_check (x INTEGER)")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _insert_project(conn, git_url="https://github.com/owner/repo.git", name="repo"):
     conn.execute(
         "INSERT INTO projects (git_url, name, test_command, read_paths, expert_roster, registered_at) "

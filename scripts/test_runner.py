@@ -19,7 +19,7 @@ def run_tests_in_clone(clone_dir: Path, test_command: str) -> tuple[bool, int]:
     yield count=0 even when passing. When kaizen supports non-pytest runners,
     add per-runner parsers here.
     """
-    argv = shlex.split(test_command)
+    argv = shlex.split(test_command, posix=(sys.platform != "win32"))
     result = subprocess.run(
         argv,
         cwd=clone_dir,
@@ -31,9 +31,10 @@ def run_tests_in_clone(clone_dir: Path, test_command: str) -> tuple[bool, int]:
     )
     count = 0
     for line in (result.stdout or "").splitlines():
-        m = re.search(r"(\d+) passed", line)
+        m = re.search(r"={3,}\s+(\d+) passed", line)
         if m:
             count = int(m.group(1))
+            break
     return result.returncode == 0, count
 
 

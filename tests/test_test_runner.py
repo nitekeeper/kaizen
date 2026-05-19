@@ -8,9 +8,7 @@ from scripts.test_runner import run_tests_in_clone
 from scripts.clone import clone_repo
 
 
-# Default pytest invocation used by the live project config.
-# `pytest` is expected on PATH; sys.executable cannot be embedded in the
-# command string because shlex.split mangles Windows backslash paths.
+# Use sys.executable so the test runner uses the same interpreter as the test suite.
 _DEFAULT_PYTEST = f"{sys.executable} -m pytest -v --tb=short"
 
 
@@ -39,7 +37,7 @@ class TestRunTestsInClone:
         dest = tmp_path / "clone"
         clone_repo(str(bare_remote), dest)
         # Custom command string with extra args; shlex.split must handle it.
-        cmd = f"{sys.executable} -m pytest -v --tb=short"
+        cmd = f"{sys.executable} -m pytest -v --tb=long"
         passed, count = run_tests_in_clone(dest, cmd)
         assert passed is True
         assert count == 1

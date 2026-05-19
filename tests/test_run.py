@@ -144,8 +144,6 @@ def _install_orchestrator_stubs(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(cg_mod, "push_branch", lambda d, b: None)
 
-    # Memex unavailable — abandonment paths still record.
-    monkeypatch.setattr(ab_mod.shutil, "which", lambda name: None)
     return clone_dir
 
 

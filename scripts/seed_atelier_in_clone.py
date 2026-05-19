@@ -1,10 +1,10 @@
 """Seed atelier's full schema + role roster into a clone's `.ai/memex.db`.
 
 Wraps subprocess invocations of atelier's `scripts/migrate.py` and
-`scripts/seed_roles.py` against a cloned target's local DB, and ensures the
-clone has a `.ai/wiki/` directory ready for memex captures.
+`scripts/seed_roles.py` against a cloned target's local DB.
 
-Requires atelier to be installed on disk; see find_atelier_root().
+Resolves atelier's location from the Agora plugin cache
+(~/.claude/plugins/cache/agora/atelier/<version>/); see find_atelier_root().
 """
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ from pathlib import Path
 
 # ── Locate atelier ─────────────────────────────────────────────────────────
 
+_AGORA_ATELIER = Path.home() / ".claude" / "plugins" / "cache" / "agora" / "atelier"
 _ATELIER_MARKERS = ("scripts/migrate.py", "scripts/seed_roles.py")
 
 
@@ -24,30 +25,28 @@ def _looks_like_atelier(candidate: Path) -> bool:
 
 
 def find_atelier_root() -> Path:
-    """Locate atelier on disk.
+    """Resolve atelier's root from the Agora plugin cache.
 
-    Search order:
-      1. ~/Documents/Skills/atelier
-      2. Walk up from cwd, checking each ancestor's siblings named 'atelier'
+    Picks the highest-sorted version directory under
+    ~/.claude/plugins/cache/agora/atelier/ that contains the required markers.
     Raises RuntimeError when not found.
     """
-    home_skill = Path.home() / "Documents" / "Skills" / "atelier"
-    if _looks_like_atelier(home_skill):
-        return home_skill
-
-    cwd = Path.cwd().resolve()
-    for ancestor in [cwd] + list(cwd.parents):
-        sibling = ancestor / "atelier"
-        if _looks_like_atelier(sibling):
-            return sibling
-        # Also check the ancestor itself
-        if _looks_like_atelier(ancestor):
-            return ancestor
-
+    if not _AGORA_ATELIER.is_dir():
+        raise RuntimeError(
+            f"Atelier plugin cache not found at {_AGORA_ATELIER}. "
+            "Install Atelier via Agora before running Kaizen."
+        )
+    versions = sorted(
+        (d for d in _AGORA_ATELIER.iterdir() if d.is_dir()),
+        key=lambda p: p.name,
+        reverse=True,
+    )
+    for candidate in versions:
+        if _looks_like_atelier(candidate):
+            return candidate
     raise RuntimeError(
-        "Could not locate atelier on disk. Looked under "
-        "~/Documents/Skills/atelier and walked up from cwd. "
-        "Install atelier (e.g. via agora) before running seed_atelier_in_clone."
+        f"No valid Atelier installation found in {_AGORA_ATELIER}. "
+        "Reinstall Atelier via Agora."
     )
 
 

@@ -1,19 +1,13 @@
-"""Abandonment handling — format report, capture to memex, record in DB.
+"""Abandonment handling — format report and record in DB.
 
 When a cycle abandons mid-flight, this module:
   1. Renders a markdown report (design §4.5)
-  2. Captures it to Kaizen's own memex via `memex capture` (best-effort)
-  3. Inserts an `abandonments` row keyed to the cycle
+  2. Inserts an `abandonments` row keyed to the cycle
 
-`memex capture` is best-effort: if memex is not on PATH, or the subprocess
-fails, the slug is still returned and the abandonment is still recorded.
-The report can be re-ingested later by the user.
+Capturing the report to Memex happens at the agent level via `memex:run`.
 """
 from __future__ import annotations
 
-import shutil
-import subprocess
-import sys
 from datetime import datetime, timezone
 
 from scripts.db import get_connection
@@ -82,47 +76,6 @@ def format_report(
     return frontmatter + body
 
 
-# ── Memex capture (best-effort) ────────────────────────────────────────────
-
-def capture_to_memex(slug: str, markdown_content: str) -> str:
-    """Capture markdown to Kaizen's memex via `memex capture`. Returns slug.
-
-    Best-effort: if `memex` is not on PATH or the subprocess fails, emits a
-    warning to stderr and returns the slug anyway. Abandonment recording
-    must not be blocked on memex availability.
-    """
-    if shutil.which("memex") is None:
-        print(
-            f"warning: `memex` not on PATH; skipped capture of {slug} "
-            "(report can be re-ingested later)",
-            file=sys.stderr,
-        )
-        return slug
-
-    try:
-        result = subprocess.run(
-            ["memex", "capture", "--id", slug],
-            input=markdown_content,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
-        if result.returncode != 0:
-            print(
-                f"warning: `memex capture` exited {result.returncode} for {slug}; "
-                f"stderr: {result.stderr.strip()}",
-                file=sys.stderr,
-            )
-    except OSError as exc:
-        print(
-            f"warning: failed to invoke `memex` for {slug}: {exc}",
-            file=sys.stderr,
-        )
-    return slug
-
-
 # ── DB write ───────────────────────────────────────────────────────────────
 
 def record_abandonment(
@@ -185,7 +138,6 @@ def process_abandonment(
         artifacts=artifacts,
     )
     slug = _slug_for(run_id, cycle_n)
-    capture_to_memex(slug, markdown)
     return record_abandonment(
         db_path=db_path,
         cycle_id=cycle_id,

@@ -8,8 +8,8 @@ Kaizen refuses to run if any of these are missing:
 
 - `git` on PATH
 - `gh` CLI on PATH and authenticated (`gh auth status` exits 0)
-- `memex` CLI on PATH (`memex --version` exits 0) — used for capturing abandonment reports and cycle minutes to Kaizen's own wiki
-- Atelier installed via Agora (`/atelier:*` slash commands available) — Kaizen depends on Atelier's 61-role roster + dev-arc skills for the cycle agents
+- Atelier installed via Agora (`atelier:run` skill available) — Kaizen depends on Atelier's 61-role roster + dev-arc skills for the cycle agents; accessed via the plugin, not a CLI
+- Memex installed via Agora (`memex:run` skill available) — used by agents to capture abandonment reports and cycle minutes; accessed via the plugin, not a CLI
 - Python 3.11+ with `pip install -r requirements.txt` applied
 
 The setup script (`scripts/setup.py`) verifies all of these and fails loudly if any are missing.
@@ -39,7 +39,7 @@ The setup script (`scripts/setup.py`) verifies all of these and fails loudly if 
 
 | Path | Purpose | Tracked? |
 |---|---|---|
-| `.ai/wiki/` | Kaizen's own Memex wiki — abandonment reports, cycle minutes, cross-repo learnings | Yes |
+| `~/.memex/` | Memex Brain — abandonment reports, cycle minutes, cross-repo learnings (managed by `memex:run`) | No (lives outside repo) |
 | `.ai/memex.db` | Kaizen's project/run/cycle/abandonment state | No (gitignored, rebuilt via migrations) |
 | `experiment/<owner>-<repo>/` | Ephemeral clone of the current target repo | No (gitignored, deleted after PR opens) |
 
@@ -60,7 +60,7 @@ This is the only user-invocable command. All other operations live in `internal/
 3. **Skip-and-continue on abandonment.** A cycle that cannot reach completion (no consensus, all destructive rejected, tests unrecoverable, etc.) produces a formal report and the next cycle still runs.
 4. **The clone is the work area.** All git operations happen in `experiment/<owner>-<repo>/`. The clone is destroyed after the PR opens, whether cycles succeeded or were all abandoned.
 5. **Atelier infrastructure is reused, not duplicated.** Cycle agents invoke `/atelier:` slash commands; the 61-role roster is seeded into the clone's DB via `scripts/seed_roles.py` called as a subprocess. Kaizen does not vendor the agent profiles.
-6. **Kaizen's own Memex stores cross-repo knowledge.** Abandonment reports and cycle minutes are captured to `.ai/wiki/` via `memex capture`. The user can query past runs with `memex ask`.
+6. **Kaizen's own Memex stores cross-repo knowledge.** Abandonment reports and cycle minutes are captured to `.ai/wiki/` via `memex:run` (the Claude Code plugin). The user can query past runs via `memex:run ask`.
 
 ## Architecture pointers
 

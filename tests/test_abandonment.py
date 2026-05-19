@@ -1,14 +1,10 @@
 """Tests for scripts/abandonment.py — report format + memex + DB."""
 from __future__ import annotations
 
-import subprocess
-from types import SimpleNamespace
-
 import pytest
 
 import scripts.abandonment as ab_mod
 from scripts.abandonment import (
-    capture_to_memex,
     format_report,
     process_abandonment,
     record_abandonment,
@@ -94,47 +90,6 @@ def test_format_report_handles_missing_subject_and_empty_lists():
     assert "Artifacts: (none)" in md
 
 
-# ── capture_to_memex ───────────────────────────────────────────────────────
-
-def test_capture_to_memex_skipped_when_not_on_path(monkeypatch, capsys):
-    monkeypatch.setattr(ab_mod.shutil, "which", lambda name: None)
-
-    def fail_subprocess(*a, **kw):
-        raise AssertionError("subprocess.run should not be called")
-    monkeypatch.setattr(ab_mod.subprocess, "run", fail_subprocess)
-
-    slug = capture_to_memex("kaizen:abandonment:1-cycle-1", "# body\n")
-    assert slug == "kaizen:abandonment:1-cycle-1"
-    err = capsys.readouterr().err
-    assert "memex" in err and "PATH" in err
-
-
-def test_capture_to_memex_handles_subprocess_failure(monkeypatch, capsys):
-    monkeypatch.setattr(ab_mod.shutil, "which", lambda name: "/fake/memex")
-
-    def fake_run(*a, **kw):
-        return SimpleNamespace(returncode=1, stdout="", stderr="boom")
-    monkeypatch.setattr(ab_mod.subprocess, "run", fake_run)
-
-    slug = capture_to_memex("kaizen:abandonment:1-cycle-1", "# body\n")
-    assert slug == "kaizen:abandonment:1-cycle-1"
-    err = capsys.readouterr().err
-    assert "exited 1" in err
-    assert "boom" in err
-
-
-def test_capture_to_memex_succeeds_silently(monkeypatch, capsys):
-    monkeypatch.setattr(ab_mod.shutil, "which", lambda name: "/fake/memex")
-
-    def fake_run(*a, **kw):
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-    monkeypatch.setattr(ab_mod.subprocess, "run", fake_run)
-
-    slug = capture_to_memex("k:a:1-cycle-1", "# body\n")
-    assert slug == "k:a:1-cycle-1"
-    assert capsys.readouterr().err == ""
-
-
 # ── record_abandonment ────────────────────────────────────────────────────
 
 def test_record_abandonment_inserts_row(db, run_and_cycle):
@@ -156,10 +111,7 @@ def test_record_abandonment_inserts_row(db, run_and_cycle):
 
 # ── process_abandonment full flow ──────────────────────────────────────────
 
-def test_process_abandonment_full_flow(db, run_and_cycle, monkeypatch):
-    # Force memex to be unavailable so the test doesn't shell out.
-    monkeypatch.setattr(ab_mod.shutil, "which", lambda name: None)
-
+def test_process_abandonment_full_flow(db, run_and_cycle):
     row = process_abandonment(
         db_path=db,
         project=run_and_cycle["project"],

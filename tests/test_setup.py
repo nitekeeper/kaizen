@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import sqlite3
 import subprocess
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,10 +10,8 @@ import pytest
 from scripts import setup as setup_mod
 from scripts.setup import (
     DepCheck,
-    check_atelier_on_disk,
     check_gh,
     check_git,
-    check_memex,
     check_python_version,
     run_setup,
     verify_all,
@@ -31,10 +28,10 @@ def _fail_result(stdout: str = "", stderr: str = "", code: int = 1) -> subproces
     return subprocess.CompletedProcess(args=[], returncode=code, stdout=stdout, stderr=stderr)
 
 
-def _all_present(monkeypatch, atelier_root: Path) -> None:
+def _all_present(monkeypatch) -> None:
     """Patch the world so every dep check passes."""
     def fake_which(name: str):
-        return f"/usr/bin/{name}" if name in {"git", "gh", "memex"} else None
+        return f"/usr/bin/{name}" if name in {"git", "gh"} else None
 
     def fake_run(cmd, *args, **kwargs):
         exe = cmd[0]
@@ -42,13 +39,10 @@ def _all_present(monkeypatch, atelier_root: Path) -> None:
             return _ok_result(stdout="git version 2.42.0\n")
         if exe == "gh":
             return _ok_result(stdout="Logged in to github.com account nitekeeper\n")
-        if exe == "memex":
-            return _ok_result(stdout="memex 1.1.2\n")
         return _ok_result()
 
     monkeypatch.setattr(setup_mod.shutil, "which", fake_which)
     monkeypatch.setattr(setup_mod.subprocess, "run", fake_run)
-    monkeypatch.setattr(setup_mod, "_find_atelier_root", lambda: atelier_root)
 
 
 # ── Individual check tests ─────────────────────────────────────────────────
@@ -110,22 +104,6 @@ class TestCheckGh:
         assert "auth login" in c.fix.lower()
 
 
-class TestCheckMemex:
-    def test_present(self, monkeypatch):
-        monkeypatch.setattr(setup_mod.shutil, "which", lambda n: "/usr/bin/memex")
-        monkeypatch.setattr(
-            setup_mod.subprocess, "run",
-            lambda *a, **k: _ok_result(stdout="memex 1.1.2\n"),
-        )
-        c = check_memex()
-        assert c.ok is True
-
-    def test_missing(self, monkeypatch):
-        monkeypatch.setattr(setup_mod.shutil, "which", lambda n: None)
-        c = check_memex()
-        assert c.ok is False
-        assert "memex" in c.fix.lower()
-
 
 class TestCheckPythonVersion:
     def test_supported(self):
@@ -151,35 +129,13 @@ class TestCheckPythonVersion:
         assert "3.11" in c.detail or "3.11" in c.fix
 
 
-class TestCheckAtelierOnDisk:
-    def test_found(self, monkeypatch, tmp_path):
-        fake_root = tmp_path / "atelier"
-        (fake_root / "scripts").mkdir(parents=True)
-        (fake_root / "scripts" / "migrate.py").write_text("")
-        (fake_root / "scripts" / "seed_roles.py").write_text("")
-        monkeypatch.setattr(setup_mod, "_find_atelier_root", lambda: fake_root)
-        c = check_atelier_on_disk()
-        assert c.ok is True
-        assert str(fake_root) in c.detail
-
-    def test_not_found(self, monkeypatch):
-        monkeypatch.setattr(setup_mod, "_find_atelier_root", lambda: None)
-        c = check_atelier_on_disk()
-        assert c.ok is False
-        assert "not found" in c.detail.lower()
-
-
 # ── Orchestrator tests ─────────────────────────────────────────────────────
 
 class TestRunSetup:
     def test_all_present_returns_zero_and_applies_migration(
         self, monkeypatch, tmp_path
     ):
-        atelier_root = tmp_path / "atelier"
-        (atelier_root / "scripts").mkdir(parents=True)
-        (atelier_root / "scripts" / "migrate.py").write_text("")
-        (atelier_root / "scripts" / "seed_roles.py").write_text("")
-        _all_present(monkeypatch, atelier_root)
+        _all_present(monkeypatch)
 
         db_path = tmp_path / ".ai" / "memex.db"
         db_path.parent.mkdir(parents=True)
@@ -203,11 +159,7 @@ class TestRunSetup:
             assert expected in names, f"missing table {expected!r}; got {names}"
 
     def test_idempotent_rerun(self, monkeypatch, tmp_path):
-        atelier_root = tmp_path / "atelier"
-        (atelier_root / "scripts").mkdir(parents=True)
-        (atelier_root / "scripts" / "migrate.py").write_text("")
-        (atelier_root / "scripts" / "seed_roles.py").write_text("")
-        _all_present(monkeypatch, atelier_root)
+        _all_present(monkeypatch)
 
         db_path = tmp_path / ".ai" / "memex.db"
         db_path.parent.mkdir(parents=True)
@@ -233,18 +185,10 @@ class TestRunSetup:
         def fake_run(cmd, *a, **k):
             if cmd[0] == "gh":
                 return _ok_result(stdout="Logged in to github.com account x\n")
-            if cmd[0] == "memex":
-                return _ok_result(stdout="memex 1.1.2\n")
             return _ok_result()
-
-        atelier_root = tmp_path / "atelier"
-        (atelier_root / "scripts").mkdir(parents=True)
-        (atelier_root / "scripts" / "migrate.py").write_text("")
-        (atelier_root / "scripts" / "seed_roles.py").write_text("")
 
         monkeypatch.setattr(setup_mod.shutil, "which", fake_which)
         monkeypatch.setattr(setup_mod.subprocess, "run", fake_run)
-        monkeypatch.setattr(setup_mod, "_find_atelier_root", lambda: atelier_root)
 
         db_path = tmp_path / ".ai" / "memex.db"
         monkeypatch.setattr(setup_mod, "DB_PATH", db_path)
@@ -259,14 +203,10 @@ class TestRunSetup:
 
 
 class TestVerifyAll:
-    def test_returns_five_checks(self, monkeypatch, tmp_path):
-        atelier_root = tmp_path / "atelier"
-        (atelier_root / "scripts").mkdir(parents=True)
-        (atelier_root / "scripts" / "migrate.py").write_text("")
-        (atelier_root / "scripts" / "seed_roles.py").write_text("")
-        _all_present(monkeypatch, atelier_root)
+    def test_returns_three_checks(self, monkeypatch):
+        _all_present(monkeypatch)
 
         checks = verify_all()
-        assert len(checks) == 5
-        assert {c.name for c in checks} == {"git", "gh", "memex", "atelier", "python"}
+        assert len(checks) == 3
+        assert {c.name for c in checks} == {"git", "gh", "python"}
         assert all(c.ok for c in checks)

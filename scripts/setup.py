@@ -67,63 +67,6 @@ def check_gh() -> DepCheck:
     return DepCheck(name, True, summary, auth_fix)
 
 
-def check_memex() -> DepCheck:
-    name = "memex"
-    fix = "Install memex (e.g. `pip install memex` or install via agora)"
-    if shutil.which("memex") is None:
-        return DepCheck(name, False, "not found on PATH", fix)
-    result = _run(["memex", "--version"])
-    if result.returncode != 0:
-        return DepCheck(
-            name, False, f"`memex --version` exited {result.returncode}", fix
-        )
-    return DepCheck(name, True, result.stdout.strip() or "memex available", fix)
-
-
-def _find_atelier_root() -> Path | None:
-    """Locate atelier on disk. Returns None if not found.
-
-    Prefers scripts.seed_atelier_in_clone.find_atelier_root if importable;
-    otherwise inlines the same search heuristic.
-    """
-    try:
-        from scripts.seed_atelier_in_clone import find_atelier_root as _find
-        try:
-            return _find()
-        except RuntimeError:
-            return None
-    except Exception:
-        # Inline fallback
-        markers = ("scripts/migrate.py", "scripts/seed_roles.py")
-
-        def looks_like(candidate: Path) -> bool:
-            return all((candidate / m).exists() for m in markers)
-
-        home_skill = Path.home() / "Documents" / "Skills" / "atelier"
-        if looks_like(home_skill):
-            return home_skill
-        cwd = Path.cwd().resolve()
-        for ancestor in [cwd] + list(cwd.parents):
-            sibling = ancestor / "atelier"
-            if looks_like(sibling):
-                return sibling
-            if looks_like(ancestor):
-                return ancestor
-        return None
-
-
-def check_atelier_on_disk() -> DepCheck:
-    name = "atelier"
-    fix = (
-        "Clone atelier to a discoverable location "
-        "(e.g. ~/Documents/Skills/atelier) or install via agora."
-    )
-    root = _find_atelier_root()
-    if root is None:
-        return DepCheck(name, False, "not found on disk", fix)
-    return DepCheck(name, True, f"{root} (markers found)", fix)
-
-
 def check_python_version() -> DepCheck:
     name = "python"
     fix = "Upgrade Python to 3.11 or newer"
@@ -139,8 +82,6 @@ def verify_all() -> list[DepCheck]:
     return [
         check_git(),
         check_gh(),
-        check_memex(),
-        check_atelier_on_disk(),
         check_python_version(),
     ]
 

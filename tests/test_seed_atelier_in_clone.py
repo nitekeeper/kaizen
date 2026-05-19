@@ -67,6 +67,27 @@ class TestAtelierEnv:
         assert env.get("PYTHONPATH") == "/fake/atelier/root"
 
 
+class TestCopyRolesFromAtelier:
+    def test_copy_roles_raises_if_memex_registry_missing(self, tmp_path, monkeypatch):
+        """If ~/.memex/registry.json is absent, _copy_roles_agents_from_atelier must raise."""
+        from scripts.seed_atelier_in_clone import _copy_roles_agents_from_atelier
+        # Redirect HOME so registry path doesn't exist
+        fake_home = tmp_path / "fake_home"
+        fake_home.mkdir()
+        monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+        clone_dir = tmp_path / "clone"
+        (clone_dir / ".ai").mkdir(parents=True)
+        # Minimal memex.db with roles/agents tables (won't be reached)
+        import sqlite3 as _sq3
+        c = _sq3.connect(str(clone_dir / ".ai" / "memex.db"))
+        c.execute("CREATE TABLE roles (id INTEGER PRIMARY KEY, name TEXT, description TEXT, created_at TEXT, updated_at TEXT)")
+        c.execute("CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role_id INTEGER, profile TEXT, created_at TEXT, updated_at TEXT)")
+        c.close()
+        with pytest.raises(RuntimeError, match="Memex registry not found"):
+            _copy_roles_agents_from_atelier(clone_dir)
+
+
 class TestSeedSchemaAndRoles:
     def test_schema_creates_atelier_tables(self, tmp_path):
         clone = _init_clone(tmp_path)

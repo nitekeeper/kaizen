@@ -8,7 +8,9 @@ Resolves atelier's location from the Agora plugin cache
 """
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -68,6 +70,58 @@ def _atelier_env(atelier_root: Path) -> dict[str, str]:
     return env
 
 
+def _copy_roles_agents_from_atelier(clone_dir: Path) -> None:
+    """Copy roles and agents from atelier's Memex-resolved DB into the clone's local DB.
+
+    Atelier's seed_roles.py always routes writes to ~/.memex/agents.db via its
+    mode_detector, ignoring the db_path argument. This helper bridges the gap
+    by copying the result rows into the clone's .ai/memex.db so the cycle
+    agents can resolve participant profiles locally.
+    """
+    registry_path = Path.home() / ".memex" / "registry.json"
+    if not registry_path.exists():
+        raise RuntimeError(
+            f"Memex registry not found at {registry_path}. "
+            "Run Atelier setup before seeding a clone."
+        )
+    registry = json.loads(registry_path.read_text())
+    try:
+        agents_db_path = registry["agents"]["path"]
+    except KeyError as exc:
+        raise RuntimeError(
+            f"Memex registry has no 'agents' store: {registry_path}"
+        ) from exc
+
+    dst_db = str(clone_dir / ".ai" / "memex.db")
+    src_conn = sqlite3.connect(agents_db_path)
+    dst_conn = sqlite3.connect(dst_db)
+    try:
+        roles = src_conn.execute(
+            "SELECT id, name, description, created_at, updated_at FROM roles"
+        ).fetchall()
+        for row in roles:
+            dst_conn.execute(
+                "INSERT OR REPLACE INTO roles "
+                "(id, name, description, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                row,
+            )
+        agents = src_conn.execute(
+            "SELECT id, name, role_id, profile, created_at, updated_at FROM agents"
+        ).fetchall()
+        for row in agents:
+            dst_conn.execute(
+                "INSERT OR REPLACE INTO agents "
+                "(id, name, role_id, profile, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                row,
+            )
+        dst_conn.commit()
+    finally:
+        src_conn.close()
+        dst_conn.close()
+
+
 def seed_atelier_schema(clone_dir: Path) -> None:
     """Apply atelier's migrations to <clone_dir>/.ai/memex.db via subprocess."""
     atelier_root = find_atelier_root()
@@ -110,6 +164,7 @@ def seed_atelier_roles(clone_dir: Path) -> None:
             f"atelier seed_roles.py failed (exit {result.returncode}):\n"
             f"stdout: {result.stdout}\nstderr: {result.stderr}"
         )
+    _copy_roles_agents_from_atelier(clone_dir)
 
 
 def ensure_wiki_dir(clone_dir: Path) -> None:

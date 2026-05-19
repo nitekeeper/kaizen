@@ -84,6 +84,22 @@ def _insert_project(conn, git_url="https://github.com/owner/repo.git", name="rep
     return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
+def _insert_run_and_cycle(conn, project_id):
+    """Insert a minimal run + cycle pair under the given project_id; return cycle_id."""
+    conn.execute(
+        "INSERT INTO runs (project_id, branch, cycles_requested, started_at, status) "
+        "VALUES (?, 'kaizen/test', 1, datetime('now'), 'running')", (project_id,)
+    )
+    run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.execute(
+        "INSERT INTO cycles (run_id, cycle_n, status, started_at) "
+        "VALUES (?, 1, 'abandoned', datetime('now'))", (run_id,)
+    )
+    cycle_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.commit()
+    return cycle_id
+
+
 def test_projects_git_url_unique(tmp_path):
     """projects.git_url is UNIQUE — duplicate insert raises IntegrityError."""
     db_path = str(tmp_path / "test.db")
@@ -172,21 +188,12 @@ def test_runs_status_check_rejects_invalid(tmp_path):
 
 
 def test_abandonments_phase_reached_check_rejects_invalid(tmp_path):
+    """abandonments.phase_reached CHECK rejects values outside ('agenda','meeting','implementation','test')."""
     db_path = str(tmp_path / "test.db")
     apply_migrations(db_path, MIGRATIONS_DIR)
     with closing(get_connection(db_path)) as conn:
         project_id = _insert_project(conn)
-        conn.execute(
-            "INSERT INTO runs (project_id, branch, cycles_requested, started_at, status) "
-            "VALUES (?, 'kaizen/test', 1, datetime('now'), 'running')", (project_id,)
-        )
-        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.execute(
-            "INSERT INTO cycles (run_id, cycle_n, status, started_at) "
-            "VALUES (?, 1, 'abandoned', datetime('now'))", (run_id,)
-        )
-        cycle_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.commit()
+        cycle_id = _insert_run_and_cycle(conn, project_id)
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
                 "INSERT INTO abandonments (cycle_id, phase_reached, reason, detail, created_at) "
@@ -202,17 +209,7 @@ def test_abandonments_reason_check_rejects_push_failed(tmp_path):
     apply_migrations(db_path, MIGRATIONS_DIR)
     with closing(get_connection(db_path)) as conn:
         project_id = _insert_project(conn)
-        conn.execute(
-            "INSERT INTO runs (project_id, branch, cycles_requested, started_at, status) "
-            "VALUES (?, 'kaizen/test', 1, datetime('now'), 'running')", (project_id,)
-        )
-        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.execute(
-            "INSERT INTO cycles (run_id, cycle_n, status, started_at) "
-            "VALUES (?, 1, 'abandoned', datetime('now'))", (run_id,)
-        )
-        cycle_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.commit()
+        cycle_id = _insert_run_and_cycle(conn, project_id)
         with pytest.raises(sqlite3.IntegrityError):
             conn.execute(
                 "INSERT INTO abandonments (cycle_id, phase_reached, reason, detail, created_at) "
@@ -223,22 +220,12 @@ def test_abandonments_reason_check_rejects_push_failed(tmp_path):
 
 
 def test_abandonments_valid_values_accepted(tmp_path):
-    """All four valid phase_reached and reason combinations must work."""
+    """All 16 valid (phase_reached x reason) combinations must succeed."""
     db_path = str(tmp_path / "test.db")
     apply_migrations(db_path, MIGRATIONS_DIR)
     with closing(get_connection(db_path)) as conn:
         project_id = _insert_project(conn)
-        conn.execute(
-            "INSERT INTO runs (project_id, branch, cycles_requested, started_at, status) "
-            "VALUES (?, 'kaizen/test', 1, datetime('now'), 'running')", (project_id,)
-        )
-        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.execute(
-            "INSERT INTO cycles (run_id, cycle_n, status, started_at) "
-            "VALUES (?, 1, 'abandoned', datetime('now'))", (run_id,)
-        )
-        cycle_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.commit()
+        cycle_id = _insert_run_and_cycle(conn, project_id)
         valid_phases = ('agenda', 'meeting', 'implementation', 'test')
         valid_reasons = ('no_consensus', 'destructive_rejected', 'tests_unrecoverable', 'other')
         for phase in valid_phases:

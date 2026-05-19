@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from scripts.seed_atelier_in_clone import (
+    _atelier_env,
     find_atelier_root,
     ensure_wiki_dir,
     seed_atelier_schema,
@@ -42,6 +43,28 @@ class TestEnsureWikiDir:
         ensure_wiki_dir(clone)
         ensure_wiki_dir(clone)  # must not raise
         assert (clone / ".ai" / "wiki").is_dir()
+
+
+class TestAtelierEnv:
+    def test_atelier_env_does_not_forward_secrets(self, monkeypatch):
+        """_atelier_env must NOT forward ambient credentials to atelier subprocesses."""
+        # Set both safe vars and obvious credentials
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        monkeypatch.setenv("HOME", "/home/testuser")
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "super-secret-value")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-super-secret")
+        monkeypatch.setenv("GH_TOKEN", "ghp_super-secret")
+        monkeypatch.setenv("GITHUB_PERSONAL_ACCESS_TOKEN", "ghp_super-secret-2")
+        env = _atelier_env(Path("/fake/atelier/root"))
+        # Secrets must NOT be present
+        assert "AWS_SECRET_ACCESS_KEY" not in env, "AWS secret leaked into subprocess env"
+        assert "ANTHROPIC_API_KEY" not in env, "Anthropic key leaked into subprocess env"
+        assert "GH_TOKEN" not in env, "gh token leaked into subprocess env"
+        assert "GITHUB_PERSONAL_ACCESS_TOKEN" not in env, "github PAT leaked into subprocess env"
+        # Safe vars must be present
+        assert env.get("PATH") == "/usr/bin:/bin"
+        assert env.get("HOME") == "/home/testuser"
+        assert env.get("PYTHONPATH") == "/fake/atelier/root"
 
 
 class TestSeedSchemaAndRoles:

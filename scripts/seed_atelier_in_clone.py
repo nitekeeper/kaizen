@@ -52,8 +52,18 @@ def find_atelier_root() -> Path:
 
 # ── Subprocess wrappers ────────────────────────────────────────────────────
 
-def _atelier_env(atelier_root: Path) -> dict:
-    env = os.environ.copy()
+def _atelier_env(atelier_root: Path) -> dict[str, str]:
+    """Return a minimal environment dict for atelier subprocesses.
+
+    Forwards only PATH, HOME, PYTHONPATH, and locale/temp-dir vars. Never
+    forwards session tokens, API keys, or other ambient credentials — those
+    have no business reaching subprocesses loaded from a plugin cache.
+    """
+    env: dict[str, str] = {}
+    for key in ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP"):
+        val = os.environ.get(key)
+        if val is not None:
+            env[key] = val
     env["PYTHONPATH"] = str(atelier_root)
     return env
 

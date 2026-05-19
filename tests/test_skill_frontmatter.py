@@ -107,3 +107,12 @@ def test_skill_frontmatter(skill_file: Path) -> None:
 
     # Body after frontmatter must be non-empty
     assert post.strip(), f"{skill_file}: body after frontmatter is empty"
+
+
+def test_expert_roster_sql_uses_correct_column_alias():
+    from pathlib import Path
+    skill_path = Path(__file__).resolve().parents[1] / "internal" / "expert-roster" / "SKILL.md"
+    content = skill_path.read_text()
+    assert "r.role_name" not in content, \
+        "SQL uses r.role_name which does not exist; should be r.name AS role_name"
+    assert "r.name AS role_name" in content

@@ -46,7 +46,7 @@ If an id does not resolve (typo, missing seed), include an entry with `agent_nam
    for aid in <list of agent_ids>:
        cur = conn.execute(
            'SELECT a.id AS agent_id, a.name AS agent_name, a.profile, '
-           '       r.role_name '
+           '       r.name AS role_name '
            'FROM agents a JOIN roles r ON a.role_id = r.id '
            'WHERE a.id = ?',
            (aid,)
@@ -62,7 +62,7 @@ If an id does not resolve (typo, missing seed), include an entry with `agent_nam
    "
    ```
 
-   The column names match atelier's schema: `agents(id TEXT PRIMARY KEY, name TEXT, role_id TEXT, profile TEXT)` joined to `roles(id TEXT PRIMARY KEY, role_name TEXT, ...)`.
+   The column names match atelier's schema: `agents(id TEXT PRIMARY KEY, name TEXT, role_id TEXT, profile TEXT)` joined to `roles(id INTEGER PRIMARY KEY, name TEXT, ...)`.
 
 3. Return the parsed list.
 

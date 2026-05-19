@@ -5,4 +5,4 @@
 # (sqlite3, subprocess, pathlib, json, argparse, datetime — all stdlib.)
 
 # Dev / test
-pytest>=8.0
+pytest>=9.0.3,<10

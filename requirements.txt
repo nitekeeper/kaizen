@@ -1,0 +1,8 @@
+# Kaizen runtime dependencies
+# Python 3.11+ required
+
+# No third-party runtime deps yet — Kaizen uses stdlib only.
+# (sqlite3, subprocess, pathlib, json, argparse, datetime — all stdlib.)
+
+# Dev / test
+pytest>=9.0.3,<10

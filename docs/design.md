@@ -47,7 +47,7 @@ kaizen:improve <git-url> [--cycles N] [--subject "<area to improve>"]
 1. **Resolve target.** Look up `<git-url>` in Kaizen's `projects` table.
    - Found → load stored config.
    - Not found → register: clone, auto-detect (test command, language, read paths), confirm with user, save.
-2. **Clone target** into `<kaizen>/experiment/<owner>-<repo>/`. Set up Atelier's full schema in `<clone>/.ai/memex.db` via `python <atelier>/scripts/migrate.py` + `seed_roles.py`. Ensure `<clone>/.ai/wiki/` exists.
+2. **Clone target** into `<kaizen>/experiment/<owner>-<repo>/`. Set up Atelier's full schema in `<clone>/.ai/memex.db` via `python3 <atelier>/scripts/migrate.py` + `seed_roles.py`. Ensure `<clone>/.ai/wiki/` exists.
 3. **Create run branch** `kaizen/<subject-or-pm>-YYYY-MM-DD-HHMM` in the clone.
 4. **For each cycle 1..N:**
    - PM agenda (Atelier's Phase 1)

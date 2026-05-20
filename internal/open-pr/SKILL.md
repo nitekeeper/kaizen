@@ -30,7 +30,7 @@ Exit 0 means good. Non-zero means re-auth needed — abort and surface the error
 ### Step 2 — Invoke the open-PR helper
 
 ```
-python scripts/pr.py <run_id> <clone_dir>
+python3 scripts/pr.py <run_id> <clone_dir>
 ```
 
 This single command:

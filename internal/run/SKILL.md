@@ -39,7 +39,7 @@ Read `internal/clone-target/SKILL.md` and follow its `setup` operation with `git
 Compute and check out the kaizen branch in the clone:
 
 ```
-python -c "
+python3 -c "
 from pathlib import Path
 from scripts.cycle_git import create_branch
 print(create_branch(Path(r'<clone_dir>'), '<subject-or-empty>'))
@@ -60,7 +60,7 @@ For each `cycle_n` in `1..cycles_requested`:
 2. **If `outcome["status"] == "success"`:** call
 
    ```
-   python -c "
+   python3 -c "
    from scripts.cycle import record_cycle_success
    record_cycle_success(
        db_path='.ai/memex.db',
@@ -78,7 +78,7 @@ For each `cycle_n` in `1..cycles_requested`:
 3. **If `outcome["status"] == "abandoned"`:** record the cycle row, then write the report:
 
    ```
-   python -c "
+   python3 -c "
    from scripts.cycle import record_cycle_abandoned
    row = record_cycle_abandoned(
        db_path='.ai/memex.db',
@@ -99,7 +99,7 @@ For each `cycle_n` in `1..cycles_requested`:
 ### Step 7 — Push the run branch
 
 ```
-python -c "
+python3 -c "
 from pathlib import Path
 from scripts.cycle_git import push_branch
 push_branch(Path(r'<clone_dir>'), '<branch>')

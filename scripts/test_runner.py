@@ -40,10 +40,10 @@ def run_tests_in_clone(clone_dir: Path, test_command: str) -> tuple[bool, int]:
 
 
 if __name__ == "__main__":
-    # Usage: python scripts/test_runner.py <clone_dir> <test_command>
+    # Usage: python3 scripts/test_runner.py <clone_dir> <test_command>
     if len(sys.argv) < 3:
         print(
-            "Usage: python scripts/test_runner.py <clone_dir> <test_command>",
+            "Usage: python3 scripts/test_runner.py <clone_dir> <test_command>",
             file=sys.stderr,
         )
         sys.exit(1)

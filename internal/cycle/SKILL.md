@@ -130,7 +130,7 @@ If, after all rejections, the working tree is clean (no remaining changes), aban
 ### Phase 5b — Tests (with in-cycle fix iteration)
 
 ```
-python -c "
+python3 -c "
 from pathlib import Path
 from scripts.test_runner import run_tests_in_clone
 passed, count = run_tests_in_clone(Path(r'<clone_dir>'), '<project[\"test_command\"]>')
@@ -160,7 +160,7 @@ print('PASS' if passed else 'FAIL', count)
 Compile the decisions and participants into the inputs the commit helper expects, then:
 
 ```
-python -c "
+python3 -c "
 from pathlib import Path
 from scripts.cycle_git import commit_cycle
 commit_cycle(

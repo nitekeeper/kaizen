@@ -28,7 +28,7 @@ The setup script (`scripts/setup.py`) verifies all of these and fails loudly if 
 
 3. Run the setup script from Kaizen's root:
    ```
-   PYTHONPATH=. python scripts/setup.py
+   PYTHONPATH=. python3 scripts/setup.py
    ```
 
    This verifies external dependencies and applies the schema migration to `.ai/memex.db`.

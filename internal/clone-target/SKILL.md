@@ -18,7 +18,7 @@ Wraps `scripts/clone.py` (clone + cleanup) and `scripts/seed_atelier_in_clone.py
 1. Parse owner and repo from the URL:
 
    ```
-   python -c "
+   python3 -c "
    from scripts.run import parse_owner_repo
    owner, repo = parse_owner_repo('<git-url>')
    print(owner, repo)
@@ -32,7 +32,7 @@ Wraps `scripts/clone.py` (clone + cleanup) and `scripts/seed_atelier_in_clone.py
 3. Clone the repo:
 
    ```
-   python scripts/clone.py clone <git-url> <clone-dir>
+   python3 scripts/clone.py clone <git-url> <clone-dir>
    ```
 
    - This invokes `git clone -b main <git-url> <clone-dir>` then sets `user.email=kaizen@kaizen.local` / `user.name=Kaizen` in the clone.
@@ -41,7 +41,7 @@ Wraps `scripts/clone.py` (clone + cleanup) and `scripts/seed_atelier_in_clone.py
 4. Seed atelier into the clone:
 
    ```
-   python scripts/seed_atelier_in_clone.py <clone-dir>
+   python3 scripts/seed_atelier_in_clone.py <clone-dir>
    ```
 
    This invokes atelier's `migrate.py` and `seed_roles.py` against `<clone>/.ai/memex.db`, then ensures `<clone>/.ai/wiki/` exists. Requires atelier to be on disk (verified by `scripts/setup.py`).
@@ -55,7 +55,7 @@ Wraps `scripts/clone.py` (clone + cleanup) and `scripts/seed_atelier_in_clone.py
 1. Invoke cleanup:
 
    ```
-   python scripts/clone.py cleanup <clone-dir>
+   python3 scripts/clone.py cleanup <clone-dir>
    ```
 
    This calls `scripts.platform_utils.safe_rmtree`, which handles read-only files (common in `.git/objects/` on Windows). Safe to call when the directory does not exist.

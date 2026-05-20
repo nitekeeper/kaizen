@@ -153,9 +153,9 @@ def detect_destructive(diff_text: str, repo_dir: Path) -> list[dict]:
 
 
 if __name__ == "__main__":
-    # CLI: python scripts/destructive_check.py <clone_dir>
+    # CLI: python3 scripts/destructive_check.py <clone_dir>
     if len(sys.argv) < 2:
-        print("Usage: python scripts/destructive_check.py <clone_dir>")
+        print("Usage: python3 scripts/destructive_check.py <clone_dir>")
         sys.exit(1)
     clone_dir = Path(sys.argv[1])
     diff = get_diff(clone_dir)

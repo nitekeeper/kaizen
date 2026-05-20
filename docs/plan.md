@@ -43,7 +43,7 @@ Commit: `feat: kaizen DB schema + migration runner`
 
 ## Wave 2 — Project CRUD + auto-detect
 
-Goal: `python scripts/project.py register <git-url>` works end-to-end (clone, detect, confirm via stdout/stdin, write row).
+Goal: `python3 scripts/project.py register <git-url>` works end-to-end (clone, detect, confirm via stdout/stdin, write row).
 
 New:
 - `scripts/project.py` — CRUD CLI (register, get, list, edit, delete)
@@ -97,7 +97,7 @@ Commit: `feat: vendor clone, destructive-check, test-runner from atelier`
 
 ## Wave 4 — Run + cycle orchestration
 
-Goal: `python scripts/run.py <project_id> --cycles N --subject "..."` executes the full multi-cycle flow against the registered project's clone, with abandonment handling and run-record tracking.
+Goal: `python3 scripts/run.py <project_id> --cycles N --subject "..."` executes the full multi-cycle flow against the registered project's clone, with abandonment handling and run-record tracking.
 
 New:
 - `scripts/run.py` — top-level orchestrator: load project, clone, seed atelier, create run row + branch, loop cycles, write run summary, cleanup. Returns enough state for PR-open step.
@@ -115,7 +115,7 @@ Commit: `feat: run + cycle orchestration with abandonment handling`
 
 ## Wave 5 — PR open
 
-Goal: `python scripts/pr.py <run_id>` opens the bundled PR via `gh pr create`.
+Goal: `python3 scripts/pr.py <run_id>` opens the bundled PR via `gh pr create`.
 
 New:
 - `scripts/pr.py` — read run + cycles + abandonments from DB, render PR body from template (design §4.6), invoke `gh pr create`, write returned URL back to `runs.pr_url`.
@@ -127,7 +127,7 @@ Commit: `feat: bundled PR open via gh CLI`
 
 ## Wave 6 — Setup script + dependency verification
 
-Goal: `python scripts/setup.py` verifies all external deps and runs the migration.
+Goal: `python3 scripts/setup.py` verifies all external deps and runs the migration.
 
 New:
 - `scripts/setup.py` — checks `git --version`, `gh auth status`, `memex --version`, atelier slash commands available (via filesystem check at the agora install path or a documented env var). Runs `migrate.py` against `.ai/memex.db`. Exit non-zero with actionable messages on failure.

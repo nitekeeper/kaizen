@@ -38,7 +38,7 @@ If an id does not resolve (typo, missing seed), include an entry with `agent_nam
 2. For each `agent_id` in `roster_ids`, query the seeded atelier DB:
 
    ```
-   python -c "
+   python3 -c "
    import json, sqlite3
    conn = sqlite3.connect(r'<clone_dir>/.ai/memex.db')
    conn.row_factory = sqlite3.Row

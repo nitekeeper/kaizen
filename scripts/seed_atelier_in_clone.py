@@ -180,10 +180,10 @@ def seed_all(clone_dir: Path) -> None:
 
 
 if __name__ == "__main__":
-    # Usage: python scripts/seed_atelier_in_clone.py <clone-dir>
+    # Usage: python3 scripts/seed_atelier_in_clone.py <clone-dir>
     if len(sys.argv) < 2:
         print(
-            "Usage: python scripts/seed_atelier_in_clone.py <clone-dir>",
+            "Usage: python3 scripts/seed_atelier_in_clone.py <clone-dir>",
             file=sys.stderr,
         )
         sys.exit(1)

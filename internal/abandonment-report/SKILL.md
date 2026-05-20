@@ -32,7 +32,7 @@ The inserted `abandonments` row dict (includes the assigned `id` and the `report
 `scripts/abandonment.process_abandonment` does the whole sequence — format the markdown, attempt the memex capture (best-effort; warns and continues if `memex` is unavailable), and insert the abandonments row.
 
 ```
-python -c "
+python3 -c "
 import json
 from scripts.abandonment import process_abandonment
 project = json.loads('''<project JSON>''')
@@ -60,7 +60,7 @@ Parse the JSON on stdout and return as a dict.
 If you need to review the rendered report before it goes to memex:
 
 ```
-python -c "
+python3 -c "
 from scripts.abandonment import format_report
 md = format_report(
     project_name='<name>',
@@ -81,7 +81,7 @@ print(md)
 Inspect the output. If satisfied, capture it:
 
 ```
-python -c "
+python3 -c "
 from scripts.abandonment import capture_to_memex
 slug = capture_to_memex('kaizen:abandonment:<run_id>-cycle-<cycle_n>', open('<tmp file with markdown>').read())
 print(slug)
@@ -91,7 +91,7 @@ print(slug)
 Then record the row:
 
 ```
-python -c "
+python3 -c "
 import json
 from scripts.abandonment import record_abandonment
 row = record_abandonment(

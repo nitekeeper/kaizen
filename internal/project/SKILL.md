@@ -22,7 +22,7 @@ All operations use the kaizen DB at the default path `.ai/memex.db` (passed impl
 ### get-by-url
 
 ```
-python scripts/project.py get-by-url <git-url>
+python3 scripts/project.py get-by-url <git-url>
 ```
 
 - Exit 0 with JSON on stdout: parse and return as a dict.
@@ -40,7 +40,7 @@ The returned dict has these keys (notable ones): `id`, `git_url`, `name`, `base_
 3. Invoke the interactive register flow:
 
    ```
-   python scripts/project.py register <git-url>
+   python3 scripts/project.py register <git-url>
    ```
 
    This subprocess:
@@ -61,7 +61,7 @@ The returned dict has these keys (notable ones): `id`, `git_url`, `name`, `base_
 ### list
 
 ```
-python scripts/project.py list
+python3 scripts/project.py list
 ```
 
 Returns a JSON array on stdout. Render as a table: `id | name | language | git_url | last_run_at`.
@@ -69,7 +69,7 @@ Returns a JSON array on stdout. Render as a table: `id | name | language | git_u
 ### edit
 
 ```
-python scripts/project.py edit <id> --field=value [--field=value ...]
+python3 scripts/project.py edit <id> --field=value [--field=value ...]
 ```
 
 Updatable fields: `git_url`, `name`, `base_branch`, `test_command`, `read_paths`, `expert_roster`, `language`, `last_run_at`, `notes`.

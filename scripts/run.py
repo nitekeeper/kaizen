@@ -197,7 +197,7 @@ def orchestrate_run(
     if project is None:
         raise RuntimeError(
             f"No project registered for {git_url!r}. Register it first:\n"
-            f"  python scripts/project.py register {git_url}"
+            f"  python3 scripts/project.py register {git_url}"
         )
 
     # 2. Clone target

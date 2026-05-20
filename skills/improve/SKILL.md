@@ -35,7 +35,7 @@ Priority order when instructions conflict:
 Run from the Kaizen repo root:
 
 ```
-python scripts/setup.py
+python3 scripts/setup.py
 ```
 
 This verifies `git`, `gh` (authenticated), `memex`, atelier on disk, and Python ≥ 3.11. If any check fails, the script prints actionable instructions and exits non-zero. **Abort** — do not proceed. Surface the script's output to the user verbatim and stop.

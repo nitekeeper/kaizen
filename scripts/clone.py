@@ -42,13 +42,13 @@ def cleanup_experiment(experiment_dir: Path) -> None:
 
 if __name__ == "__main__":
     # Usage:
-    #   python scripts/clone.py clone <git-url> <dest>
-    #   python scripts/clone.py cleanup <experiment-dir>
+    #   python3 scripts/clone.py clone <git-url> <dest>
+    #   python3 scripts/clone.py cleanup <experiment-dir>
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
 
     if cmd == "clone":
         if len(sys.argv) < 4:
-            print("Usage: python scripts/clone.py clone <git-url> <dest>", file=sys.stderr)
+            print("Usage: python3 scripts/clone.py clone <git-url> <dest>", file=sys.stderr)
             sys.exit(1)
         remote_url = sys.argv[2]
         dest = Path(sys.argv[3])
@@ -57,7 +57,7 @@ if __name__ == "__main__":
 
     elif cmd == "cleanup":
         if len(sys.argv) < 3:
-            print("Usage: python scripts/clone.py cleanup <experiment-dir>", file=sys.stderr)
+            print("Usage: python3 scripts/clone.py cleanup <experiment-dir>", file=sys.stderr)
             sys.exit(1)
         cleanup_experiment(Path(sys.argv[2]))
         print("experiment/ removed.")

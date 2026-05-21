@@ -268,6 +268,96 @@ def test_orchestrate_run_all_abandoned(db, project, tmp_path, monkeypatch):
     assert len(result["abandonments"]) == 3
 
 
+def test_orchestrate_run_removes_stale_experiment_dir(db, project, tmp_path, monkeypatch):
+    """H2: a pre-existing experiment_dir from a crashed prior run must be
+    removed before clone_repo runs, so `git clone` doesn't fail with
+    'destination path already exists'."""
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+
+    # Pre-create a stale clone dir with a sentinel file inside.
+    stale_dir = tmp_path / "experiment" / "owner-repo"
+    stale_dir.mkdir(parents=True, exist_ok=True)
+    sentinel = stale_dir / "STALE_SENTINEL.txt"
+    sentinel.write_text("leftover from a previous crashed run")
+    assert sentinel.exists()
+
+    # Wrap fake_clone so we can confirm it was called with the expected args
+    # *after* the stale-dir cleanup happened.
+    clone_calls: list[tuple] = []
+
+    def fake_clone(remote_url, dest, branch):
+        clone_calls.append((remote_url, dest, branch))
+        # The sentinel must already be gone by the time clone runs.
+        assert not sentinel.exists(), "stale experiment_dir was not cleaned before clone_repo ran"
+        dest.mkdir(parents=True, exist_ok=True)
+
+    import scripts.clone as clone_mod
+
+    monkeypatch.setattr(clone_mod, "clone_repo", fake_clone)
+
+    result = orchestrate_run(
+        db_path=db,
+        git_url=project["git_url"],
+        cycles_requested=1,
+        cycle_executor=lambda *a: {
+            "status": "success",
+            "commit_sha": "x",
+            "minutes_memex_slug": None,
+        },
+    )
+
+    # The sentinel must be gone (proves rmtree happened).
+    assert not sentinel.exists()
+    # fake_clone must have been invoked with the right args.
+    assert len(clone_calls) == 1
+    remote_url, dest, branch = clone_calls[0]
+    assert remote_url == project["git_url"]
+    assert dest == stale_dir
+    assert branch == project["base_branch"]
+    assert result["status"] == "complete"
+
+
+def test_orchestrate_run_cleans_up_on_seed_failure(db, project, tmp_path, monkeypatch):
+    """M1: if seed_all raises, experiment_dir must be torn down before the
+    exception propagates so the next run isn't blocked by a half-initialized
+    clone."""
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+
+    # Stub clone to materialize the experiment_dir on disk.
+    import scripts.clone as clone_mod
+
+    experiment_dir = tmp_path / "experiment" / "owner-repo"
+
+    def fake_clone(remote_url, dest, branch):
+        dest.mkdir(parents=True, exist_ok=True)
+        (dest / "marker.txt").write_text("clone artefact")
+
+    monkeypatch.setattr(clone_mod, "clone_repo", fake_clone)
+
+    # Stub seed_all to raise.
+    import scripts.seed_atelier_in_clone as seed_mod
+
+    def boom_seed(_d):
+        raise RuntimeError("seed boom")
+
+    monkeypatch.setattr(seed_mod, "seed_all", boom_seed)
+
+    with pytest.raises(RuntimeError, match="seed boom"):
+        orchestrate_run(
+            db_path=db,
+            git_url=project["git_url"],
+            cycles_requested=1,
+            cycle_executor=lambda *a: {
+                "status": "success",
+                "commit_sha": "x",
+                "minutes_memex_slug": None,
+            },
+        )
+
+    # The half-initialized clone must have been removed.
+    assert not experiment_dir.exists()
+
+
 def test_orchestrate_run_push_failure_leaves_clone(db, project, tmp_path, monkeypatch):
     _install_orchestrator_stubs(monkeypatch, tmp_path)
 

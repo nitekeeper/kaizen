@@ -183,7 +183,7 @@ def orchestrate_run(
     """
     # Local imports keep cycle.py / clone.py / etc. optional at import time.
     from scripts.abandonment import process_abandonment
-    from scripts.clone import clone_repo
+    from scripts.clone import cleanup_experiment, clone_repo
     from scripts.cycle import (
         execute_cycle as default_executor,
     )
@@ -209,10 +209,17 @@ def orchestrate_run(
 
     # 2. Clone target
     experiment_dir = experiment_dir_for(kaizen_root(), git_url)
+    # H2: drop stale clone from a prior crashed run before re-cloning.
+    cleanup_experiment(experiment_dir)
     clone_repo(git_url, experiment_dir, project["base_branch"])
 
     # 3. Seed atelier
-    seed_all(experiment_dir)
+    # M1: tear down half-initialized clone before re-raising.
+    try:
+        seed_all(experiment_dir)
+    except Exception:
+        cleanup_experiment(experiment_dir)
+        raise
 
     # 4. Branch
     branch = create_branch(experiment_dir, subject)

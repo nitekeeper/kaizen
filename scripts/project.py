@@ -3,13 +3,14 @@
 Each project row stores the auto-detected (and user-confirmed) config used
 when running a multi-cycle improvement against the target repository.
 """
+
 from __future__ import annotations
 
 import json
 import re
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from scripts.db import get_connection
@@ -18,9 +19,15 @@ DEFAULT_DB_PATH = ".ai/memex.db"
 
 # Fields the user can mutate via update_project.
 _UPDATABLE = {
-    "git_url", "name", "base_branch", "test_command",
-    "read_paths", "expert_roster", "language",
-    "last_run_at", "notes",
+    "git_url",
+    "name",
+    "base_branch",
+    "test_command",
+    "read_paths",
+    "expert_roster",
+    "language",
+    "last_run_at",
+    "notes",
 }
 
 # Fields that are stored as JSON-encoded TEXT but exposed as Python lists.
@@ -28,11 +35,11 @@ _JSON_LIST_FIELDS = ("read_paths", "expert_roster")
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _row_to_dict(row, cols) -> dict:
-    out = dict(zip(cols, row))
+    out = dict(zip(cols, row, strict=False))
     for field in _JSON_LIST_FIELDS:
         raw = out.get(field)
         if isinstance(raw, str):
@@ -44,6 +51,7 @@ def _row_to_dict(row, cols) -> dict:
 
 
 # ── CRUD ───────────────────────────────────────────────────────────────────
+
 
 def create_project(
     db_path: str,
@@ -66,9 +74,16 @@ def create_project(
             " language, registered_at, last_run_at, notes) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
-                git_url, name, base_branch, test_command,
-                json.dumps(read_paths), json.dumps(expert_roster),
-                language, now, None, notes,
+                git_url,
+                name,
+                base_branch,
+                test_command,
+                json.dumps(read_paths),
+                json.dumps(expert_roster),
+                language,
+                now,
+                None,
+                notes,
             ),
         )
         conn.commit()
@@ -123,11 +138,13 @@ def update_project(db_path: str, project_id: int, **fields) -> dict:
     for field in _JSON_LIST_FIELDS:
         if field in updates and not isinstance(updates[field], str):
             updates[field] = json.dumps(updates[field])
+    # nosec B608 — `set_clause` column names are filtered through the
+    # _UPDATABLE whitelist (line above); values flow through `?` binding.
     set_clause = ", ".join(f"{k} = ?" for k in updates)
     conn = get_connection(db_path)
     try:
         conn.execute(
-            f"UPDATE projects SET {set_clause} WHERE id = ?",
+            f"UPDATE projects SET {set_clause} WHERE id = ?",  # nosec B608
             (*updates.values(), project_id),
         )
         conn.commit()
@@ -148,6 +165,7 @@ def delete_project(db_path: str, project_id: int) -> bool:
 
 # ── Registration flow helpers ───────────────────────────────────────────────
 
+
 def _name_from_url(git_url: str) -> str:
     """Derive a project name from a git URL: https://.../owner/repo.git -> repo."""
     stem = git_url.rstrip("/").split("/")[-1]
@@ -158,8 +176,10 @@ def _name_from_url(git_url: str) -> str:
 
 def _prompt(label: str, default):
     """Prompt with default shown. Empty input returns the default unchanged."""
-    rendered = json.dumps(default) if isinstance(default, (list, dict)) else (
-        "" if default is None else str(default)
+    rendered = (
+        json.dumps(default)
+        if isinstance(default, (list, dict))
+        else ("" if default is None else str(default))
     )
     try:
         raw = input(f"{label} [{rendered}]: ").strip()
@@ -191,7 +211,7 @@ def _edit_detected(detected: dict) -> dict:
 
 def _register_cli(git_url: str, db_path: str) -> int:
     """Run the interactive register flow. Returns process exit code."""
-    from scripts.clone import clone_repo, cleanup_experiment  # local to avoid import-time cost
+    from scripts.clone import cleanup_experiment, clone_repo  # local to avoid import-time cost
     from scripts.detect_config import detect_all
 
     existing = get_project_by_url(db_path, git_url)
@@ -204,7 +224,7 @@ def _register_cli(git_url: str, db_path: str) -> int:
         print(f"Cloning {git_url} ... ", end="", flush=True)
         try:
             clone_repo(git_url, dest)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             print("failed.")
             print(f"clone error: {exc}", file=sys.stderr)
             return 2
@@ -271,6 +291,7 @@ def _register_cli(git_url: str, db_path: str) -> int:
 
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
+
 def _parse_edit_args(args: list[str]) -> dict:
     """Parse --field=value pairs. JSON-parses values for list fields."""
     out: dict = {}
@@ -284,8 +305,8 @@ def _parse_edit_args(args: list[str]) -> dict:
                 parsed = json.loads(raw)
                 if not isinstance(parsed, list):
                     raise ValueError
-            except (json.JSONDecodeError, ValueError):
-                raise SystemExit(f"--{key} expects a JSON array, got: {raw!r}")
+            except (json.JSONDecodeError, ValueError) as err:
+                raise SystemExit(f"--{key} expects a JSON array, got: {raw!r}") from err
             out[key] = parsed
         else:
             out[key] = raw
@@ -337,8 +358,7 @@ def main(argv: list[str]) -> int:
 
     if cmd == "edit":
         if not rest:
-            print("Usage: project.py edit <id> --field=value [--field=value]...",
-                  file=sys.stderr)
+            print("Usage: project.py edit <id> --field=value [--field=value]...", file=sys.stderr)
             return 1
         project_id = int(rest[0])
         fields = _parse_edit_args(rest[1:])

@@ -3,15 +3,15 @@
 Branch naming format:
     kaizen/<subject-slug-or-pm-directed>-YYYY-MM-DD-HHMM
 """
+
 from __future__ import annotations
 
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from scripts.git_utils import git as _git
-
 
 # ── Slug helper ────────────────────────────────────────────────────────────
 
@@ -43,13 +43,14 @@ def _slugify(subject: str | None) -> str:
 
 # ── Public functions ───────────────────────────────────────────────────────
 
+
 def create_branch(clone_dir: Path, subject: str | None) -> str:
     """Create and checkout kaizen/<slug>-YYYY-MM-DD-HHMM. Returns branch name.
 
     subject is slugified; when None, uses 'pm-directed'.
     Timestamp is UTC.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     date_str = now.strftime("%Y-%m-%d")
     time_str = now.strftime("%H%M")
     slug = _slugify(subject)

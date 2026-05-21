@@ -1,4 +1,5 @@
 """Run a configurable test command inside a clone and parse pass counts."""
+
 from __future__ import annotations
 
 import re

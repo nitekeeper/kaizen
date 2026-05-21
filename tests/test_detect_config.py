@@ -1,4 +1,5 @@
 """Tests for scripts/detect_config.py — language, test command, read paths."""
+
 from __future__ import annotations
 
 import json
@@ -15,8 +16,8 @@ from scripts.detect_config import (
     detect_test_command,
 )
 
-
 # ── Fixture builders ────────────────────────────────────────────────────────
+
 
 def _make_python_repo(root: Path, marker: str = "pyproject.toml") -> Path:
     (root / marker).write_text("# python project\n", encoding="utf-8")
@@ -32,7 +33,7 @@ def _make_javascript_repo(root: Path, test_script: str | None = "jest --coverage
 
 
 def _make_rust_repo(root: Path) -> Path:
-    (root / "Cargo.toml").write_text("[package]\nname = \"demo\"\n", encoding="utf-8")
+    (root / "Cargo.toml").write_text('[package]\nname = "demo"\n', encoding="utf-8")
     return root
 
 
@@ -42,6 +43,7 @@ def _make_go_repo(root: Path) -> Path:
 
 
 # ── Language detection ─────────────────────────────────────────────────────
+
 
 def test_detect_language_python_pyproject(tmp_path):
     _make_python_repo(tmp_path, "pyproject.toml")
@@ -85,6 +87,7 @@ def test_detect_language_unknown(tmp_path):
 
 # ── Test command detection ─────────────────────────────────────────────────
 
+
 def test_detect_test_command_python(tmp_path):
     assert detect_test_command(tmp_path, "python") == "pytest -v --tb=short"
 
@@ -118,6 +121,7 @@ def test_detect_test_command_unknown_returns_none(tmp_path):
 
 # ── Read paths ─────────────────────────────────────────────────────────────
 
+
 @pytest.mark.parametrize(
     "language,expected",
     [
@@ -133,6 +137,7 @@ def test_detect_read_paths(tmp_path, language, expected):
 
 
 # ── Expert roster ──────────────────────────────────────────────────────────
+
 
 def test_default_expert_roster_python_has_standing_plus_python_specialists():
     roster = default_expert_roster("python")
@@ -167,12 +172,19 @@ def test_default_expert_roster_go_specialists():
 
 # ── detect_all aggregator ──────────────────────────────────────────────────
 
+
 def test_detect_all_python(tmp_path):
     _make_python_repo(tmp_path)
     out = detect_all(tmp_path)
     assert out["language"] == "python"
     assert out["test_command"] == "pytest -v --tb=short"
-    assert out["read_paths"] == ["scripts/*.py", "tests/*.py", "skills/*/SKILL.md", "CLAUDE.md", "README.md"]
+    assert out["read_paths"] == [
+        "scripts/*.py",
+        "tests/*.py",
+        "skills/*/SKILL.md",
+        "CLAUDE.md",
+        "README.md",
+    ]
     assert "backend-engineer-1" in out["expert_roster"]
 
 

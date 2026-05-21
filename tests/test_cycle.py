@@ -1,9 +1,9 @@
 """Tests for scripts/cycle.py — per-cycle DB row writes + stub executor."""
+
 from __future__ import annotations
 
 import pytest
 
-from scripts.migrate import MIGRATIONS_DIR, apply_migrations
 from scripts.cycle import (
     execute_cycle,
     get_cycle,
@@ -11,8 +11,9 @@ from scripts.cycle import (
     record_cycle_abandoned,
     record_cycle_success,
 )
-from scripts.run import create_run
+from scripts.migrate import MIGRATIONS_DIR, apply_migrations
 from scripts.project import create_project
+from scripts.run import create_run
 
 
 @pytest.fixture
@@ -90,12 +91,9 @@ def test_get_cycle_returns_row_or_none(db, run_row):
 
 
 def test_list_cycles_orders_by_cycle_n(db, run_row):
-    record_cycle_success(db, run_row["id"], 3, "c", "sha3", None,
-                        "2026-05-16T12:00:00+00:00")
-    record_cycle_abandoned(db, run_row["id"], 1, "a",
-                           "2026-05-16T12:00:00+00:00")
-    record_cycle_success(db, run_row["id"], 2, "b", "sha2", None,
-                        "2026-05-16T12:00:00+00:00")
+    record_cycle_success(db, run_row["id"], 3, "c", "sha3", None, "2026-05-16T12:00:00+00:00")
+    record_cycle_abandoned(db, run_row["id"], 1, "a", "2026-05-16T12:00:00+00:00")
+    record_cycle_success(db, run_row["id"], 2, "b", "sha2", None, "2026-05-16T12:00:00+00:00")
     rows = list_cycles(db, run_row["id"])
     assert [r["cycle_n"] for r in rows] == [1, 2, 3]
     assert [r["status"] for r in rows] == ["abandoned", "success", "success"]

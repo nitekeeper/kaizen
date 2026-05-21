@@ -1,9 +1,9 @@
 """Tests for scripts/abandonment.py — report format + memex + DB."""
+
 from __future__ import annotations
 
 import pytest
 
-import scripts.abandonment as ab_mod
 from scripts.abandonment import (
     format_report,
     process_abandonment,
@@ -35,17 +35,24 @@ def run_and_cycle(db) -> dict:
         language="python",
     )
     run = create_run(
-        db, project_id=project["id"], branch="kaizen/x-2026-05-16-1200",
-        cycles_requested=1, subject="x",
+        db,
+        project_id=project["id"],
+        branch="kaizen/x-2026-05-16-1200",
+        cycles_requested=1,
+        subject="x",
     )
     cycle = record_cycle_abandoned(
-        db, run_id=run["id"], cycle_n=1, subject="x",
+        db,
+        run_id=run["id"],
+        cycle_n=1,
+        subject="x",
         started_at="2026-05-16T12:00:00+00:00",
     )
     return {"project": project, "run": run, "cycle": cycle}
 
 
 # ── format_report ──────────────────────────────────────────────────────────
+
 
 def test_format_report_includes_all_required_fields():
     md = format_report(
@@ -81,9 +88,16 @@ def test_format_report_includes_all_required_fields():
 
 def test_format_report_handles_missing_subject_and_empty_lists():
     md = format_report(
-        project_name="o-r", git_url="u", run_id=1, cycle_n=1,
-        subject=None, participants=[], phase_reached="agenda",
-        reason="other", detail="d", artifacts=[],
+        project_name="o-r",
+        git_url="u",
+        run_id=1,
+        cycle_n=1,
+        subject=None,
+        participants=[],
+        phase_reached="agenda",
+        reason="other",
+        detail="d",
+        artifacts=[],
     )
     assert "Subject: PM-directed" in md
     assert "Participants: (none recorded)" in md
@@ -91,6 +105,7 @@ def test_format_report_handles_missing_subject_and_empty_lists():
 
 
 # ── record_abandonment ────────────────────────────────────────────────────
+
 
 def test_record_abandonment_inserts_row(db, run_and_cycle):
     row = record_abandonment(
@@ -110,6 +125,7 @@ def test_record_abandonment_inserts_row(db, run_and_cycle):
 
 
 # ── process_abandonment full flow ──────────────────────────────────────────
+
 
 def test_process_abandonment_full_flow(db, run_and_cycle):
     row = process_abandonment(

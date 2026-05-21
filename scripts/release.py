@@ -28,6 +28,10 @@ from pathlib import Path
 _INCLUDE_DIRS = [".claude-plugin", "scripts", "skills", "internal", "migrations"]
 _INCLUDE_FILES = ["pyproject.toml", "requirements.txt", "README.md", "CLAUDE.md", "CHANGELOG.md"]
 
+# Files that MUST land in the dist bundle. If any of these is missing from the
+# repo at build time, abort rather than silently shipping a broken tarball.
+_REQUIRED_FILES = frozenset({"README.md", "CHANGELOG.md", ".claude-plugin/plugin.json"})
+
 
 def _hash_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -158,6 +162,15 @@ clone. The user's local copy of the target repo is never touched.
             "bytes": (version_dir / "INSTALL.md").stat().st_size,
         }
     )
+
+    # Sanity gate: every required file must have landed in the bundle.
+    missing = [rel for rel in _REQUIRED_FILES if not (version_dir / rel).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Release bundle is missing required files: {sorted(missing)}. "
+            "Aborting — the repo must contain README.md, CHANGELOG.md, "
+            "and .claude-plugin/plugin.json before building a release."
+        )
 
     # Manifest
     manifest = {

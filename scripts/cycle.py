@@ -18,22 +18,24 @@ and avoids a sentinel state. The trade-off: a mid-cycle crash leaves no
 `cycles` row. Post-mortem analysis can still detect unaccounted cycles by
 comparing `runs.cycles_requested` against `cycles_succeeded + cycles_abandoned`.
 """
+
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from scripts.db import get_connection
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _row_to_dict(row, cols) -> dict:
-    return dict(zip(cols, row))
+    return dict(zip(cols, row, strict=False))
 
 
 # ── DB writes ───────────────────────────────────────────────────────────────
+
 
 def record_cycle_success(
     db_path: str,
@@ -55,8 +57,7 @@ def record_cycle_success(
             "(run_id, cycle_n, subject, status, commit_sha, minutes_memex_slug, "
             " started_at, ended_at) "
             "VALUES (?, ?, ?, 'success', ?, ?, ?, ?)",
-            (run_id, cycle_n, subject, commit_sha, minutes_memex_slug,
-             started_at, ended_at),
+            (run_id, cycle_n, subject, commit_sha, minutes_memex_slug, started_at, ended_at),
         )
         conn.commit()
         new_id = cur.lastrowid
@@ -125,6 +126,7 @@ def list_cycles(db_path: str, run_id: int) -> list[dict]:
 
 
 # ── Stub executor (Wave 7 fills this in via SKILL prose) ────────────────────
+
 
 def execute_cycle(clone_dir, project: dict, run_row: dict, cycle_n: int) -> dict:
     """Default cycle executor — Wave 4 stub.

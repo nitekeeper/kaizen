@@ -6,6 +6,7 @@ Wraps subprocess invocations of atelier's `scripts/migrate.py` and
 Resolves atelier's location from the Agora plugin cache
 (~/.claude/plugins/cache/agora/atelier/<version>/); see find_atelier_root().
 """
+
 from __future__ import annotations
 
 import json
@@ -14,7 +15,6 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
-
 
 # ── Locate atelier ─────────────────────────────────────────────────────────
 
@@ -47,12 +47,12 @@ def find_atelier_root() -> Path:
         if _looks_like_atelier(candidate):
             return candidate
     raise RuntimeError(
-        f"No valid Atelier installation found in {_AGORA_ATELIER}. "
-        "Reinstall Atelier via Agora."
+        f"No valid Atelier installation found in {_AGORA_ATELIER}. Reinstall Atelier via Agora."
     )
 
 
 # ── Subprocess wrappers ────────────────────────────────────────────────────
+
 
 def _atelier_env(atelier_root: Path) -> dict[str, str]:
     """Return a minimal environment dict for atelier subprocesses.
@@ -88,9 +88,7 @@ def _copy_roles_agents_from_atelier(clone_dir: Path) -> None:
     try:
         agents_db_path = registry["agents"]["path"]
     except KeyError as exc:
-        raise RuntimeError(
-            f"Memex registry has no 'agents' store: {registry_path}"
-        ) from exc
+        raise RuntimeError(f"Memex registry has no 'agents' store: {registry_path}") from exc
 
     dst_db = str(clone_dir / ".ai" / "memex.db")
     src_conn = sqlite3.connect(agents_db_path)

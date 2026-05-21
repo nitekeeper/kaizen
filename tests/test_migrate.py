@@ -4,7 +4,7 @@ from contextlib import closing
 import pytest
 
 from scripts.db import get_connection
-from scripts.migrate import apply_migrations, MIGRATIONS_DIR
+from scripts.migrate import MIGRATIONS_DIR, apply_migrations
 
 
 def test_all_tables_created(tmp_path):
@@ -12,9 +12,12 @@ def test_all_tables_created(tmp_path):
     db_path = str(tmp_path / "test.db")
     apply_migrations(db_path, MIGRATIONS_DIR)
     with closing(get_connection(db_path)) as conn:
-        tables = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-        ).fetchall()}
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
     expected = {"projects", "runs", "cycles", "abandonments", "migrations"}
     assert expected == tables
 
@@ -44,9 +47,12 @@ def test_fk_indexes_created(tmp_path):
     db_path = str(tmp_path / "test.db")
     apply_migrations(db_path, MIGRATIONS_DIR)
     with closing(get_connection(db_path)) as conn:
-        indexes = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'"
-        ).fetchall()}
+        indexes = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
     for expected_idx in ("idx_runs_project_id", "idx_cycles_run_id", "idx_abandonments_cycle_id"):
         assert expected_idx in indexes, f"Missing index {expected_idx!r}"
 
@@ -59,6 +65,7 @@ def test_apply_migrations_closes_connection_on_error(tmp_path, monkeypatch):
     (bad_dir / "001_bad.sql").write_text("INVALID SQL HERE;;;")
     # Pre-fail check: function should raise but the connection must be closed
     import scripts.migrate as migrate
+
     with pytest.raises(sqlite3.Error):
         migrate.apply_migrations(db_path, bad_dir)
     # After raising, opening a fresh connection in WAL mode must not be blocked
@@ -88,12 +95,14 @@ def _insert_run_and_cycle(conn, project_id):
     """Insert a minimal run + cycle pair under the given project_id; return cycle_id."""
     conn.execute(
         "INSERT INTO runs (project_id, branch, cycles_requested, started_at, status) "
-        "VALUES (?, 'kaizen/test', 1, datetime('now'), 'running')", (project_id,)
+        "VALUES (?, 'kaizen/test', 1, datetime('now'), 'running')",
+        (project_id,),
     )
     run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.execute(
         "INSERT INTO cycles (run_id, cycle_n, status, started_at) "
-        "VALUES (?, 1, 'abandoned', datetime('now'))", (run_id,)
+        "VALUES (?, 1, 'abandoned', datetime('now'))",
+        (run_id,),
     )
     cycle_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
     conn.commit()
@@ -114,39 +123,36 @@ def test_runs_fk_rejects_bogus_project_id(tmp_path):
     """Insert into runs with non-existent project_id raises IntegrityError."""
     db_path = str(tmp_path / "test.db")
     apply_migrations(db_path, MIGRATIONS_DIR)
-    with closing(get_connection(db_path)) as conn:
-        with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(
-                "INSERT INTO runs (project_id, branch, cycles_requested, started_at, status) "
-                "VALUES (99999, 'kaizen/test', 1, datetime('now'), 'running')"
-            )
-            conn.commit()
+    with closing(get_connection(db_path)) as conn, pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO runs (project_id, branch, cycles_requested, started_at, status) "
+            "VALUES (99999, 'kaizen/test', 1, datetime('now'), 'running')"
+        )
+        conn.commit()
 
 
 def test_cycles_fk_rejects_bogus_run_id(tmp_path):
     """Insert into cycles with non-existent run_id raises IntegrityError."""
     db_path = str(tmp_path / "test.db")
     apply_migrations(db_path, MIGRATIONS_DIR)
-    with closing(get_connection(db_path)) as conn:
-        with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(
-                "INSERT INTO cycles (run_id, cycle_n, status, started_at) "
-                "VALUES (99999, 1, 'success', datetime('now'))"
-            )
-            conn.commit()
+    with closing(get_connection(db_path)) as conn, pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO cycles (run_id, cycle_n, status, started_at) "
+            "VALUES (99999, 1, 'success', datetime('now'))"
+        )
+        conn.commit()
 
 
 def test_abandonments_fk_rejects_bogus_cycle_id(tmp_path):
     """Insert into abandonments with non-existent cycle_id raises IntegrityError."""
     db_path = str(tmp_path / "test.db")
     apply_migrations(db_path, MIGRATIONS_DIR)
-    with closing(get_connection(db_path)) as conn:
-        with pytest.raises(sqlite3.IntegrityError):
-            conn.execute(
-                "INSERT INTO abandonments (cycle_id, phase_reached, reason, detail, created_at) "
-                "VALUES (99999, 'meeting', 'no_consensus', 'test', datetime('now'))"
-            )
-            conn.commit()
+    with closing(get_connection(db_path)) as conn, pytest.raises(sqlite3.IntegrityError):
+        conn.execute(
+            "INSERT INTO abandonments (cycle_id, phase_reached, reason, detail, created_at) "
+            "VALUES (99999, 'meeting', 'no_consensus', 'test', datetime('now'))"
+        )
+        conn.commit()
 
 
 def test_cycles_status_check_rejects_invalid(tmp_path):
@@ -198,7 +204,7 @@ def test_abandonments_phase_reached_check_rejects_invalid(tmp_path):
             conn.execute(
                 "INSERT INTO abandonments (cycle_id, phase_reached, reason, detail, created_at) "
                 "VALUES (?, 'invalid-phase', 'no_consensus', 'detail', datetime('now'))",
-                (cycle_id,)
+                (cycle_id,),
             )
             conn.commit()
 
@@ -214,7 +220,7 @@ def test_abandonments_reason_check_rejects_push_failed(tmp_path):
             conn.execute(
                 "INSERT INTO abandonments (cycle_id, phase_reached, reason, detail, created_at) "
                 "VALUES (?, 'meeting', 'push_failed', 'detail', datetime('now'))",
-                (cycle_id,)
+                (cycle_id,),
             )
             conn.commit()
 
@@ -226,8 +232,8 @@ def test_abandonments_valid_values_accepted(tmp_path):
     with closing(get_connection(db_path)) as conn:
         project_id = _insert_project(conn)
         cycle_id = _insert_run_and_cycle(conn, project_id)
-        valid_phases = ('agenda', 'meeting', 'implementation', 'test')
-        valid_reasons = ('no_consensus', 'destructive_rejected', 'tests_unrecoverable', 'other')
+        valid_phases = ("agenda", "meeting", "implementation", "test")
+        valid_reasons = ("no_consensus", "destructive_rejected", "tests_unrecoverable", "other")
         for phase in valid_phases:
             for reason in valid_reasons:
                 conn.execute(

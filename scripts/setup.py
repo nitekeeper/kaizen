@@ -1,4 +1,5 @@
 """Kaizen setup — verify external dependencies and apply DB migrations."""
+
 from __future__ import annotations
 
 import shutil
@@ -41,9 +42,7 @@ def check_git() -> DepCheck:
         return DepCheck(name, False, "not found on PATH", fix)
     result = _run(["git", "--version"])
     if result.returncode != 0:
-        return DepCheck(
-            name, False, f"`git --version` exited {result.returncode}", fix
-        )
+        return DepCheck(name, False, f"`git --version` exited {result.returncode}", fix)
     return DepCheck(name, True, result.stdout.strip(), fix)
 
 
@@ -61,7 +60,11 @@ def check_gh() -> DepCheck:
     # gh prints auth status to stderr typically; surface a short summary
     output = (result.stdout or result.stderr or "").strip().splitlines()
     summary = next(
-        (line.strip() for line in output if "account" in line.lower() or "logged in" in line.lower()),
+        (
+            line.strip()
+            for line in output
+            if "account" in line.lower() or "logged in" in line.lower()
+        ),
         "authenticated",
     )
     return DepCheck(name, True, summary, auth_fix)
@@ -88,7 +91,7 @@ def verify_all() -> list[DepCheck]:
 
 def _safe(text: str) -> str:
     """Strip characters the active stdout encoding cannot represent."""
-    enc = (sys.stdout.encoding or "utf-8")
+    enc = sys.stdout.encoding or "utf-8"
     try:
         text.encode(enc)
         return text
@@ -109,10 +112,7 @@ def run_setup() -> int:
     print_results(checks)
     failed = [c for c in checks if not c.ok]
     if failed:
-        print(
-            f"\nSetup blocked: {len(failed)} dependencies missing. "
-            "Fix the above and re-run."
-        )
+        print(f"\nSetup blocked: {len(failed)} dependencies missing. Fix the above and re-run.")
         return 1
     apply_migrations(str(DB_PATH), MIGRATIONS_DIR)
     try:

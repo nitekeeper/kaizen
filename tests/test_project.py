@@ -1,4 +1,5 @@
 """Tests for scripts/project.py — CRUD module + minimal CLI smoke."""
+
 from __future__ import annotations
 
 import json
@@ -29,21 +30,22 @@ def db(tmp_path) -> str:
 
 
 def _make(db, **overrides) -> dict:
-    base = dict(
-        git_url="https://github.com/owner/repo.git",
-        name="repo",
-        base_branch="main",
-        test_command="pytest -v --tb=short",
-        read_paths=["scripts/*.py", "tests/*.py"],
-        expert_roster=["agent-systems-architect-1", "backend-engineer-1"],
-        language="python",
-        notes=None,
-    )
+    base = {
+        "git_url": "https://github.com/owner/repo.git",
+        "name": "repo",
+        "base_branch": "main",
+        "test_command": "pytest -v --tb=short",
+        "read_paths": ["scripts/*.py", "tests/*.py"],
+        "expert_roster": ["agent-systems-architect-1", "backend-engineer-1"],
+        "language": "python",
+        "notes": None,
+    }
     base.update(overrides)
     return create_project(db, **base)
 
 
 # ── create + get roundtrip ────────────────────────────────────────────────
+
 
 def test_create_and_get_roundtrip(db):
     created = _make(db)
@@ -69,9 +71,7 @@ def test_lists_are_returned_as_python_lists_not_json_strings(db):
 def test_lists_stored_as_json_strings_in_db(db):
     _make(db)
     with get_connection(db) as conn:
-        row = conn.execute(
-            "SELECT read_paths, expert_roster FROM projects LIMIT 1"
-        ).fetchone()
+        row = conn.execute("SELECT read_paths, expert_roster FROM projects LIMIT 1").fetchone()
     # Raw DB values are JSON-encoded strings.
     assert isinstance(row[0], str)
     assert json.loads(row[0]) == ["scripts/*.py", "tests/*.py"]
@@ -80,6 +80,7 @@ def test_lists_stored_as_json_strings_in_db(db):
 
 
 # ── get_project_by_url ─────────────────────────────────────────────────────
+
 
 def test_get_project_by_url_finds_the_right_row(db):
     _make(db, git_url="https://github.com/a/one.git", name="one")
@@ -98,6 +99,7 @@ def test_get_project_by_url_returns_none_when_missing(db):
 
 # ── list_projects ──────────────────────────────────────────────────────────
 
+
 def test_list_projects_returns_all_in_id_order(db):
     a = _make(db, git_url="https://github.com/x/a.git", name="a")
     b = _make(db, git_url="https://github.com/x/b.git", name="b")
@@ -113,11 +115,10 @@ def test_list_projects_empty(db):
 
 # ── update_project ─────────────────────────────────────────────────────────
 
+
 def test_update_project_mutates_scalar_fields(db):
     created = _make(db)
-    updated = update_project(
-        db, created["id"], name="renamed", notes="now with notes"
-    )
+    updated = update_project(db, created["id"], name="renamed", notes="now with notes")
     assert updated["name"] == "renamed"
     assert updated["notes"] == "now with notes"
     # Untouched fields preserved.
@@ -143,6 +144,7 @@ def test_update_project_ignores_unknown_fields(db):
 
 # ── delete_project ─────────────────────────────────────────────────────────
 
+
 def test_delete_project_removes_row(db):
     created = _make(db)
     assert delete_project(db, created["id"]) is True
@@ -155,6 +157,7 @@ def test_delete_project_returns_false_when_missing(db):
 
 # ── UNIQUE constraint ─────────────────────────────────────────────────────
 
+
 def test_create_duplicate_git_url_raises_integrity_error(db):
     _make(db, git_url="https://github.com/dupe/dupe.git", name="one")
     with pytest.raises(sqlite3.IntegrityError):
@@ -162,6 +165,7 @@ def test_create_duplicate_git_url_raises_integrity_error(db):
 
 
 # ── CLI smoke test ─────────────────────────────────────────────────────────
+
 
 def test_cli_list_against_empty_db_returns_empty_array(tmp_path):
     db_path = tmp_path / ".ai" / "memex.db"

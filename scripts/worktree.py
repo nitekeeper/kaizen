@@ -1,4 +1,5 @@
 """Git worktree merge-back and cleanup for session close."""
+
 from __future__ import annotations
 
 import sys
@@ -27,9 +28,13 @@ def classify_status(porcelain_output: str) -> tuple[list[str], list[str], list[s
     so it is broken out from the other-untracked bucket and ignored by sync flows.
     """
     lines = porcelain_output.splitlines()
-    dirty = [l for l in lines if not l.startswith("??")]
-    untracked_claude = [l for l in lines if l.startswith("?? ") and l[3:].startswith(".claude/")]
-    untracked_other = [l for l in lines if l.startswith("?? ") and not l[3:].startswith(".claude/")]
+    dirty = [ln for ln in lines if not ln.startswith("??")]
+    untracked_claude = [
+        ln for ln in lines if ln.startswith("?? ") and ln[3:].startswith(".claude/")
+    ]
+    untracked_other = [
+        ln for ln in lines if ln.startswith("?? ") and not ln[3:].startswith(".claude/")
+    ]
     return dirty, untracked_claude, untracked_other
 
 
@@ -152,7 +157,7 @@ def merge_back(worktree_dir: Path) -> None:
     if rm_result.returncode != 0:
         # Path may already be gone; prune stale entries
         _git(["worktree", "prune"], main_path, check=False)
-        print(f"Worktree path already removed or inaccessible; ran `git worktree prune`.")
+        print("Worktree path already removed or inaccessible; ran `git worktree prune`.")
     else:
         print(f"Worktree '{worktree_path_str}' removed.")
 

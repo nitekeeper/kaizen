@@ -209,9 +209,7 @@ def orchestrate_run(
 
     # 2. Clone target
     experiment_dir = experiment_dir_for(kaizen_root(), git_url)
-    # H2: Remove any stale clone left behind by a previous crashed run so
-    # `git clone` doesn't fail with "destination path already exists".
-    # `cleanup_experiment` (via `safe_rmtree`) is safe-if-absent.
+    # H2: drop stale clone from a prior crashed run before re-cloning.
     cleanup_experiment(experiment_dir)
     clone_repo(git_url, experiment_dir, project["base_branch"])
 

@@ -18,16 +18,40 @@ def _git(args: list[str], cwd: Path) -> None:
     )
 
 
-@pytest.fixture
-def bare_remote(tmp_path):
-    """Bare repo acting as origin."""
-    remote = tmp_path / "remote.git"
-    remote.mkdir()
+def _init_bare_remote(path: Path, branch: str) -> None:
+    """Initialise an empty bare repo at `path` with `branch` as the initial branch."""
+    path.mkdir()
     subprocess.run(
-        ["git", "init", "--bare", str(remote)],
+        ["git", "init", "--bare", "-b", branch, str(path)],
         check=True,
         capture_output=True,
     )
+
+
+def _seed_remote_from_scratch(tmp_path: Path, remote: Path, branch: str) -> None:
+    """Push one README-only commit onto `branch` of `remote` from a throwaway repo."""
+    safe = branch.replace("/", "_")
+    seed = tmp_path / f"seed_{safe}"
+    seed.mkdir()
+    _git(["init", "-b", branch], seed)
+    _git(["config", "user.email", "test@test.com"], seed)
+    _git(["config", "user.name", "Test User"], seed)
+    _git(["remote", "add", "origin", str(remote)], seed)
+    (seed / "README.md").write_text(f"# kaizen test target ({branch})\n")
+    _git(["add", "."], seed)
+    _git(["commit", "-m", "initial"], seed)
+    _git(["push", "-u", "origin", branch], seed)
+
+
+@pytest.fixture
+def bare_remote(tmp_path):
+    """Empty bare repo acting as origin (initial branch `main`).
+
+    Note: this fixture creates an *empty* remote; pair with `source_repo` to
+    push commits before any clone.
+    """
+    remote = tmp_path / "remote.git"
+    _init_bare_remote(remote, "main")
     return remote
 
 
@@ -47,3 +71,12 @@ def source_repo(tmp_path, bare_remote):
     _git(["commit", "-m", "initial"], repo)
     _git(["push", "-u", "origin", "main"], repo)
     return repo
+
+
+@pytest.fixture
+def bare_remote_trunk(tmp_path):
+    """Bare repo whose initial branch is `trunk` (non-main), seeded with one commit."""
+    remote = tmp_path / "remote_trunk.git"
+    _init_bare_remote(remote, "trunk")
+    _seed_remote_from_scratch(tmp_path, remote, "trunk")
+    return remote

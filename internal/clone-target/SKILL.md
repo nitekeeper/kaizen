@@ -32,10 +32,12 @@ Wraps `scripts/clone.py` (clone + cleanup) and `scripts/seed_atelier_in_clone.py
 3. Clone the repo:
 
    ```
-   python3 scripts/clone.py clone <git-url> <clone-dir>
+   python3 scripts/clone.py clone <git-url> <branch> <clone-dir>
    ```
 
-   - This invokes `git clone -b main <git-url> <clone-dir>` then sets `user.email=kaizen@kaizen.local` / `user.name=Kaizen` in the clone.
+   - This invokes `git clone -b <branch> <git-url> <clone-dir>` then sets `user.email=kaizen@kaizen.local` / `user.name=Kaizen` in the clone.
+   - `<branch>` is the target repo's base branch (e.g. `main`, `master`, `develop`, `trunk`) and is **required** — `clone_repo(remote_url, dest, branch)` has no default. The runtime path (`scripts.run.orchestrate_run`) reads it from the project record's `base_branch` field.
+   - **Registration limitation**: `scripts/project.py:_register_cli` currently hardcodes `"main"` when cloning + creating the project row. Until task 19 (L2) lands a git-detected default branch, repos whose default is not `main` cannot be onboarded end-to-end via the registration flow — the operator must hand-edit the `projects.base_branch` column after registration before any run.
    - On failure (network, auth, bad URL): the subprocess raises `subprocess.CalledProcessError`. Surface the git error to the user and signal abort to the caller — do not proceed with a half-cloned directory. The caller (`internal/run/SKILL.md`) must not create a run row when setup fails.
 
 4. Seed atelier into the clone:

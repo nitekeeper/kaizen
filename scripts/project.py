@@ -223,7 +223,7 @@ def _register_cli(git_url: str, db_path: str) -> int:
         dest = Path(tmp) / "clone"
         print(f"Cloning {git_url} ... ", end="", flush=True)
         try:
-            clone_repo(git_url, dest)
+            clone_repo(git_url, dest, "main")
         except Exception as exc:
             print("failed.")
             print(f"clone error: {exc}", file=sys.stderr)

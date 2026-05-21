@@ -133,7 +133,7 @@ def _install_orchestrator_stubs(monkeypatch, tmp_path):
     """Stub clone/seed/branch/push so the orchestrator doesn't touch real git."""
     clone_dir = tmp_path / "experiment" / "owner-repo"
 
-    def fake_clone(remote_url, dest):
+    def fake_clone(remote_url, dest, branch):
         dest.mkdir(parents=True, exist_ok=True)
 
     monkeypatch.setattr(run_mod, "kaizen_root", lambda: tmp_path)

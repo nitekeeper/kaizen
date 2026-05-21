@@ -51,26 +51,26 @@ _BRANCH_RE = re.compile(r"^kaizen/[a-z0-9-]+-\d{4}-\d{2}-\d{2}-\d{4}$")
 class TestCreateBranch:
     def test_branch_name_format(self, tmp_path, bare_remote, source_repo):
         dest = tmp_path / "clone"
-        clone_repo(str(bare_remote), dest)
+        clone_repo(str(bare_remote), dest, "main")
         branch = create_branch(dest, "improve error handling")
         assert _BRANCH_RE.match(branch), f"Branch name {branch!r} does not match expected format"
 
     def test_branch_uses_slug(self, tmp_path, bare_remote, source_repo):
         dest = tmp_path / "clone"
-        clone_repo(str(bare_remote), dest)
+        clone_repo(str(bare_remote), dest, "main")
         branch = create_branch(dest, "Improve Error Handling")
         assert branch.startswith("kaizen/improve-error-handling-")
 
     def test_none_subject_uses_pm_directed(self, tmp_path, bare_remote, source_repo):
         dest = tmp_path / "clone"
-        clone_repo(str(bare_remote), dest)
+        clone_repo(str(bare_remote), dest, "main")
         branch = create_branch(dest, None)
         assert branch.startswith("kaizen/pm-directed-")
         assert _BRANCH_RE.match(branch)
 
     def test_branch_is_checked_out(self, tmp_path, bare_remote, source_repo):
         dest = tmp_path / "clone"
-        clone_repo(str(bare_remote), dest)
+        clone_repo(str(bare_remote), dest, "main")
         branch = create_branch(dest, "test subject")
         result = subprocess.run(
             ["git", "branch", "--show-current"],
@@ -87,7 +87,7 @@ class TestCreateBranch:
 class TestCommitCycle:
     def test_commit_message_format(self, tmp_path, bare_remote, source_repo):
         dest = tmp_path / "clone"
-        clone_repo(str(bare_remote), dest)
+        clone_repo(str(bare_remote), dest, "main")
         create_branch(dest, "improve error handling")
         (dest / "CHANGES.txt").write_text("a change")
         commit_cycle(
@@ -115,7 +115,7 @@ class TestCommitCycle:
 
     def test_commit_stages_all_changes(self, tmp_path, bare_remote, source_repo):
         dest = tmp_path / "clone"
-        clone_repo(str(bare_remote), dest)
+        clone_repo(str(bare_remote), dest, "main")
         create_branch(dest, "test")
         (dest / "new_file.txt").write_text("new")
         commit_cycle(
@@ -142,7 +142,7 @@ class TestCommitCycle:
 class TestPushBranch:
     def test_branch_appears_on_remote_after_push(self, tmp_path, bare_remote, source_repo):
         dest = tmp_path / "clone"
-        clone_repo(str(bare_remote), dest)
+        clone_repo(str(bare_remote), dest, "main")
         branch = create_branch(dest, "push test")
         # Need at least one commit on the branch before push has anything to send,
         # but git push of an empty branch (same as main) is fine — it sets the ref.

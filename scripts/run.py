@@ -214,9 +214,7 @@ def orchestrate_run(
     clone_repo(git_url, experiment_dir, project["base_branch"])
 
     # 3. Seed atelier
-    # M1: If seeding fails, the clone is in a half-initialized state. Tear it
-    # down before re-raising so the user isn't left with a stale directory
-    # blocking the next run.
+    # M1: tear down half-initialized clone before re-raising.
     try:
         seed_all(experiment_dir)
     except Exception:

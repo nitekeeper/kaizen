@@ -60,4 +60,7 @@ ignore = [
 exclude_dirs = ["tests", "dist", "experiment", ".worktrees", ".github"]
 skips = [
     "B101",   # assert_used — assertions in production code are intentional invariants here
+    "B404",   # blacklist: import subprocess — kaizen drives git/gh/pytest via subprocess by design
+    "B603",   # subprocess_without_shell_equals_true — we deliberately AVOID shell=True (the Low finding is for the bare-call pattern)
+    "B607",   # start_process_with_partial_path — git/gh/pytest are resolved via PATH; documented hard dependency in CLAUDE.md
 ]

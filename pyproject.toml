@@ -1,0 +1,63 @@
+[project]
+name = "kaizen"
+version = "0.1.0"
+description = "Kaizen: multi-agent improvement plugin — runs Atelier's methodology against any git repository by URL."
+requires-python = ">=3.11"
+# Kaizen is stdlib-only at runtime (sqlite3, subprocess, pathlib, json,
+# argparse, datetime); test/dev tooling lives in [project.optional-dependencies].
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.3,<10",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+# ----------------------------------------------------------------------------
+# Lint & format — Ruff
+# ----------------------------------------------------------------------------
+# Ruff replaces flake8 / isort / pyupgrade / pylint here. The selected rule set
+# is pragmatic: catch real bugs and stale syntax, avoid stylistic bikeshed.
+# Run locally:  ruff check --fix && ruff format
+# CI enforces:  ruff check && ruff format --check
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+exclude = [
+    "dist",                          # release bundles (manifest tracked, body gitignored)
+    "experiment",                    # ephemeral target-repo clones
+    ".worktrees",                    # local atelier worktree mounts
+]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes (unused imports, undefined names)
+    "I",    # isort (import ordering)
+    "B",    # flake8-bugbear (likely bugs)
+    "C4",   # comprehensions
+    "UP",   # pyupgrade (modern syntax)
+    "SIM",  # simplify
+    "RUF",  # ruff-specific
+]
+ignore = [
+    "E501",   # line-too-long — the formatter handles wrapping where it can; long URLs/strings get a pass
+]
+
+# ----------------------------------------------------------------------------
+# Security — Bandit
+# ----------------------------------------------------------------------------
+# Bandit catches Python-specific security antipatterns: shell injection,
+# hardcoded credentials, weak crypto, unsafe deserialization, etc.
+# Run locally:  bandit -c pyproject.toml -r scripts internal skills
+# CI enforces the same.
+
+[tool.bandit]
+exclude_dirs = ["tests", "dist", "experiment", ".worktrees", ".github"]
+skips = [
+    "B101",   # assert_used — assertions in production code are intentional invariants here
+]

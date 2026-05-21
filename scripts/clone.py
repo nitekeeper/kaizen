@@ -25,6 +25,8 @@ def clone_repo(remote_url: str, dest: Path, branch: str) -> None:
     does not look up an origin from any other repo. `branch` is required so
     target repos with non-`main` default branches can be cloned.
     """
+    if not branch:
+        raise ValueError("branch must be a non-empty string")
     dest.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
         ["git", "clone", "-b", branch, remote_url, str(dest)],

@@ -61,6 +61,13 @@ class TestCloneRepo:
         )
         assert head.stdout.strip() == "trunk"
 
+    def test_clone_rejects_empty_branch(self, tmp_path):
+        """Empty branch string must surface a clear ValueError, not a vague git error."""
+        from scripts.clone import clone_repo
+
+        with pytest.raises(ValueError, match="branch must be a non-empty string"):
+            clone_repo("https://example.com/x.git", tmp_path / "clone", "")
+
 
 # ── get_remote_url ─────────────────────────────────────────────────────────
 

@@ -1,0 +1,19 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "kaizen",
+  "description": "Local marketplace for the Kaizen personal-use plugin",
+  "owner": {
+    "name": "nitekeeper"
+  },
+  "plugins": [
+    {
+      "name": "kaizen",
+      "source": "./",
+      "description": "Multi-agent improvement plugin — runs Atelier's methodology against any git repository by URL",
+      "version": "0.1.0",
+      "author": {
+        "name": "nitekeeper"
+      }
+    }
+  ]
+}

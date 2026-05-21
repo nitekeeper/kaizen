@@ -4,6 +4,13 @@
 .ai/memex.db-wal
 experiment/
 
+# Release dist bundles — body gitignored, manifest tracked
+# (the build path is dist/v<X.Y.Z>/; manifest.json is committed so version
+# drift can be detected via diff. Bundle bodies are rebuilt by
+# `scripts.release` and attached to GitHub Releases.)
+dist/v*/
+!dist/v*/manifest.json
+
 # Python
 __pycache__/
 *.pyc

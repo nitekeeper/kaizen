@@ -1,15 +1,12 @@
 """Tests for scripts/setup.py — dependency verification + migration runner."""
+
 from __future__ import annotations
 
 import sqlite3
 import subprocess
-from types import SimpleNamespace
-
-import pytest
 
 from scripts import setup as setup_mod
 from scripts.setup import (
-    DepCheck,
     check_gh,
     check_git,
     check_python_version,
@@ -17,8 +14,8 @@ from scripts.setup import (
     verify_all,
 )
 
-
 # ── Helpers ────────────────────────────────────────────────────────────────
+
 
 def _ok_result(stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=[], returncode=0, stdout=stdout, stderr=stderr)
@@ -30,6 +27,7 @@ def _fail_result(stdout: str = "", stderr: str = "", code: int = 1) -> subproces
 
 def _all_present(monkeypatch) -> None:
     """Patch the world so every dep check passes."""
+
     def fake_which(name: str):
         return f"/usr/bin/{name}" if name in {"git", "gh"} else None
 
@@ -47,11 +45,13 @@ def _all_present(monkeypatch) -> None:
 
 # ── Individual check tests ─────────────────────────────────────────────────
 
+
 class TestCheckGit:
     def test_present(self, monkeypatch):
         monkeypatch.setattr(setup_mod.shutil, "which", lambda n: "/usr/bin/git")
         monkeypatch.setattr(
-            setup_mod.subprocess, "run",
+            setup_mod.subprocess,
+            "run",
             lambda *a, **k: _ok_result(stdout="git version 2.42.0\n"),
         )
         c = check_git()
@@ -68,7 +68,9 @@ class TestCheckGit:
     def test_present_but_fails(self, monkeypatch):
         monkeypatch.setattr(setup_mod.shutil, "which", lambda n: "/usr/bin/git")
         monkeypatch.setattr(
-            setup_mod.subprocess, "run", lambda *a, **k: _fail_result(code=127),
+            setup_mod.subprocess,
+            "run",
+            lambda *a, **k: _fail_result(code=127),
         )
         c = check_git()
         assert c.ok is False
@@ -78,7 +80,8 @@ class TestCheckGh:
     def test_authenticated(self, monkeypatch):
         monkeypatch.setattr(setup_mod.shutil, "which", lambda n: "/usr/bin/gh")
         monkeypatch.setattr(
-            setup_mod.subprocess, "run",
+            setup_mod.subprocess,
+            "run",
             lambda *a, **k: _ok_result(stdout="Logged in to github.com account nitekeeper\n"),
         )
         c = check_gh()
@@ -94,15 +97,16 @@ class TestCheckGh:
     def test_installed_but_not_authenticated(self, monkeypatch):
         monkeypatch.setattr(setup_mod.shutil, "which", lambda n: "/usr/bin/gh")
         monkeypatch.setattr(
-            setup_mod.subprocess, "run",
+            setup_mod.subprocess,
+            "run",
             lambda *a, **k: _fail_result(
-                stderr="You are not logged into any GitHub hosts.\n", code=1,
+                stderr="You are not logged into any GitHub hosts.\n",
+                code=1,
             ),
         )
         c = check_gh()
         assert c.ok is False
         assert "auth login" in c.fix.lower()
-
 
 
 class TestCheckPythonVersion:
@@ -113,8 +117,7 @@ class TestCheckPythonVersion:
         assert c.ok is True
 
     def test_too_old(self, monkeypatch):
-        fake = SimpleNamespace(major=3, minor=9, micro=0)
-        # Make comparisons work via tuple coercion in the function
+        # Make comparisons work via tuple coercion in the function.
         # The function does: sys.version_info >= (3, 11). SimpleNamespace won't
         # support that, so wrap as a tuple-like by subclassing tuple.
         class V(tuple):
@@ -131,10 +134,9 @@ class TestCheckPythonVersion:
 
 # ── Orchestrator tests ─────────────────────────────────────────────────────
 
+
 class TestRunSetup:
-    def test_all_present_returns_zero_and_applies_migration(
-        self, monkeypatch, tmp_path
-    ):
+    def test_all_present_returns_zero_and_applies_migration(self, monkeypatch, tmp_path):
         _all_present(monkeypatch)
 
         db_path = tmp_path / ".ai" / "memex.db"
@@ -149,9 +151,7 @@ class TestRunSetup:
         # Verify the 4 kaizen tables + migrations table exist
         conn = sqlite3.connect(db_path)
         try:
-            rows = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
+            rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
             names = {r[0] for r in rows}
         finally:
             conn.close()

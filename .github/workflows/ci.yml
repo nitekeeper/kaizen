@@ -1,0 +1,78 @@
+name: CI
+
+# Fast PR gate: lint, format, security, and tests. All four must pass
+# before a PR can be merged (enforced via branch protection rules).
+#
+# Mirrors memex/atelier's CI shape so the three plugin repos behave the
+# same. Kaizen-specific note: bandit scans `scripts internal skills`
+# (no `db/` or `prompts/` directories in this repo).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint & format (Ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install Ruff
+        run: pip install ruff
+
+      - name: Lint (ruff check)
+        run: ruff check .
+
+      - name: Format check (ruff format --check)
+        run: ruff format --check .
+
+  security:
+    name: Security (Bandit + pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install Bandit and pip-audit
+        run: pip install bandit pip-audit
+
+      - name: Bandit (AST security scan)
+        run: bandit -c pyproject.toml -r scripts internal skills
+
+      - name: pip-audit (dependency CVE scan)
+        # pyproject.toml's runtime `[project] dependencies` is empty (Kaizen is
+        # stdlib-only at runtime); pip-audit warns and exits 0 in that case.
+        # Once runtime deps are added, this gate starts blocking PRs that
+        # introduce vulnerable packages.
+        run: pip-audit .
+
+  tests:
+    name: Tests (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install pytest
+        run: pip install pytest
+
+      - name: Run test suite
+        run: pytest tests/ -q

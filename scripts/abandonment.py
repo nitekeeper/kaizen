@@ -6,19 +6,20 @@ When a cycle abandons mid-flight, this module:
 
 Capturing the report to Memex happens at the agent level via `memex:run`.
 """
+
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from scripts.db import get_connection
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _row_to_dict(row, cols) -> dict:
-    return dict(zip(cols, row))
+    return dict(zip(cols, row, strict=False))
 
 
 def _slug_for(run_id: int, cycle_n: int) -> str:
@@ -26,6 +27,7 @@ def _slug_for(run_id: int, cycle_n: int) -> str:
 
 
 # ── Markdown rendering ─────────────────────────────────────────────────────
+
 
 def format_report(
     project_name: str,
@@ -47,7 +49,7 @@ def format_report(
     slug = _slug_for(run_id, cycle_n)
     title = f"Cycle {cycle_n} abandoned — {reason}"
     subject_display = subject or "PM-directed"
-    date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    date_str = datetime.now(UTC).strftime("%Y-%m-%d %H:%M UTC")
     participants_str = ", ".join(participants) if participants else "(none recorded)"
     artifacts_str = ", ".join(artifacts) if artifacts else "(none)"
 
@@ -77,6 +79,7 @@ def format_report(
 
 
 # ── DB write ───────────────────────────────────────────────────────────────
+
 
 def record_abandonment(
     db_path: str,
@@ -108,6 +111,7 @@ def record_abandonment(
 
 # ── End-to-end orchestrator ────────────────────────────────────────────────
 
+
 def process_abandonment(
     db_path: str,
     project: dict,
@@ -125,7 +129,11 @@ def process_abandonment(
 
     Returns the inserted abandonments row.
     """
-    markdown = format_report(
+    # NOTE: The markdown body itself is rendered by the agent layer via
+    # memex:run (see module docstring) — this call here is currently unused.
+    # Kept to surface formatting errors early; the result is intentionally
+    # discarded.
+    _markdown = format_report(
         project_name=project["name"],
         git_url=project["git_url"],
         run_id=run_id,

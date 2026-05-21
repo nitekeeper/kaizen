@@ -1,4 +1,5 @@
 """Tests for scripts/run.py — CRUD + orchestrator integration."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -6,7 +7,6 @@ from pathlib import Path
 import pytest
 
 import scripts.run as run_mod
-import scripts.abandonment as ab_mod
 from scripts.migrate import MIGRATIONS_DIR, apply_migrations
 from scripts.project import create_project
 from scripts.run import (
@@ -41,10 +41,14 @@ def project(db) -> dict:
 
 # ── Run CRUD ───────────────────────────────────────────────────────────────
 
+
 def test_create_run_inserts_row(db, project):
     row = create_run(
-        db, project_id=project["id"], branch="kaizen/x-2026-05-16-1200",
-        cycles_requested=3, subject="x",
+        db,
+        project_id=project["id"],
+        branch="kaizen/x-2026-05-16-1200",
+        cycles_requested=3,
+        subject="x",
     )
     assert row["id"] >= 1
     assert row["project_id"] == project["id"]
@@ -62,8 +66,10 @@ def test_create_run_inserts_row(db, project):
 def test_finalize_run_updates_counts_and_status(db, project):
     row = create_run(db, project["id"], "b", 5, None)
     updated = finalize_run(
-        db, row["id"],
-        cycles_succeeded=4, cycles_abandoned=1,
+        db,
+        row["id"],
+        cycles_succeeded=4,
+        cycles_abandoned=1,
         pr_url="https://github.com/owner/repo/pull/42",
         status="complete",
     )
@@ -82,9 +88,14 @@ def test_get_run_returns_row_or_none(db, project):
 
 def test_list_runs_filters_by_project_id(db, project):
     other = create_project(
-        db, git_url="https://github.com/x/y.git", name="y",
-        base_branch="main", test_command="pytest",
-        read_paths=[], expert_roster=[], language="python",
+        db,
+        git_url="https://github.com/x/y.git",
+        name="y",
+        base_branch="main",
+        test_command="pytest",
+        read_paths=[],
+        expert_roster=[],
+        language="python",
     )
     create_run(db, project["id"], "a", 1, None)
     create_run(db, project["id"], "b", 1, None)
@@ -100,19 +111,14 @@ def test_list_runs_filters_by_project_id(db, project):
 
 # ── URL parsing ────────────────────────────────────────────────────────────
 
+
 def test_parse_owner_repo_https():
-    assert run_mod.parse_owner_repo(
-        "https://github.com/owner/repo.git"
-    ) == ("owner", "repo")
-    assert run_mod.parse_owner_repo(
-        "https://github.com/owner/repo"
-    ) == ("owner", "repo")
+    assert run_mod.parse_owner_repo("https://github.com/owner/repo.git") == ("owner", "repo")
+    assert run_mod.parse_owner_repo("https://github.com/owner/repo") == ("owner", "repo")
 
 
 def test_parse_owner_repo_ssh():
-    assert run_mod.parse_owner_repo(
-        "git@github.com:owner/repo.git"
-    ) == ("owner", "repo")
+    assert run_mod.parse_owner_repo("git@github.com:owner/repo.git") == ("owner", "repo")
 
 
 def test_parse_owner_repo_raises_on_garbage():
@@ -122,24 +128,30 @@ def test_parse_owner_repo_raises_on_garbage():
 
 # ── Orchestrator tests ─────────────────────────────────────────────────────
 
+
 def _install_orchestrator_stubs(monkeypatch, tmp_path):
     """Stub clone/seed/branch/push so the orchestrator doesn't touch real git."""
     clone_dir = tmp_path / "experiment" / "owner-repo"
 
     def fake_clone(remote_url, dest):
         dest.mkdir(parents=True, exist_ok=True)
+
     monkeypatch.setattr(run_mod, "kaizen_root", lambda: tmp_path)
     # The clone helper is imported inside orchestrate_run; patch at the
     # source module so the import sees our stub.
     import scripts.clone as clone_mod
+
     monkeypatch.setattr(clone_mod, "clone_repo", fake_clone)
 
     import scripts.seed_atelier_in_clone as seed_mod
+
     monkeypatch.setattr(seed_mod, "seed_all", lambda d: None)
 
     import scripts.cycle_git as cg_mod
+
     monkeypatch.setattr(
-        cg_mod, "create_branch",
+        cg_mod,
+        "create_branch",
         lambda d, subj: f"kaizen/{(subj or 'pm-directed').replace(' ', '-')}-2026-05-16-1200",
     )
     monkeypatch.setattr(cg_mod, "push_branch", lambda d, b: None)
@@ -154,9 +166,11 @@ def test_orchestrate_run_unknown_url_raises(db, tmp_path, monkeypatch):
             db_path=db,
             git_url="https://github.com/nope/none.git",
             cycles_requested=1,
-            cycle_executor=lambda *a: {"status": "success",
-                                       "commit_sha": "x",
-                                       "minutes_memex_slug": None},
+            cycle_executor=lambda *a: {
+                "status": "success",
+                "commit_sha": "x",
+                "minutes_memex_slug": None,
+            },
         )
     assert "project.py register" in str(exc_info.value)
 
@@ -261,6 +275,7 @@ def test_orchestrate_run_push_failure_leaves_clone(db, project, tmp_path, monkey
 
     def boom(clone_dir, branch):
         raise RuntimeError("push refused")
+
     monkeypatch.setattr(cg_mod, "push_branch", boom)
 
     result = orchestrate_run(
@@ -268,7 +283,8 @@ def test_orchestrate_run_push_failure_leaves_clone(db, project, tmp_path, monkey
         git_url=project["git_url"],
         cycles_requested=1,
         cycle_executor=lambda *a: {
-            "status": "success", "commit_sha": "x",
+            "status": "success",
+            "commit_sha": "x",
             "minutes_memex_slug": None,
         },
     )

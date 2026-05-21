@@ -1,4 +1,5 @@
 """Shared pytest fixtures for kaizen tests."""
+
 from __future__ import annotations
 
 import subprocess
@@ -9,7 +10,7 @@ import pytest
 
 def _git(args: list[str], cwd: Path) -> None:
     subprocess.run(
-        ["git"] + args,
+        ["git", *args],
         cwd=cwd,
         check=True,
         capture_output=True,

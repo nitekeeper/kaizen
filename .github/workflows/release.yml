@@ -1,0 +1,120 @@
+name: Release
+
+# Tag-triggered release: push `v<X.Y.Z>` and this workflow runs tests, sanity-
+# checks that plugin.json/pyproject.toml agree with the tag, builds the dist
+# bundle, and publishes a GitHub Release whose body is the CHANGELOG section
+# for that version.
+#
+# We deliberately do NOT auto-release on merge to main — CHANGELOG entries
+# and version bumps are editorial decisions made in PRs (see scripts/bump.py).
+# The tag push is the "I really mean it" signal.
+#
+# Kaizen-specific divergence from memex/atelier: there is NO "Notify agora
+# marketplace" step. Kaizen is personal-use only per CLAUDE.md — it is not
+# distributed via Agora and has no Agora dispatch secret. The GitHub Release
+# is the terminal artifact; users install by cloning the repo and registering
+# the plugin manually with Claude Code.
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write   # needed to create the GitHub Release
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install pytest
+
+      - name: Run tests
+        run: pytest tests/ -q
+
+      - name: Extract version from tag
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify manifest versions match the tag
+        env:
+          # Route step outputs and event fields through env vars rather than
+          # inline-interpolating ${{ ... }} into the run script. Inline
+          # interpolation happens before bash sees the script, which would
+          # let a malicious tag name break out of the surrounding quotes.
+          # While tag-pushing requires repo write (already a high bar),
+          # env-var passing is defense-in-depth.
+          TAG: ${{ steps.ver.outputs.version }}
+        run: |
+          python - <<'PY'
+          import json, os, re, sys
+          tag = os.environ["TAG"]
+          pj = json.load(open(".claude-plugin/plugin.json"))["version"]
+          py = re.search(r'^version\s*=\s*"([^"]+)"', open("pyproject.toml").read(), re.M).group(1)
+          mismatches = []
+          if pj != tag: mismatches.append(f"plugin.json={pj}")
+          if py != tag: mismatches.append(f"pyproject.toml={py}")
+          if mismatches:
+              print(f"::error::tag v{tag} does not match: " + ", ".join(mismatches))
+              sys.exit(1)
+          print(f"all manifests agree: v{tag}")
+          PY
+
+      - name: Build dist bundle
+        env:
+          TAG: ${{ steps.ver.outputs.version }}
+        run: python -m scripts.release "$TAG"
+
+      - name: Zip the dist bundle for release attachment
+        env:
+          TAG: ${{ steps.ver.outputs.version }}
+        run: |
+          cd dist
+          zip -r "kaizen-v${TAG}.zip" "v${TAG}"
+
+      - name: Extract CHANGELOG section for this version
+        id: changelog
+        env:
+          TAG: ${{ steps.ver.outputs.version }}
+        run: |
+          python - <<'PY' > /tmp/release-body.md
+          import os, re, sys
+          version = os.environ["TAG"]
+          content = open("CHANGELOG.md", encoding="utf-8").read()
+          # Match `## v<version> — date` block up to the next `## v` or `---` divider
+          pattern = rf"^## v{re.escape(version)}\b.*?(?=^## v|\Z)"
+          m = re.search(pattern, content, re.M | re.S)
+          if not m:
+              print(f"WARNING: no CHANGELOG section for v{version}", file=sys.stderr)
+              print(f"## v{version}\n\nSee commit log for changes.")
+          else:
+              body = m.group(0).rstrip()
+              # Strip the trailing `---` divider if present
+              body = re.sub(r"\n---\s*$", "", body)
+              print(body)
+          PY
+          echo "body_path=/tmp/release-body.md" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.ver.outputs.version }}
+          BODY_PATH: ${{ steps.changelog.outputs.body_path }}
+        run: |
+          gh release create "v${TAG}" \
+            "dist/kaizen-v${TAG}.zip" \
+            --title "v${TAG}" \
+            --notes-file "${BODY_PATH}"

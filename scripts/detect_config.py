@@ -1,6 +1,7 @@
 """Pure detection module: infer project language, test command, read paths,
 and a default expert roster from an on-disk repo. No I/O prompts — call sites
 handle confirmation."""
+
 from __future__ import annotations
 
 import json
@@ -35,9 +36,11 @@ READ_PATHS = {
 def detect_language(repo_root: Path) -> str:
     """Return one of: python, javascript, rust, go, unknown. First match wins."""
     repo_root = Path(repo_root)
-    if (repo_root / "pyproject.toml").exists() \
-            or (repo_root / "pytest.ini").exists() \
-            or (repo_root / "setup.py").exists():
+    if (
+        (repo_root / "pyproject.toml").exists()
+        or (repo_root / "pytest.ini").exists()
+        or (repo_root / "setup.py").exists()
+    ):
         return "python"
     package_json = repo_root / "package.json"
     if package_json.exists():

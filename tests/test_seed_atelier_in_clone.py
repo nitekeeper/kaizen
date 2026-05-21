@@ -1,17 +1,25 @@
 """Tests for scripts/seed_atelier_in_clone.py."""
+
 import sqlite3
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from scripts.seed_atelier_in_clone import (
+ATELIER_CACHE = Path("~/.claude/plugins/cache/agora/atelier").expanduser()
+
+pytestmark = pytest.mark.skipif(
+    not ATELIER_CACHE.exists(),
+    reason="requires local Agora atelier cache",
+)
+
+from scripts.seed_atelier_in_clone import (  # noqa: E402
     _atelier_env,
-    find_atelier_root,
     ensure_wiki_dir,
-    seed_atelier_schema,
-    seed_atelier_roles,
+    find_atelier_root,
     seed_all,
+    seed_atelier_roles,
+    seed_atelier_schema,
 )
 
 
@@ -20,7 +28,8 @@ def _init_clone(tmp_path: Path) -> Path:
     clone.mkdir()
     subprocess.run(
         ["git", "init", "-b", "main", str(clone)],
-        check=True, capture_output=True,
+        check=True,
+        capture_output=True,
     )
     return clone
 
@@ -71,6 +80,7 @@ class TestCopyRolesFromAtelier:
     def test_copy_roles_raises_if_memex_registry_missing(self, tmp_path, monkeypatch):
         """If ~/.memex/registry.json is absent, _copy_roles_agents_from_atelier must raise."""
         from scripts.seed_atelier_in_clone import _copy_roles_agents_from_atelier
+
         # Redirect HOME so registry path doesn't exist
         fake_home = tmp_path / "fake_home"
         fake_home.mkdir()
@@ -80,9 +90,14 @@ class TestCopyRolesFromAtelier:
         (clone_dir / ".ai").mkdir(parents=True)
         # Minimal memex.db with roles/agents tables (won't be reached)
         import sqlite3 as _sq3
+
         c = _sq3.connect(str(clone_dir / ".ai" / "memex.db"))
-        c.execute("CREATE TABLE roles (id INTEGER PRIMARY KEY, name TEXT, description TEXT, created_at TEXT, updated_at TEXT)")
-        c.execute("CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role_id INTEGER, profile TEXT, created_at TEXT, updated_at TEXT)")
+        c.execute(
+            "CREATE TABLE roles (id INTEGER PRIMARY KEY, name TEXT, description TEXT, created_at TEXT, updated_at TEXT)"
+        )
+        c.execute(
+            "CREATE TABLE agents (id TEXT PRIMARY KEY, name TEXT, role_id INTEGER, profile TEXT, created_at TEXT, updated_at TEXT)"
+        )
         c.close()
         with pytest.raises(RuntimeError, match="Memex registry not found"):
             _copy_roles_agents_from_atelier(clone_dir)
@@ -96,9 +111,7 @@ class TestSeedSchemaAndRoles:
         assert db_path.exists()
         conn = sqlite3.connect(str(db_path))
         try:
-            rows = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table'"
-            ).fetchall()
+            rows = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
             table_names = {r[0] for r in rows}
         finally:
             conn.close()

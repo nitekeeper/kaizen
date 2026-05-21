@@ -12,6 +12,7 @@ The yaml package is intentionally avoided — kaizen's requirements.txt is
 stdlib-only. We parse the closing-delimiter position and the description
 field with a small inline parser sufficient for the convention.
 """
+
 from __future__ import annotations
 
 import re
@@ -19,14 +20,12 @@ from pathlib import Path
 
 import pytest
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Glob both public and internal skill files. Order is deterministic so test
 # ids in -v output are stable.
 SKILL_FILES = sorted(
-    list(REPO_ROOT.glob("skills/*/SKILL.md"))
-    + list(REPO_ROOT.glob("internal/*/SKILL.md"))
+    list(REPO_ROOT.glob("skills/*/SKILL.md")) + list(REPO_ROOT.glob("internal/*/SKILL.md"))
 )
 
 
@@ -49,7 +48,7 @@ def _split_frontmatter(text: str) -> tuple[str, str]:
     if m is None:
         raise ValueError("no closing '---' frontmatter terminator found")
     fm_body = after_opener[: m.start()]
-    post = after_opener[m.end():]
+    post = after_opener[m.end() :]
     return fm_body, post
 
 
@@ -85,7 +84,9 @@ def test_skill_files_discovered() -> None:
     )
 
 
-@pytest.mark.parametrize("skill_file", SKILL_FILES, ids=lambda p: str(p.relative_to(REPO_ROOT)).replace("\\", "/"))
+@pytest.mark.parametrize(
+    "skill_file", SKILL_FILES, ids=lambda p: str(p.relative_to(REPO_ROOT)).replace("\\", "/")
+)
 def test_skill_frontmatter(skill_file: Path) -> None:
     text = skill_file.read_text(encoding="utf-8")
     fm_body, post = _split_frontmatter(text)
@@ -111,8 +112,10 @@ def test_skill_frontmatter(skill_file: Path) -> None:
 
 def test_expert_roster_sql_uses_correct_column_alias():
     from pathlib import Path
+
     skill_path = Path(__file__).resolve().parents[1] / "internal" / "expert-roster" / "SKILL.md"
     content = skill_path.read_text()
-    assert "r.role_name" not in content, \
+    assert "r.role_name" not in content, (
         "SQL uses r.role_name which does not exist; should be r.name AS role_name"
+    )
     assert "r.name AS role_name" in content

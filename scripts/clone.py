@@ -1,4 +1,5 @@
 """Clone target repositories into the experiment area and tear them down."""
+
 from __future__ import annotations
 
 import subprocess
@@ -8,8 +9,8 @@ from pathlib import Path
 from scripts.git_utils import git as _git
 from scripts.platform_utils import safe_rmtree
 
-
 # ── Public functions ───────────────────────────────────────────────────────
+
 
 def get_remote_url(repo_dir: Path) -> str:
     """Return the origin remote URL of repo_dir."""

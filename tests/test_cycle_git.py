@@ -1,15 +1,13 @@
 """Tests for scripts/cycle_git.py — branch naming, commit, push."""
+
 import re
 import subprocess
-from pathlib import Path
 
-import pytest
-
-from scripts.cycle_git import _slugify, create_branch, commit_cycle, push_branch
 from scripts.clone import clone_repo
-
+from scripts.cycle_git import _slugify, commit_cycle, create_branch, push_branch
 
 # ── Slugification ──────────────────────────────────────────────────────────
+
 
 class TestSlugify:
     def test_simple_phrase(self):
@@ -39,7 +37,7 @@ class TestSlugify:
 
     def test_truncation_strips_trailing_hyphen(self):
         # Pick a string whose 40th char is a hyphen; ensure no dangling -
-        subject = ("ab-" * 20)  # 'ab-ab-ab-...' length 60
+        subject = "ab-" * 20  # 'ab-ab-ab-...' length 60
         slug = _slugify(subject)
         assert not slug.endswith("-")
         assert len(slug) <= 40
@@ -76,12 +74,15 @@ class TestCreateBranch:
         branch = create_branch(dest, "test subject")
         result = subprocess.run(
             ["git", "branch", "--show-current"],
-            cwd=dest, capture_output=True, text=True,
+            cwd=dest,
+            capture_output=True,
+            text=True,
         )
         assert result.stdout.strip() == branch
 
 
 # ── commit_cycle ───────────────────────────────────────────────────────────
+
 
 class TestCommitCycle:
     def test_commit_message_format(self, tmp_path, bare_remote, source_repo):
@@ -100,7 +101,9 @@ class TestCommitCycle:
         )
         result = subprocess.run(
             ["git", "log", "-1", "--pretty=%B"],
-            cwd=dest, capture_output=True, text=True,
+            cwd=dest,
+            capture_output=True,
+            text=True,
         )
         msg = result.stdout
         assert "kaizen(cycle-2):" in msg
@@ -116,19 +119,25 @@ class TestCommitCycle:
         create_branch(dest, "test")
         (dest / "new_file.txt").write_text("new")
         commit_cycle(
-            clone_dir=dest, cycle_n=1,
-            decisions=["Add file"], participants=["Dr. Test"],
-            n_tests=1, subject="test",
+            clone_dir=dest,
+            cycle_n=1,
+            decisions=["Add file"],
+            participants=["Dr. Test"],
+            n_tests=1,
+            subject="test",
             minutes_rel_path="docs/kaizen/minutes.md",
         )
         result = subprocess.run(
             ["git", "show", "--name-only", "--pretty=format:"],
-            cwd=dest, capture_output=True, text=True,
+            cwd=dest,
+            capture_output=True,
+            text=True,
         )
         assert "new_file.txt" in result.stdout
 
 
 # ── push_branch ────────────────────────────────────────────────────────────
+
 
 class TestPushBranch:
     def test_branch_appears_on_remote_after_push(self, tmp_path, bare_remote, source_repo):
@@ -139,14 +148,18 @@ class TestPushBranch:
         # but git push of an empty branch (same as main) is fine — it sets the ref.
         (dest / "x.txt").write_text("x")
         commit_cycle(
-            clone_dir=dest, cycle_n=1,
-            decisions=["x"], participants=["Dr. Test"],
-            n_tests=1, subject="push test",
+            clone_dir=dest,
+            cycle_n=1,
+            decisions=["x"],
+            participants=["Dr. Test"],
+            n_tests=1,
+            subject="push test",
             minutes_rel_path="docs/kaizen/minutes.md",
         )
         push_branch(dest, branch)
         result = subprocess.run(
             ["git", "ls-remote", "--heads", str(bare_remote)],
-            capture_output=True, text=True,
+            capture_output=True,
+            text=True,
         )
         assert branch in result.stdout

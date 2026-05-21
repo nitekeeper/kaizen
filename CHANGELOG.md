@@ -9,7 +9,7 @@ All notable changes to Kaizen are recorded here.
 - Implementation plan (`docs/plan.md`) — 11-wave build order with parallel-eligible pairs marked.
 - Plugin scaffolding: `CLAUDE.md`, `requirements.txt`, `.claude-plugin/plugin.json`, `.gitignore` (with editor + OS metadata patterns).
 
-## [0.1.0] — TBD
+## v0.1.0 — TBD
 
 First end-to-end release. Targets:
 - `kaizen:improve <git-url>` slash command works against any registered project

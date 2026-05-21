@@ -21,25 +21,27 @@ push + finalize; it does NOT delete the clone. The caller (Wave 5 / the
 SKILL prose) calls `cleanup_after_pr(experiment_dir)` once the PR is open.
 This lets a test or recovery flow inspect the clone before teardown.
 """
+
 from __future__ import annotations
 
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from scripts.db import get_connection
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _row_to_dict(row, cols) -> dict:
-    return dict(zip(cols, row))
+    return dict(zip(cols, row, strict=False))
 
 
 # ── Run CRUD ───────────────────────────────────────────────────────────────
+
 
 def create_run(
     db_path: str,
@@ -150,13 +152,16 @@ def kaizen_root() -> Path:
 
 # ── Cleanup hook (deferred until after PR open) ────────────────────────────
 
+
 def cleanup_after_pr(experiment_dir: Path) -> None:
     """Delete the experiment clone. Called by Wave 5 after PR opens."""
     from scripts.clone import cleanup_experiment
+
     cleanup_experiment(experiment_dir)
 
 
 # ── Orchestrator ───────────────────────────────────────────────────────────
+
 
 def orchestrate_run(
     db_path: str,
@@ -177,17 +182,19 @@ def orchestrate_run(
       abandonments (list of rows), status.
     """
     # Local imports keep cycle.py / clone.py / etc. optional at import time.
-    from scripts.project import get_project_by_url
+    from scripts.abandonment import process_abandonment
     from scripts.clone import clone_repo
-    from scripts.seed_atelier_in_clone import seed_all
-    from scripts.cycle_git import create_branch, push_branch
     from scripts.cycle import (
         execute_cycle as default_executor,
-        record_cycle_success,
-        record_cycle_abandoned,
-        list_cycles,
     )
-    from scripts.abandonment import process_abandonment
+    from scripts.cycle import (
+        list_cycles,
+        record_cycle_abandoned,
+        record_cycle_success,
+    )
+    from scripts.cycle_git import create_branch, push_branch
+    from scripts.project import get_project_by_url
+    from scripts.seed_atelier_in_clone import seed_all
 
     if cycle_executor is None:
         cycle_executor = default_executor
@@ -264,14 +271,13 @@ def orchestrate_run(
             cycles_abandoned += 1
         else:
             raise RuntimeError(
-                f"cycle_executor for cycle {cycle_n} returned unrecognised "
-                f"status: {outcome!r}"
+                f"cycle_executor for cycle {cycle_n} returned unrecognised status: {outcome!r}"
             )
 
     # 7. Push the branch. If push fails, leave clone in place.
     try:
         push_branch(experiment_dir, branch)
-    except Exception as push_exc:  # noqa: BLE001 — surface any git error
+    except Exception as push_exc:
         finalized = finalize_run(
             db_path=db_path,
             run_id=run_row["id"],
@@ -325,10 +331,10 @@ def orchestrate_run(
 
 # ── CLI (dev-test only; real entry is `kaizen:improve` in Wave 7) ──────────
 
+
 def main(argv: list[str]) -> int:
     if not argv or argv[0] != "orchestrate":
-        print("Usage: run.py orchestrate <git-url> [--cycles N] [--subject \"...\"]",
-              file=sys.stderr)
+        print('Usage: run.py orchestrate <git-url> [--cycles N] [--subject "..."]', file=sys.stderr)
         return 1
 
     rest = argv[1:]
@@ -353,6 +359,7 @@ def main(argv: list[str]) -> int:
 
     db_path = ".ai/memex.db"
     import json
+
     result = orchestrate_run(
         db_path=db_path,
         git_url=git_url,

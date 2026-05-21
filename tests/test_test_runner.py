@@ -1,12 +1,9 @@
 """Tests for scripts/test_runner.py — parameterized test command runner."""
+
 import sys
-from pathlib import Path
 
-import pytest
-
-from scripts.test_runner import run_tests_in_clone
 from scripts.clone import clone_repo
-
+from scripts.test_runner import run_tests_in_clone
 
 # Use sys.executable so the test runner uses the same interpreter as the test suite.
 _DEFAULT_PYTEST = f"{sys.executable} -m pytest -v --tb=short"
@@ -22,6 +19,7 @@ class TestRunTestsInClone:
 
     def test_failing_tests_returns_false(self, tmp_path, bare_remote, source_repo):
         from tests.conftest import _git
+
         # Push a failing test to the remote
         (source_repo / "tests" / "test_fail.py").write_text("def test_fail(): assert False\n")
         _git(["add", "."], source_repo)

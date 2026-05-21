@@ -1,4 +1,5 @@
 """Platform detection and cross-platform filesystem helpers."""
+
 from __future__ import annotations
 
 import os
@@ -32,12 +33,16 @@ def safe_rmtree(path: Path) -> None:
         return
 
     if sys.version_info >= (3, 12):
+
         def _on_exc(func, target, exc):
             os.chmod(target, stat.S_IWRITE)
             func(target)
+
         shutil.rmtree(path, onexc=_on_exc)
     else:
+
         def _on_error(func, target, exc_info):
             os.chmod(target, stat.S_IWRITE)
             func(target)
+
         shutil.rmtree(path, onerror=_on_error)

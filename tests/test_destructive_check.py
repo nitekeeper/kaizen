@@ -1,13 +1,11 @@
 """Tests for scripts/destructive_check.py (vendored verbatim from atelier)."""
-import textwrap
-from pathlib import Path
 
-import pytest
+import textwrap
 
 from scripts.destructive_check import (
-    detect_destructive,
     _deleted_file_paths,
     _is_imported_by_any_file,
+    detect_destructive,
 )
 
 
@@ -28,6 +26,7 @@ def _delete_diff(filepath: str, body: str = "pass") -> str:
 
 # ── _deleted_file_paths ────────────────────────────────────────────────────
 
+
 class TestDeletedFilePaths:
     def test_single_deleted_file(self):
         diff = _delete_diff("scripts/db.py", "def get_connection(): pass")
@@ -46,12 +45,11 @@ class TestDeletedFilePaths:
 
 # ── _is_imported_by_any_file ───────────────────────────────────────────────
 
+
 class TestIsImportedByAnyFile:
     def test_imported_via_from_import(self, tmp_path):
         (tmp_path / "scripts").mkdir()
-        (tmp_path / "scripts" / "workflow.py").write_text(
-            "from scripts.db import get_connection\n"
-        )
+        (tmp_path / "scripts" / "workflow.py").write_text("from scripts.db import get_connection\n")
         assert _is_imported_by_any_file("scripts/db.py", tmp_path) is True
 
     def test_not_imported(self, tmp_path):
@@ -61,9 +59,7 @@ class TestIsImportedByAnyFile:
 
     def test_markdown_file_never_imported(self, tmp_path):
         (tmp_path / "scripts").mkdir()
-        (tmp_path / "scripts" / "workflow.py").write_text(
-            "from scripts.db import get_connection\n"
-        )
+        (tmp_path / "scripts" / "workflow.py").write_text("from scripts.db import get_connection\n")
         assert _is_imported_by_any_file("docs/readme.md", tmp_path) is False
 
     def test_git_dir_not_scanned(self, tmp_path):
@@ -77,12 +73,11 @@ class TestIsImportedByAnyFile:
 
 # ── detect_destructive ─────────────────────────────────────────────────────
 
+
 class TestDetectDestructive:
     def test_deleted_imported_file_flagged(self, tmp_path):
         (tmp_path / "scripts").mkdir()
-        (tmp_path / "scripts" / "workflow.py").write_text(
-            "from scripts.db import get_connection\n"
-        )
+        (tmp_path / "scripts" / "workflow.py").write_text("from scripts.db import get_connection\n")
         diff = _delete_diff("scripts/db.py", "def get_connection(): pass")
         issues = detect_destructive(diff, tmp_path)
         assert any(i["type"] == "deleted_imported_file" for i in issues)

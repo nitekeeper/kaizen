@@ -1,4 +1,5 @@
 """Detect destructive changes in a git diff for Atelier self-improvement cycles."""
+
 from __future__ import annotations
 
 import json
@@ -27,9 +28,7 @@ def get_diff(clone_dir: Path) -> str:
 
 def _deleted_file_paths(diff_text: str) -> list[str]:
     """Extract paths of deleted files from a git diff."""
-    pattern = re.compile(
-        r"^diff --git a/(.+?) b/\1\r?\ndeleted file mode", re.MULTILINE
-    )
+    pattern = re.compile(r"^diff --git a/(.+?) b/\1\r?\ndeleted file mode", re.MULTILINE)
     return [m.group(1) for m in pattern.finditer(diff_text)]
 
 
@@ -64,11 +63,13 @@ def _check_deleted_files(diff_text: str, repo_dir: Path) -> list[dict]:
     issues = []
     for path in _deleted_file_paths(diff_text):
         if _is_imported_by_any_file(path, repo_dir):
-            issues.append({
-                "type": "deleted_imported_file",
-                "description": f"Deleted '{path}' is imported by other files",
-                "file": path,
-            })
+            issues.append(
+                {
+                    "type": "deleted_imported_file",
+                    "description": f"Deleted '{path}' is imported by other files",
+                    "file": path,
+                }
+            )
     return issues
 
 
@@ -82,11 +83,13 @@ def _check_removed_public_functions(diff_text: str) -> list[dict]:
             current_file = header.group(1)
         m = re.match(r"^-(?:async\s+)?def ([a-zA-Z][a-zA-Z0-9_]*)\(", line)
         if m:
-            issues.append({
-                "type": "removed_public_function",
-                "description": f"Public function '{m.group(1)}' was removed",
-                "file": current_file,
-            })
+            issues.append(
+                {
+                    "type": "removed_public_function",
+                    "description": f"Public function '{m.group(1)}' was removed",
+                    "file": current_file,
+                }
+            )
     return issues
 
 
@@ -102,11 +105,13 @@ def _check_db_migrations(diff_text: str) -> list[dict]:
         line = m.group(0).lstrip("+").lstrip()
         if line.startswith("--"):
             continue
-        issues.append({
-            "type": "destructive_db_migration",
-            "description": f"Destructive SQL: {m.group(0).strip()}",
-            "file": "migration",
-        })
+        issues.append(
+            {
+                "type": "destructive_db_migration",
+                "description": f"Destructive SQL: {m.group(0).strip()}",
+                "file": "migration",
+            }
+        )
     return issues
 
 
@@ -115,11 +120,13 @@ def _check_removed_skill_dirs(diff_text: str) -> list[dict]:
     issues = []
     for path in _deleted_file_paths(diff_text):
         if path.startswith("skills/") and path.endswith("SKILL.md"):
-            issues.append({
-                "type": "removed_skill_directory",
-                "description": f"Skill '{Path(path).parent.name}' was removed",
-                "file": path,
-            })
+            issues.append(
+                {
+                    "type": "removed_skill_directory",
+                    "description": f"Skill '{Path(path).parent.name}' was removed",
+                    "file": path,
+                }
+            )
     return issues
 
 
@@ -128,11 +135,13 @@ def _check_removed_tests(diff_text: str) -> list[dict]:
     issues = []
     for path in _deleted_file_paths(diff_text):
         if Path(path).name.startswith("test_") and path.endswith(".py"):
-            issues.append({
-                "type": "removed_test_file",
-                "description": f"Test file '{path}' was deleted",
-                "file": path,
-            })
+            issues.append(
+                {
+                    "type": "removed_test_file",
+                    "description": f"Test file '{path}' was deleted",
+                    "file": path,
+                }
+            )
     return issues
 
 

@@ -12,7 +12,7 @@ _DEFAULT_PYTEST = f"{sys.executable} -m pytest -v --tb=short"
 class TestRunTestsInClone:
     def test_passing_tests_returns_true_and_count(self, tmp_path, bare_remote, source_repo):
         dest = tmp_path / "clone"
-        clone_repo(str(bare_remote), dest)
+        clone_repo(str(bare_remote), dest, "main")
         passed, count = run_tests_in_clone(dest, _DEFAULT_PYTEST)
         assert passed is True
         assert count == 1
@@ -26,14 +26,14 @@ class TestRunTestsInClone:
         _git(["commit", "-m", "add failing test"], source_repo)
         _git(["push"], source_repo)
         dest = tmp_path / "clone"
-        clone_repo(str(bare_remote), dest)
+        clone_repo(str(bare_remote), dest, "main")
         passed, _count = run_tests_in_clone(dest, _DEFAULT_PYTEST)
         assert passed is False
 
     def test_custom_test_command_string_parses_correctly(self, tmp_path, bare_remote, source_repo):
         """A different pytest invocation string is split by shlex and run successfully."""
         dest = tmp_path / "clone"
-        clone_repo(str(bare_remote), dest)
+        clone_repo(str(bare_remote), dest, "main")
         # Custom command string with extra args; shlex.split must handle it.
         cmd = f"{sys.executable} -m pytest -v --tb=long"
         passed, count = run_tests_in_clone(dest, cmd)

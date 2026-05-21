@@ -209,7 +209,7 @@ def orchestrate_run(
 
     # 2. Clone target
     experiment_dir = experiment_dir_for(kaizen_root(), git_url)
-    clone_repo(git_url, experiment_dir)
+    clone_repo(git_url, experiment_dir, project["base_branch"])
 
     # 3. Seed atelier
     seed_all(experiment_dir)

@@ -18,15 +18,17 @@ def get_remote_url(repo_dir: Path) -> str:
     return result.stdout.strip()
 
 
-def clone_repo(remote_url: str, dest: Path) -> None:
-    """Clone remote_url into dest and configure a known git identity.
+def clone_repo(remote_url: str, dest: Path, branch: str) -> None:
+    """Clone remote_url into dest at branch and configure a known git identity.
 
     Caller is responsible for providing remote_url directly; this function
-    does not look up an origin from any other repo.
+    does not look up an origin from any other repo. `branch` is required so
+    target repos with non-`main` default branches (master, develop, trunk, ...)
+    can be cloned.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        ["git", "clone", "-b", "main", remote_url, str(dest)],
+        ["git", "clone", "-b", branch, remote_url, str(dest)],
         check=True,
         capture_output=True,
         text=True,
@@ -43,17 +45,21 @@ def cleanup_experiment(experiment_dir: Path) -> None:
 
 if __name__ == "__main__":
     # Usage:
-    #   python3 scripts/clone.py clone <git-url> <dest>
+    #   python3 scripts/clone.py clone <git-url> <branch> <dest>
     #   python3 scripts/clone.py cleanup <experiment-dir>
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
 
     if cmd == "clone":
-        if len(sys.argv) < 4:
-            print("Usage: python3 scripts/clone.py clone <git-url> <dest>", file=sys.stderr)
+        if len(sys.argv) < 5:
+            print(
+                "Usage: python3 scripts/clone.py clone <git-url> <branch> <dest>",
+                file=sys.stderr,
+            )
             sys.exit(1)
         remote_url = sys.argv[2]
-        dest = Path(sys.argv[3])
-        clone_repo(remote_url, dest)
+        branch = sys.argv[3]
+        dest = Path(sys.argv[4])
+        clone_repo(remote_url, dest, branch)
         print(f"CLONE_DIR={dest}")
 
     elif cmd == "cleanup":

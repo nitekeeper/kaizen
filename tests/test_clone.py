@@ -16,7 +16,7 @@ class TestCloneRepo:
         from scripts.clone import clone_repo
 
         dest = tmp_path / "clone"
-        clone_repo(str(bare_remote), dest)
+        clone_repo(str(bare_remote), dest, "main")
         assert dest.exists()
         assert (dest / "README.md").exists()
 
@@ -24,7 +24,7 @@ class TestCloneRepo:
         from scripts.clone import clone_repo
 
         dest = tmp_path / "clone"
-        clone_repo(str(bare_remote), dest)
+        clone_repo(str(bare_remote), dest, "main")
         result = subprocess.run(
             ["git", "config", "user.email"],
             cwd=dest,
@@ -39,7 +39,7 @@ class TestCloneRepo:
 
         dest = tmp_path / "clone"
         # Pass the bare_remote path as the URL directly — no origin lookup.
-        clone_repo(str(bare_remote), dest)
+        clone_repo(str(bare_remote), dest, "main")
         assert (dest / "README.md").exists()
 
 
@@ -51,7 +51,7 @@ class TestGetRemoteUrl:
         from scripts.clone import clone_repo, get_remote_url
 
         dest = tmp_path / "clone"
-        clone_repo(str(bare_remote), dest)
+        clone_repo(str(bare_remote), dest, "main")
         url = get_remote_url(dest)
         assert str(bare_remote) in url
 
@@ -110,6 +110,7 @@ class TestCLI:
                 str(Path.cwd() / "scripts" / "clone.py"),
                 "clone",
                 str(bare_remote),
+                "main",
                 str(dest),
             ],
             capture_output=True,

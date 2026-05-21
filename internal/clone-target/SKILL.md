@@ -32,10 +32,11 @@ Wraps `scripts/clone.py` (clone + cleanup) and `scripts/seed_atelier_in_clone.py
 3. Clone the repo:
 
    ```
-   python3 scripts/clone.py clone <git-url> <clone-dir>
+   python3 scripts/clone.py clone <git-url> <branch> <clone-dir>
    ```
 
-   - This invokes `git clone -b main <git-url> <clone-dir>` then sets `user.email=kaizen@kaizen.local` / `user.name=Kaizen` in the clone.
+   - This invokes `git clone -b <branch> <git-url> <clone-dir>` then sets `user.email=kaizen@kaizen.local` / `user.name=Kaizen` in the clone.
+   - `<branch>` is the target repo's base branch (e.g. `main`, `master`, `develop`, `trunk`). Callers typically pass `project["base_branch"]` from the kaizen DB; `internal/run/SKILL.md` resolves it via `scripts.detect.detect_default_branch` when registering the project.
    - On failure (network, auth, bad URL): the subprocess raises `subprocess.CalledProcessError`. Surface the git error to the user and signal abort to the caller — do not proceed with a half-cloned directory. The caller (`internal/run/SKILL.md`) must not create a run row when setup fails.
 
 4. Seed atelier into the clone:

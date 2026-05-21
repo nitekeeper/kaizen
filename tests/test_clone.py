@@ -42,6 +42,25 @@ class TestCloneRepo:
         clone_repo(str(bare_remote), dest, "main")
         assert (dest / "README.md").exists()
 
+    def test_clone_honors_non_main_branch(self, tmp_path, bare_remote_trunk):
+        """Branch argument must be honored end-to-end (not silently ignored)."""
+        from scripts.clone import clone_repo
+
+        dest = tmp_path / "clone_trunk"
+        clone_repo(str(bare_remote_trunk), dest, "trunk")
+
+        assert dest.exists()
+        assert (dest / "README.md").exists()
+
+        head = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=dest,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert head.stdout.strip() == "trunk"
+
 
 # ── get_remote_url ─────────────────────────────────────────────────────────
 

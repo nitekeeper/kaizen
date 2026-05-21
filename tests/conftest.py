@@ -47,3 +47,27 @@ def source_repo(tmp_path, bare_remote):
     _git(["commit", "-m", "initial"], repo)
     _git(["push", "-u", "origin", "main"], repo)
     return repo
+
+
+@pytest.fixture
+def bare_remote_trunk(tmp_path):
+    """Bare repo whose initial branch is `trunk` (non-main), seeded with one commit."""
+    remote = tmp_path / "remote_trunk.git"
+    remote.mkdir()
+    subprocess.run(
+        ["git", "init", "--bare", "-b", "trunk", str(remote)],
+        check=True,
+        capture_output=True,
+    )
+    # Seed the bare remote by pushing from a scratch repo on `trunk`.
+    seed = tmp_path / "seed_trunk"
+    seed.mkdir()
+    _git(["init", "-b", "trunk"], seed)
+    _git(["config", "user.email", "test@test.com"], seed)
+    _git(["config", "user.name", "Test User"], seed)
+    _git(["remote", "add", "origin", str(remote)], seed)
+    (seed / "README.md").write_text("# kaizen test target (trunk)\n")
+    _git(["add", "."], seed)
+    _git(["commit", "-m", "initial"], seed)
+    _git(["push", "-u", "origin", "trunk"], seed)
+    return remote

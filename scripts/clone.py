@@ -23,8 +23,7 @@ def clone_repo(remote_url: str, dest: Path, branch: str) -> None:
 
     Caller is responsible for providing remote_url directly; this function
     does not look up an origin from any other repo. `branch` is required so
-    target repos with non-`main` default branches (master, develop, trunk, ...)
-    can be cloned.
+    target repos with non-`main` default branches can be cloned.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run(

@@ -7,6 +7,7 @@ import subprocess
 
 from scripts import setup as setup_mod
 from scripts.setup import (
+    check_atelier,
     check_gh,
     check_git,
     check_python_version,
@@ -25,8 +26,9 @@ def _fail_result(stdout: str = "", stderr: str = "", code: int = 1) -> subproces
     return subprocess.CompletedProcess(args=[], returncode=code, stdout=stdout, stderr=stderr)
 
 
-def _all_present(monkeypatch) -> None:
+def _all_present(monkeypatch, tmp_path=None) -> None:
     """Patch the world so every dep check passes."""
+    import pathlib
 
     def fake_which(name: str):
         return f"/usr/bin/{name}" if name in {"git", "gh"} else None
@@ -41,6 +43,11 @@ def _all_present(monkeypatch) -> None:
 
     monkeypatch.setattr(setup_mod.shutil, "which", fake_which)
     monkeypatch.setattr(setup_mod.subprocess, "run", fake_run)
+
+    # Patch find_atelier_root to return a deterministic path without touching
+    # the real plugin cache.
+    fake_atelier_root = pathlib.Path("/fake/atelier/v1.0.0")
+    monkeypatch.setattr(setup_mod, "find_atelier_root", lambda: fake_atelier_root)
 
 
 # ── Individual check tests ─────────────────────────────────────────────────
@@ -202,11 +209,45 @@ class TestRunSetup:
         assert "Setup blocked" in out
 
 
+class TestCheckAtelier:
+    def test_present(self, monkeypatch, tmp_path):
+        """Happy path: find_atelier_root returns a valid path → ok=True."""
+        monkeypatch.setattr(setup_mod, "find_atelier_root", lambda: tmp_path)
+        c = check_atelier()
+        assert c.ok is True
+        assert str(tmp_path) in c.detail
+        assert "atelier" in c.name.lower()
+
+    def test_not_found_runtime_error(self, monkeypatch):
+        """Sad path: find_atelier_root raises RuntimeError → ok=False with helpful detail."""
+
+        def _raise():
+            raise RuntimeError("Atelier plugin cache not found at /fake/path")
+
+        monkeypatch.setattr(setup_mod, "find_atelier_root", _raise)
+        c = check_atelier()
+        assert c.ok is False
+        assert "atelier" in c.detail.lower() or "cache" in c.detail.lower()
+        assert "plugin install atelier" in c.fix.lower()
+
+    def test_not_found_generic_exception(self, monkeypatch):
+        """Sad path: find_atelier_root raises unexpected exception → treated as not-found."""
+
+        def _raise():
+            raise OSError("permission denied")
+
+        monkeypatch.setattr(setup_mod, "find_atelier_root", _raise)
+        c = check_atelier()
+        assert c.ok is False
+        assert "permission denied" in c.detail.lower()
+        assert "plugin install atelier" in c.fix.lower()
+
+
 class TestVerifyAll:
-    def test_returns_three_checks(self, monkeypatch):
+    def test_returns_four_checks(self, monkeypatch):
         _all_present(monkeypatch)
 
         checks = verify_all()
-        assert len(checks) == 3
-        assert {c.name for c in checks} == {"git", "gh", "python"}
+        assert len(checks) == 4
+        assert {c.name for c in checks} == {"git", "gh", "python", "atelier"}
         assert all(c.ok for c in checks)

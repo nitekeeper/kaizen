@@ -80,6 +80,8 @@ def _check_removed_public_functions(diff_text: str) -> list[dict]:
         header = re.match(r"^diff --git a/(.+?) b/\1$", line)
         if header:
             current_file = header.group(1)
+        if Path(current_file).suffix.lower() != ".py":
+            continue
         m = re.match(r"^-(?:async\s+)?def ([a-zA-Z][a-zA-Z0-9_]*)\(", line)
         if m:
             issues.append(

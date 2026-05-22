@@ -9,6 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from scripts.destructive_check import (
+    _check_removed_public_functions,
     _deleted_file_paths,
     _is_imported_by_any_file,
     detect_destructive,
@@ -97,7 +98,7 @@ class TestDetectDestructive:
         assert not any(i["type"] == "deleted_imported_file" for i in issues)
 
     def test_removed_public_function_flagged(self, tmp_path):
-        diff = "-def get_phase(project_id):\n-    pass\n"
+        diff = _make_modify_diff("scripts/workflow.py", ["def get_phase(project_id):", "    pass"])
         issues = detect_destructive(diff, tmp_path)
         assert any(i["type"] == "removed_public_function" for i in issues)
 
@@ -148,6 +149,89 @@ class TestDetectDestructive:
             assert "type" in issue
             assert "description" in issue
             assert "file" in issue
+
+
+def _make_modify_diff(
+    filepath: str, removed_lines: list[str], added_lines: list[str] | None = None
+) -> str:
+    """Build a minimal unified diff that modifies filepath (not a file deletion)."""
+    added_lines = added_lines or []
+    removed = "\n".join(f"-{line}" for line in removed_lines)
+    added = "\n".join(f"+{line}" for line in added_lines)
+    hunk_body = "\n".join(filter(None, [removed, added]))
+    total_old = len(removed_lines)
+    total_new = len(added_lines)
+    return (
+        f"diff --git a/{filepath} b/{filepath}\n"
+        f"index abc123..def456 100644\n"
+        f"--- a/{filepath}\n"
+        f"+++ b/{filepath}\n"
+        f"@@ -{total_old},0 +{total_new},0 @@\n"
+        f"{hunk_body}\n"
+    )
+
+
+# ── _check_removed_public_functions: .py extension gate (M4, task 16) ─────
+
+
+class TestCheckRemovedPublicFunctionsPyExtensionGate:
+    """Gate tests: def removal check must only fire for .py files."""
+
+    def test_py_file_def_removal_produces_issue(self):
+        """Happy path: a .py file with a removed public def produces an issue."""
+        diff = _make_modify_diff(
+            "scripts/workflow.py",
+            ["def get_phase(project_id):"],
+        )
+        issues = _check_removed_public_functions(diff)
+        assert any(i["type"] == "removed_public_function" for i in issues)
+        assert issues[0]["file"] == "scripts/workflow.py"
+
+    def test_markdown_file_def_removal_no_issue(self):
+        """Markdown file containing '-def fake(' must NOT produce an issue."""
+        diff = _make_modify_diff(
+            "README.md",
+            ["def fake(x):"],
+        )
+        issues = _check_removed_public_functions(diff)
+        assert issues == [], f"Expected no issues for .md file, got: {issues}"
+
+    def test_json_file_def_removal_no_issue(self):
+        """JSON file containing '-def something(' must NOT produce an issue."""
+        diff = _make_modify_diff(
+            "fixtures/data.json",
+            ["def something(arg):"],
+        )
+        issues = _check_removed_public_functions(diff)
+        assert issues == [], f"Expected no issues for .json file, got: {issues}"
+
+    def test_mixed_diff_only_py_file_produces_issue(self):
+        """A diff with both a .py def removal and a .md def removal yields exactly one issue."""
+        diff = _make_modify_diff("scripts/workflow.py", ["def real_func(x):"]) + _make_modify_diff(
+            "docs/guide.md", ["def fake_func(y):"]
+        )
+        issues = _check_removed_public_functions(diff)
+        assert len(issues) == 1, f"Expected exactly 1 issue, got: {issues}"
+        assert issues[0]["file"] == "scripts/workflow.py"
+        assert issues[0]["type"] == "removed_public_function"
+
+    def test_uppercase_py_extension_produces_issue(self):
+        """A file with .PY extension (case-insensitive match) produces an issue."""
+        diff = _make_modify_diff(
+            "legacy/FOO.PY",
+            ["def bar(x):"],
+        )
+        issues = _check_removed_public_functions(diff)
+        assert any(i["type"] == "removed_public_function" for i in issues), (
+            "Expected .PY (uppercase) to be treated as Python file"
+        )
+
+    def test_unknown_file_no_issue(self):
+        """Lines before any diff header (current_file == 'unknown') are skipped."""
+        # No 'diff --git' header — current_file stays 'unknown', suffix != '.py'
+        raw_diff = "-def orphan(x):\n-    pass\n"
+        issues = _check_removed_public_functions(raw_diff)
+        assert issues == [], f"Expected no issues for unknown file context, got: {issues}"
 
 
 # ── get_diff library error path ────────────────────────────────────────────

@@ -263,6 +263,7 @@ def orchestrate_run(
                     subject=outcome.get("subject", subject),
                     started_at=cycle_started,
                 )
+                # _ab_markdown: caller is responsible for capturing to Memex via memex:run; not used at this layer yet.
                 ab_row, _ab_markdown = process_abandonment(
                     db_path=db_path,
                     project=project,

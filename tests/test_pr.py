@@ -264,6 +264,46 @@ def test_render_pr_body_includes_timestamps_formatted(db, project):
     assert "Run ended | 2026-05-16 15:47 UTC" in body
 
 
+# ── _fmt_ts ───────────────────────────────────────────────────────────────
+
+
+class TestFmtTs:
+    def test_fmt_ts_naive_treated_as_utc(self):
+        from scripts.pr import _fmt_ts
+
+        assert _fmt_ts("2026-05-16T14:23:00") == "2026-05-16 14:23 UTC"
+
+    def test_fmt_ts_with_offset_converted_to_utc(self):
+        from scripts.pr import _fmt_ts
+
+        assert _fmt_ts("2026-05-16T14:23:00+05:30") == "2026-05-16 08:53 UTC"
+
+    def test_fmt_ts_negative_offset_converted_to_utc(self):
+        from scripts.pr import _fmt_ts
+
+        assert _fmt_ts("2026-05-16T14:23:00-04:00") == "2026-05-16 18:23 UTC"
+
+    def test_fmt_ts_utc_offset_unchanged(self):
+        from scripts.pr import _fmt_ts
+
+        assert _fmt_ts("2026-05-16T14:23:00+00:00") == "2026-05-16 14:23 UTC"
+
+    def test_fmt_ts_returns_em_dash_for_none(self):
+        from scripts.pr import _fmt_ts
+
+        assert _fmt_ts(None) == "—"
+
+    def test_fmt_ts_returns_em_dash_for_empty_string(self):
+        from scripts.pr import _fmt_ts
+
+        assert _fmt_ts("") == "—"
+
+    def test_fmt_ts_returns_raw_for_invalid_iso(self):
+        from scripts.pr import _fmt_ts
+
+        assert _fmt_ts("not-a-timestamp") == "not-a-timestamp"
+
+
 # ── open_pr (subprocess mocked) ────────────────────────────────────────────
 
 

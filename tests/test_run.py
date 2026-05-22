@@ -358,6 +358,38 @@ def test_orchestrate_run_cleans_up_on_seed_failure(db, project, tmp_path, monkey
     assert not experiment_dir.exists()
 
 
+def test_orchestrate_run_finalizes_failed_run_on_cycle_exception(
+    db, project, tmp_path, monkeypatch
+):
+    """H3: an unhandled exception inside the cycle loop must finalize the
+    runs row at status='failed' (with partial counts) before re-raising,
+    so the DB is never left with a row stuck at status='running'."""
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+
+    def boom_executor(clone_dir, proj, run_row, cycle_n):
+        raise RuntimeError("cycle boom")
+
+    with pytest.raises(RuntimeError, match="cycle boom"):
+        orchestrate_run(
+            db_path=db,
+            git_url=project["git_url"],
+            cycles_requested=3,
+            cycle_executor=boom_executor,
+        )
+
+    # Exactly one runs row was created for this project; pick it up.
+    rows = list_runs(db, project_id=project["id"])
+    assert len(rows) == 1
+    final = rows[0]
+    assert final["status"] == "failed"
+    # The crash happened on cycle 1 before any progress was recorded, so
+    # both counters must still be zero on the persisted row.
+    assert final["cycles_succeeded"] == 0
+    assert final["cycles_abandoned"] == 0
+    # ended_at must be populated — finalize_run was called.
+    assert final["ended_at"] is not None
+
+
 def test_orchestrate_run_push_failure_leaves_clone(db, project, tmp_path, monkeypatch):
     _install_orchestrator_stubs(monkeypatch, tmp_path)
 

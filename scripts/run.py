@@ -238,48 +238,65 @@ def orchestrate_run(
     cycles_abandoned = 0
     abandonment_rows: list[dict] = []
 
-    for cycle_n in range(1, cycles_requested + 1):
-        cycle_started = _now()
-        outcome = cycle_executor(experiment_dir, project, run_row, cycle_n)
+    # H3: any unhandled exception inside the loop body (cycle_executor crash,
+    # record_cycle_* error, process_abandonment error, etc.) would otherwise
+    # leave the runs row stuck at status='running' forever. Finalize as
+    # 'failed' with the partial counts captured so far, then re-raise to
+    # preserve the original traceback. KeyboardInterrupt / SystemExit pass
+    # through untouched.
+    try:
+        for cycle_n in range(1, cycles_requested + 1):
+            cycle_started = _now()
+            outcome = cycle_executor(experiment_dir, project, run_row, cycle_n)
 
-        if outcome.get("status") == "success":
-            record_cycle_success(
-                db_path=db_path,
-                run_id=run_row["id"],
-                cycle_n=cycle_n,
-                subject=outcome.get("subject", subject),
-                commit_sha=outcome["commit_sha"],
-                minutes_memex_slug=outcome.get("minutes_memex_slug"),
-                started_at=cycle_started,
-            )
-            cycles_succeeded += 1
-        elif outcome.get("status") == "abandoned":
-            cycle_row = record_cycle_abandoned(
-                db_path=db_path,
-                run_id=run_row["id"],
-                cycle_n=cycle_n,
-                subject=outcome.get("subject", subject),
-                started_at=cycle_started,
-            )
-            ab_row = process_abandonment(
-                db_path=db_path,
-                project=project,
-                run_id=run_row["id"],
-                cycle_id=cycle_row["id"],
-                cycle_n=cycle_n,
-                subject=outcome.get("subject", subject),
-                participants=outcome.get("participants", []),
-                phase_reached=outcome.get("phase_reached", "unknown"),
-                reason=outcome.get("reason", "other"),
-                detail=outcome.get("detail", ""),
-                artifacts=outcome.get("artifacts", []),
-            )
-            abandonment_rows.append(ab_row)
-            cycles_abandoned += 1
-        else:
-            raise RuntimeError(
-                f"cycle_executor for cycle {cycle_n} returned unrecognised status: {outcome!r}"
-            )
+            if outcome.get("status") == "success":
+                record_cycle_success(
+                    db_path=db_path,
+                    run_id=run_row["id"],
+                    cycle_n=cycle_n,
+                    subject=outcome.get("subject", subject),
+                    commit_sha=outcome["commit_sha"],
+                    minutes_memex_slug=outcome.get("minutes_memex_slug"),
+                    started_at=cycle_started,
+                )
+                cycles_succeeded += 1
+            elif outcome.get("status") == "abandoned":
+                cycle_row = record_cycle_abandoned(
+                    db_path=db_path,
+                    run_id=run_row["id"],
+                    cycle_n=cycle_n,
+                    subject=outcome.get("subject", subject),
+                    started_at=cycle_started,
+                )
+                ab_row = process_abandonment(
+                    db_path=db_path,
+                    project=project,
+                    run_id=run_row["id"],
+                    cycle_id=cycle_row["id"],
+                    cycle_n=cycle_n,
+                    subject=outcome.get("subject", subject),
+                    participants=outcome.get("participants", []),
+                    phase_reached=outcome.get("phase_reached", "unknown"),
+                    reason=outcome.get("reason", "other"),
+                    detail=outcome.get("detail", ""),
+                    artifacts=outcome.get("artifacts", []),
+                )
+                abandonment_rows.append(ab_row)
+                cycles_abandoned += 1
+            else:
+                raise RuntimeError(
+                    f"cycle_executor for cycle {cycle_n} returned unrecognised status: {outcome!r}"
+                )
+    except Exception:
+        finalize_run(
+            db_path=db_path,
+            run_id=run_row["id"],
+            cycles_succeeded=cycles_succeeded,
+            cycles_abandoned=cycles_abandoned,
+            pr_url=None,
+            status="failed",
+        )
+        raise
 
     # 7. Push the branch. If push fails, leave clone in place.
     try:

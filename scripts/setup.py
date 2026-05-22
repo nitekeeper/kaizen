@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 from scripts.migrate import apply_migrations
+from scripts.seed_atelier_in_clone import find_atelier_root
 
 REPO_ROOT = Path(__file__).parent.parent
 MIGRATIONS_DIR = REPO_ROOT / "migrations"
@@ -80,12 +81,23 @@ def check_python_version() -> DepCheck:
     return DepCheck(name, False, f"{detail} (need >= 3.11)", fix)
 
 
+def check_atelier() -> DepCheck:
+    name = "atelier"
+    fix = "Install Atelier via Agora: run `agora install atelier` in Claude Code"
+    try:
+        root = find_atelier_root()
+    except Exception as exc:
+        return DepCheck(name, False, str(exc), fix)
+    return DepCheck(name, True, str(root), fix)
+
+
 def verify_all() -> list[DepCheck]:
     """Run every check and return the results. Does not raise."""
     return [
         check_git(),
         check_gh(),
         check_python_version(),
+        check_atelier(),
     ]
 
 

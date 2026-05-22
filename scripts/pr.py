@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from scripts.db import get_connection
@@ -107,7 +107,7 @@ def _fmt_ts(ts: str | None) -> str:
         dt = datetime.fromisoformat(ts)
     except ValueError:
         return ts
-    dt = dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)  # noqa: UP017
+    dt = dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
     return dt.strftime("%Y-%m-%d %H:%M UTC")
 
 

@@ -303,6 +303,11 @@ class TestFmtTs:
 
         assert _fmt_ts("not-a-timestamp") == "not-a-timestamp"
 
+    def test_fmt_ts_z_suffix_treated_as_utc(self):
+        from scripts.pr import _fmt_ts
+
+        assert _fmt_ts("2026-05-16T14:23:00Z") == "2026-05-16 14:23 UTC"
+
 
 # ── open_pr (subprocess mocked) ────────────────────────────────────────────
 

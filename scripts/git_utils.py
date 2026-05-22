@@ -1,4 +1,4 @@
-"""Shared git subprocess helper used by self_improve and worktree modules."""
+"""Shared git subprocess helper used by cycle_git, clone, and worktree modules."""
 
 from __future__ import annotations
 

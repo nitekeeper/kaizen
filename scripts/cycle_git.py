@@ -7,6 +7,7 @@ Branch naming format:
 from __future__ import annotations
 
 import re
+import shutil
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -69,6 +70,11 @@ def commit_cycle(
     minutes_rel_path: str,
 ) -> None:
     """Stage all changes and produce the standard kaizen cycle commit."""
+    # Strip transient dirs so they never reach the PR diff
+    for transient in (".ai", "__pycache__", ".pytest_cache"):
+        path = clone_dir / transient
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
     _git(["add", "-A"], clone_dir)
     summary = decisions[0] if decisions else "improvements applied"
     decisions_text = "\n".join(f"  {i + 1}. {d}" for i, d in enumerate(decisions))

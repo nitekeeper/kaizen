@@ -1,12 +1,12 @@
 ---
-description: Use when a Kaizen cycle abandons — writes the formal markdown report, captures it to Kaizen's own memex, and records the abandonments row keyed to the cycle.
+description: Use when a Kaizen cycle abandons — renders the formal markdown report, writes it to .ai/wiki/<slug>.md, invokes memex:run capture, and records the abandonments row keyed to the cycle.
 ---
 
 # internal/abandonment-report
 
-When a cycle cannot complete, it produces a structured outcome with a reason code. This skill turns that outcome into a permanent record: a markdown report following design §4.5, captured to Kaizen's own wiki, with a matching row in the `abandonments` table.
+When a cycle cannot complete, it produces a structured outcome with a reason code. This skill turns that outcome into a permanent record: a markdown report following design §4.5, written to `.ai/wiki/<slug>.md` and captured to Kaizen's own wiki via `memex:run capture`, with a matching row in the `abandonments` table.
 
-Backed entirely by `scripts/abandonment.py` (which already exposes `format_report`, `capture_to_memex`, `record_abandonment`, and the end-to-end `process_abandonment` helper).
+Backed entirely by `scripts/abandonment.py` (which exposes `format_report`, `record_abandonment`, and the end-to-end `process_abandonment` helper — returning a `(row, markdown)` tuple).
 
 ## Inputs
 
@@ -17,26 +17,26 @@ Backed entirely by `scripts/abandonment.py` (which already exposes `format_repor
 - `subject` (str | None)
 - `participants` (list[str]) — agent names.
 - `phase_reached` (str) — one of `agenda`, `meeting`, `implementation`, `test`, `push`.
-- `reason` (str) — one of `no_consensus`, `destructive_rejected`, `tests_unrecoverable`, `push_failed`, `other`.
+- `reason` (str) — one of `no_consensus`, `destructive_rejected`, `tests_unrecoverable`, `other`.
 - `detail` (str) — free-text. What was attempted, what blocked it, what the next session should reconsider.
 - `artifacts` (list[str]) — slugs or paths of partial proposals, test logs, etc.
 
 ## Output
 
-The inserted `abandonments` row dict (includes the assigned `id` and the `report_memex_slug`).
+A 2-tuple: the inserted `abandonments` row dict (includes the assigned `id` and the `report_memex_slug`), and the rendered markdown string. After calling this skill, the orchestrator writes the markdown to `.ai/wiki/<slug>.md` and invokes `memex:run capture` against that path.
 
 ## Procedure
 
 ### Single-call path (recommended)
 
-`scripts/abandonment.process_abandonment` does the whole sequence — format the markdown, attempt the memex capture (best-effort; warns and continues if `memex` is unavailable), and insert the abandonments row.
+`process_abandonment` renders the markdown and records the abandonments row; the caller is responsible for writing markdown to `.ai/wiki/<slug>.md` and invoking `memex:run capture`.
 
 ```
 python3 -c "
 import json
 from scripts.abandonment import process_abandonment
 project = json.loads('''<project JSON>''')
-row = process_abandonment(
+row, markdown = process_abandonment(
     db_path='.ai/memex.db',
     project=project,
     run_id=<run_id>,
@@ -53,7 +53,16 @@ print(json.dumps(row, default=str))
 "
 ```
 
-Parse the JSON on stdout and return as a dict.
+After the call, write the markdown and capture it:
+
+```python
+slug = row["report_memex_slug"]
+from pathlib import Path
+Path(".ai/wiki").mkdir(parents=True, exist_ok=True)
+Path(f".ai/wiki/{slug}.md").write_text(markdown)
+# Then invoke as a skill call:
+# memex:run capture <slug> .ai/wiki/<slug>.md
+```
 
 ### Step-by-step path (when the agent needs to inspect the markdown before capture)
 
@@ -78,14 +87,19 @@ print(md)
 "
 ```
 
-Inspect the output. If satisfied, capture it:
+Inspect the output. If satisfied, write the markdown to `.ai/wiki/<slug>.md`:
+
+```python
+slug = f"kaizen:abandonment:{run_id}-cycle-{cycle_n}"
+from pathlib import Path
+Path(".ai/wiki").mkdir(parents=True, exist_ok=True)
+Path(f".ai/wiki/{slug}.md").write_text(md)
+```
+
+Then invoke `memex:run capture` as a skill call:
 
 ```
-python3 -c "
-from scripts.abandonment import capture_to_memex
-slug = capture_to_memex('kaizen:abandonment:<run_id>-cycle-<cycle_n>', open('<tmp file with markdown>').read())
-print(slug)
-"
+memex:run capture <slug> .ai/wiki/<slug>.md
 ```
 
 Then record the row:
@@ -139,6 +153,6 @@ Do not edit this format ad hoc — it is the contract `format_report` enforces a
 ## Hard rules
 
 - **Slug format is fixed:** `kaizen:abandonment:<run_id>-cycle-<n>`. Anything else breaks cross-referencing in PR bodies and `memex ask` queries.
-- **`memex capture` is best-effort.** If `memex` is not on PATH or the subprocess fails, the abandonment is still recorded with the slug stored — the report can be re-ingested by the user later. Never let a missing memex CLI block abandonment recording.
+- **The caller's `memex:run capture` is best-effort.** If the wiki write or the skill invocation fails, the abandonment row is still recorded with the slug stored — the report can be re-ingested by the user later. Never let a missing memex plugin block abandonment recording.
 - **`phase_reached` and `reason` come from the cycle's structured outcome.** Do not invent values. If the cycle did not provide them, use `phase_reached="unknown"` and `reason="other"`.
 - **The `cycles` row must already exist** when this skill is invoked. The orchestrator inserts it (with `status='abandoned'`) before calling this skill — `abandonments.cycle_id` references that row.

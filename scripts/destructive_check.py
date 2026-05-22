@@ -21,7 +21,7 @@ def get_diff(clone_dir: Path) -> str:
         check=False,
     )
     if result.returncode != 0:
-        raise RuntimeError(f"git diff failed in {clone_dir}: {result.stderr.strip()}")
+        raise RuntimeError(f"Error: git diff failed in {clone_dir}: {result.stderr.strip()}")
     return result.stdout
 
 

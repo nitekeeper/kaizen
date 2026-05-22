@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -165,7 +166,7 @@ class TestWorktreeCLI:
             capture_output=True,
             text=True,
             cwd=str(repo),
-            env={**__import__("os").environ, "PYTHONPATH": str(self._repo_root())},
+            env={**os.environ, "PYTHONPATH": str(self._repo_root())},
         )
         # Not in a linked worktree → should exit 0 with informational message
         assert result.returncode == 0
@@ -177,6 +178,7 @@ class TestWorktreeCLI:
             capture_output=True,
             text=True,
             cwd=str(self._repo_root()),
+            env={**os.environ, "PYTHONPATH": str(self._repo_root())},
         )
         assert result.returncode == 1
         assert "merge-back" in result.stderr
@@ -193,7 +195,7 @@ class TestWorktreeCLI:
             capture_output=True,
             text=True,
             cwd=str(wt),
-            env={**__import__("os").environ, "PYTHONPATH": str(self._repo_root())},
+            env={**os.environ, "PYTHONPATH": str(self._repo_root())},
         )
         assert result.returncode == 1
         assert result.stderr.strip() != ""

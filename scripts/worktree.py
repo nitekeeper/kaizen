@@ -64,9 +64,9 @@ def merge_back(worktree_dir: Path) -> None:
     the worktree branch into the base branch in the main workspace, and
     delete the worktree and its branch.
 
-    Aborts with clear instructions on merge conflict, dirty main workspace,
-    or detached HEAD. Unlike auto_merge_to_main, this does NOT stash — the
-    developer is present and should handle their own workspace state.
+    Raises RuntimeError with clear instructions on merge conflict, dirty main
+    workspace, or detached HEAD. Unlike auto_merge_to_main, this does NOT
+    stash — the developer is present and should handle their own workspace state.
     """
     # ── Detect ───────────────────────────────────────────────────────────────
     is_worktree, _ = detect_worktree(worktree_dir)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 import sys
 import tempfile
 from datetime import UTC, datetime
@@ -216,6 +217,31 @@ def _edit_detected(detected: dict) -> dict:
     return edited
 
 
+def _detect_base_branch(git_url: str) -> str:
+    """Detect the default branch of a git remote via `ls-remote --symref`.
+
+    Falls back to 'main' if detection fails (network error, malformed output, etc.).
+    Used at project registration time to seed `projects.base_branch` from the
+    actual repo, rather than assuming 'main'.
+    """
+    result = subprocess.run(  # nosec B603 B607
+        ["git", "ls-remote", "--symref", git_url, "HEAD"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    if result.returncode != 0:
+        return "main"
+    # Expected output line: "ref: refs/heads/<branch>\tHEAD"
+    for line in result.stdout.splitlines():
+        if line.startswith("ref: refs/heads/"):
+            ref = line[len("ref: refs/heads/") :]
+            # ref may be followed by "\tHEAD"; strip everything after first whitespace
+            return ref.split()[0] if ref.split() else "main"
+    return "main"
+
+
 def _register_cli(git_url: str, db_path: str) -> int:
     """Run the interactive register flow. Returns process exit code."""
     from scripts.clone import cleanup_experiment, clone_repo  # local to avoid import-time cost
@@ -226,11 +252,12 @@ def _register_cli(git_url: str, db_path: str) -> int:
         print(json.dumps(existing, indent=2))
         return 0
 
+    base_branch = _detect_base_branch(git_url)
     with tempfile.TemporaryDirectory(prefix="kaizen-register-") as tmp:
         dest = Path(tmp) / "clone"
-        print(f"Cloning {git_url} ... ", end="", flush=True)
+        print(f"Cloning {git_url} (branch={base_branch}) ... ", end="", flush=True)
         try:
-            clone_repo(git_url, dest, "main")
+            clone_repo(git_url, dest, base_branch)
         except Exception as exc:
             print("failed.")
             print(f"clone error: {exc}", file=sys.stderr)
@@ -284,7 +311,7 @@ def _register_cli(git_url: str, db_path: str) -> int:
             db_path=db_path,
             git_url=git_url,
             name=_name_from_url(git_url),
-            base_branch="main",
+            base_branch=base_branch,
             test_command=detected["test_command"],
             read_paths=detected.get("read_paths") or [],
             expert_roster=detected.get("expert_roster") or [],

@@ -13,6 +13,7 @@ import pytest
 from scripts.db import get_connection
 from scripts.migrate import MIGRATIONS_DIR, apply_migrations
 from scripts.project import (
+    _detect_base_branch,
     create_project,
     delete_project,
     get_project,
@@ -209,3 +210,27 @@ def test_cli_list_against_empty_db_returns_empty_array(tmp_path):
     )
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout) == []
+
+
+# ── _detect_base_branch ────────────────────────────────────────────────────
+
+
+def test_detect_base_branch_reads_from_remote_symref(tmp_path, bare_remote_trunk):
+    """Happy path: a remote whose HEAD points to 'trunk' is detected correctly."""
+    # bare_remote_trunk fixture (conftest.py) creates a bare repo with branch 'trunk'
+    # seeded with one commit so HEAD resolves.
+    result = _detect_base_branch(str(bare_remote_trunk))
+    assert result == "trunk"
+
+
+def test_detect_base_branch_falls_back_to_main_on_invalid_url(tmp_path):
+    """Fallback: a bad/nonexistent path returns 'main' without raising."""
+    result = _detect_base_branch("/nonexistent/path.git")
+    assert result == "main"
+
+
+def test_detect_base_branch_handles_main_default(tmp_path, bare_remote, source_repo):
+    """Normal case: a remote whose HEAD points to 'main' is detected as 'main'."""
+    # bare_remote is a bare repo with branch 'main'; source_repo has pushed commits to it.
+    result = _detect_base_branch(str(bare_remote))
+    assert result == "main"

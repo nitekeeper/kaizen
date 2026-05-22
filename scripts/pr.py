@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from scripts.db import get_connection
@@ -98,15 +98,16 @@ _DETAIL_TRUNCATE = 200
 def _fmt_ts(ts: str | None) -> str:
     """Format an ISO timestamp string as 'YYYY-MM-DD HH:MM UTC'.
 
-    Tolerates None and non-ISO inputs (returns "—" / the raw value).
+    Normalises to UTC before formatting. Tolerates None and non-ISO inputs
+    (returns "—" / the raw value).
     """
     if not ts:
         return "—"
     try:
-        # fromisoformat handles "+00:00" suffix natively (3.11+).
         dt = datetime.fromisoformat(ts)
     except ValueError:
         return ts
+    dt = dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
     return dt.strftime("%Y-%m-%d %H:%M UTC")
 
 

@@ -103,12 +103,14 @@ class TestDetectDestructive:
         assert any(i["type"] == "removed_public_function" for i in issues)
 
     def test_removed_private_function_not_flagged(self, tmp_path):
-        diff = "-def _internal_helper():\n-    pass\n"
+        diff = _make_modify_diff("scripts/helpers.py", ["def _internal_helper():", "    pass"])
         issues = detect_destructive(diff, tmp_path)
         assert not any(i["type"] == "removed_public_function" for i in issues)
 
     def test_removed_class_method_not_flagged(self, tmp_path):
-        diff = "-    def get_phase(self):\n-        pass\n"
+        diff = _make_modify_diff(
+            "scripts/workflow.py", ["    def get_phase(self):", "        pass"]
+        )
         issues = detect_destructive(diff, tmp_path)
         assert not any(i["type"] == "removed_public_function" for i in issues)
 
@@ -171,7 +173,7 @@ def _make_modify_diff(
     )
 
 
-# ── _check_removed_public_functions: .py extension gate (M4, task 16) ─────
+# ── _check_removed_public_functions: .py extension gate ─────────────────────
 
 
 class TestCheckRemovedPublicFunctionsPyExtensionGate:

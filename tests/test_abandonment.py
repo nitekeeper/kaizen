@@ -128,7 +128,7 @@ def test_record_abandonment_inserts_row(db, run_and_cycle):
 
 
 def test_process_abandonment_full_flow(db, run_and_cycle):
-    row = process_abandonment(
+    row, markdown = process_abandonment(
         db_path=db,
         project=run_and_cycle["project"],
         run_id=run_and_cycle["run"]["id"],
@@ -145,3 +145,22 @@ def test_process_abandonment_full_flow(db, run_and_cycle):
     assert row["report_memex_slug"] == expected_slug
     assert row["reason"] == "no_consensus"
     assert row["cycle_id"] == run_and_cycle["cycle"]["id"]
+    assert "Cycle 1 abandoned" in markdown
+
+
+def test_process_abandonment_returns_rendered_markdown(db, run_and_cycle):
+    row, markdown = process_abandonment(
+        db_path=db,
+        project=run_and_cycle["project"],
+        run_id=run_and_cycle["run"]["id"],
+        cycle_id=run_and_cycle["cycle"]["id"],
+        cycle_n=1,
+        subject="x",
+        participants=["pm"],
+        phase_reached="meeting",
+        reason="no_consensus",
+        detail="d",
+        artifacts=[],
+    )
+    assert row["report_memex_slug"].startswith("kaizen:abandonment:")
+    assert "type: abandonment-report" in markdown

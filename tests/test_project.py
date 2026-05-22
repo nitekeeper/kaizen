@@ -6,6 +6,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -71,7 +72,7 @@ def test_lists_are_returned_as_python_lists_not_json_strings(db):
 
 def test_lists_stored_as_json_strings_in_db(db):
     _make(db)
-    with get_connection(db) as conn:
+    with closing(get_connection(db)) as conn:
         row = conn.execute("SELECT read_paths, expert_roster FROM projects LIMIT 1").fetchone()
     # Raw DB values are JSON-encoded strings.
     assert isinstance(row[0], str)

@@ -263,7 +263,7 @@ def orchestrate_run(
                     subject=outcome.get("subject", subject),
                     started_at=cycle_started,
                 )
-                ab_row = process_abandonment(
+                ab_row, _ab_markdown = process_abandonment(
                     db_path=db_path,
                     project=project,
                     run_id=run_row["id"],

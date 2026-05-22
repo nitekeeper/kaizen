@@ -135,6 +135,34 @@ class TestCommitCycle:
         )
         assert "new_file.txt" in result.stdout
 
+    def test_commit_cycle_excludes_ai_dir(self, tmp_path, bare_remote, source_repo):
+        dest = tmp_path / "clone"
+        clone_repo(str(bare_remote), dest, "main")
+        create_branch(dest, "test-exclusion")
+        (dest / "CHANGES.txt").write_text("a real change")
+        (dest / ".ai").mkdir(exist_ok=True)
+        (dest / ".ai" / "session_debug.log").write_text("debug noise")
+        commit_cycle(
+            clone_dir=dest,
+            cycle_n=1,
+            decisions=["real change"],
+            participants=["Dr. Test"],
+            n_tests=1,
+            subject="test exclusion",
+            minutes_rel_path="docs/kaizen/minutes.md",
+        )
+        result = subprocess.run(
+            ["git", "show", "--name-only", "--pretty=format:"],
+            cwd=dest,
+            capture_output=True,
+            text=True,
+        )
+        staged_files = result.stdout.strip().splitlines()
+        assert "CHANGES.txt" in staged_files
+        assert not any(f.startswith(".ai/") for f in staged_files), (
+            f".ai/ files must not be staged: {staged_files}"
+        )
+
 
 # ── push_branch ────────────────────────────────────────────────────────────
 

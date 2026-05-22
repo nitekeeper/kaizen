@@ -40,6 +40,8 @@ python3 scripts/setup.py
 
 This verifies `git`, `gh` (authenticated), `memex`, atelier on disk, and Python ≥ 3.11. If any check fails, the script prints actionable instructions and exits non-zero. **Abort** — do not proceed. Surface the script's output to the user verbatim and stop.
 
+**Verify `memex:run` is available:** Read `~/.claude/settings.json` and confirm `enabledPlugins["memex@agora"]` is truthy. If it is absent or falsy, surface the error: "memex@agora plugin not enabled. Enable it via Agora (`/agora:install memex`) before running kaizen:improve." and **abort**.
+
 If `scripts/setup.py` has not previously run on this machine, it will also apply Kaizen's DB migrations. That is expected; the run is safe to proceed if all dependency checks pass.
 
 ### Step 2 — Parse arguments

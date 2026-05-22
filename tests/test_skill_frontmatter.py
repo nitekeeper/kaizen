@@ -119,3 +119,16 @@ def test_expert_roster_sql_uses_correct_column_alias():
         "SQL uses r.role_name which does not exist; should be r.name AS role_name"
     )
     assert "r.name AS role_name" in content
+
+
+def test_abandonment_skill_no_capture_to_memex_reference():
+    skill_path = (
+        Path(__file__).resolve().parents[1] / "internal" / "abandonment-report" / "SKILL.md"
+    )
+    content = skill_path.read_text()
+    assert "capture_to_memex" not in content, (
+        "abandonment-report SKILL.md must not reference the non-existent capture_to_memex function"
+    )
+    assert "push_failed" not in content, (
+        "push_failed is a run-level event and must not appear in abandonment SKILL.md reasons"
+    )

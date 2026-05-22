@@ -124,16 +124,13 @@ def process_abandonment(
     reason: str,
     detail: str,
     artifacts: list[str],
-) -> dict:
-    """Format report → capture to memex → record abandonment row.
+) -> tuple[dict, str]:
+    """Format report → record abandonment row → return (row, rendered markdown).
 
-    Returns the inserted abandonments row.
+    Returns a 2-tuple of (abandonments row dict, rendered markdown string).
+    The markdown is returned so callers can capture it to Memex via memex:run.
     """
-    # NOTE: The markdown body itself is rendered by the agent layer via
-    # memex:run (see module docstring) — this call here is currently unused.
-    # Kept to surface formatting errors early; the result is intentionally
-    # discarded.
-    _markdown = format_report(
+    markdown = format_report(
         project_name=project["name"],
         git_url=project["git_url"],
         run_id=run_id,
@@ -146,7 +143,7 @@ def process_abandonment(
         artifacts=artifacts,
     )
     slug = _slug_for(run_id, cycle_n)
-    return record_abandonment(
+    row = record_abandonment(
         db_path=db_path,
         cycle_id=cycle_id,
         phase_reached=phase_reached,
@@ -154,3 +151,4 @@ def process_abandonment(
         detail=detail,
         report_memex_slug=slug,
     )
+    return row, markdown

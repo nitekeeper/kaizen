@@ -238,12 +238,7 @@ def orchestrate_run(
     cycles_abandoned = 0
     abandonment_rows: list[dict] = []
 
-    # H3: any unhandled exception inside the loop body (cycle_executor crash,
-    # record_cycle_* error, process_abandonment error, etc.) would otherwise
-    # leave the runs row stuck at status='running' forever. Finalize as
-    # 'failed' with the partial counts captured so far, then re-raise to
-    # preserve the original traceback. KeyboardInterrupt / SystemExit pass
-    # through untouched.
+    # H3: finalize the run as failed so the row never sticks at status='running'.
     try:
         for cycle_n in range(1, cycles_requested + 1):
             cycle_started = _now()

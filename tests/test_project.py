@@ -164,6 +164,29 @@ def test_create_duplicate_git_url_raises_integrity_error(db):
         _make(db, git_url="https://github.com/dupe/dupe.git", name="two")
 
 
+# ── update_project column-name validation (M6) ────────────────────────────
+
+
+def test_update_project_rejects_invalid_column_name_when_allowlist_bypassed(db, monkeypatch):
+    """Regex guard raises ValueError even when _UPDATABLE is extended with a bad key."""
+    from scripts import project
+
+    created = _make(db)
+    evil_key = "name; DROP TABLE projects--"
+    monkeypatch.setattr(project, "_UPDATABLE", project._UPDATABLE | {evil_key})
+    with pytest.raises(ValueError, match="Invalid column name"):
+        update_project(db, created["id"], **{evil_key: "evil"})
+
+
+def test_update_project_silently_drops_unknown_keys(db):
+    """Keys not in _UPDATABLE are silently ignored; project is returned unchanged."""
+    created = _make(db)
+    result = update_project(db, created["id"], not_a_real_column="x")
+    assert result["id"] == created["id"]
+    assert result["name"] == created["name"]
+    assert result["git_url"] == created["git_url"]
+
+
 # ── CLI smoke test ─────────────────────────────────────────────────────────
 
 

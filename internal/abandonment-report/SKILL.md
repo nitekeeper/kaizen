@@ -50,7 +50,7 @@ row, markdown = process_abandonment(
     artifacts=<list of slugs/paths>,
 )
 print(json.dumps(row, default=str))
-" 
+"
 ```
 
 After the call, write the markdown and capture it:

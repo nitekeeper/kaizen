@@ -64,9 +64,9 @@ def merge_back(worktree_dir: Path) -> None:
     the worktree branch into the base branch in the main workspace, and
     delete the worktree and its branch.
 
-    Aborts with clear instructions on merge conflict, dirty main workspace,
-    or detached HEAD. Unlike auto_merge_to_main, this does NOT stash — the
-    developer is present and should handle their own workspace state.
+    Raises RuntimeError with clear instructions on merge conflict, dirty main
+    workspace, or detached HEAD. Unlike auto_merge_to_main, this does NOT
+    stash — the developer is present and should handle their own workspace state.
     """
     # ── Detect ───────────────────────────────────────────────────────────────
     is_worktree, _ = detect_worktree(worktree_dir)
@@ -76,12 +76,11 @@ def merge_back(worktree_dir: Path) -> None:
 
     wt_branch = get_current_branch(worktree_dir)
     if not wt_branch:
-        print(
+        raise RuntimeError(
             "ERROR: Worktree is in detached HEAD state. "
             "Re-attach to a branch before saving:\n"
             "  git checkout -b <branch-name>"
         )
-        sys.exit(1)
 
     main_path_str, base_branch = parse_main_worktree(worktree_dir)
     main_path = Path(main_path_str)
@@ -98,25 +97,23 @@ def merge_back(worktree_dir: Path) -> None:
     # ── Pre-flight: main workspace must be clean and on the base branch ──────
     main_current = get_current_branch(main_path)
     if main_current != base_branch:
-        print(
+        raise RuntimeError(
             f"ERROR: Main workspace is on '{main_current}', not '{base_branch}'.\n"
             f"Check out '{base_branch}' in the main workspace before running save:\n"
             f"  cd {main_path}\n"
             f"  git checkout {base_branch}"
         )
-        sys.exit(1)
 
     main_status = _git(["status", "--porcelain"], main_path)
     dirty_lines, untracked_claude, untracked_other = classify_status(main_status.stdout)
 
     if dirty_lines or untracked_other:
-        print(
+        raise RuntimeError(
             f"ERROR: Main workspace has uncommitted changes.\n"
             f"Commit or stash them first:\n"
             f"  cd {main_path}\n"
             f"  git stash"
         )
-        sys.exit(1)
 
     if untracked_claude:
         print(
@@ -132,7 +129,7 @@ def merge_back(worktree_dir: Path) -> None:
     )
     if merge_result.returncode != 0:
         _git(["merge", "--abort"], main_path, check=False)
-        print(
+        raise RuntimeError(
             f"CONFLICT: Merge of '{wt_branch}' into '{base_branch}' produced conflicts.\n"
             f"The merge has been aborted. Your worktree and branch are intact.\n\n"
             f"To resolve manually:\n"
@@ -143,7 +140,6 @@ def merge_back(worktree_dir: Path) -> None:
             f"  git worktree remove {worktree_dir}\n"
             f"  git branch -d {wt_branch}"
         )
-        sys.exit(1)
 
     print(f"Merged '{wt_branch}' into '{base_branch}'.")
 
@@ -185,7 +181,11 @@ def merge_back(worktree_dir: Path) -> None:
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else ""
     if cmd == "merge-back":
-        merge_back(Path.cwd())
+        try:
+            merge_back(Path.cwd())
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
     else:
         print("Commands: merge-back", file=sys.stderr)
         sys.exit(1)

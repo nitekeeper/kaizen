@@ -21,8 +21,7 @@ def get_diff(clone_dir: Path) -> str:
         check=False,
     )
     if result.returncode != 0:
-        print(f"Error: git diff failed in {clone_dir}: {result.stderr.strip()}", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError(f"Error: git diff failed in {clone_dir}: {result.stderr.strip()}")
     return result.stdout
 
 
@@ -167,7 +166,11 @@ if __name__ == "__main__":
         print("Usage: python3 scripts/destructive_check.py <clone_dir>")
         sys.exit(1)
     clone_dir = Path(sys.argv[1])
-    diff = get_diff(clone_dir)
+    try:
+        diff = get_diff(clone_dir)
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        sys.exit(1)
     issues = detect_destructive(diff, clone_dir)
     print(json.dumps(issues, indent=2))
     if issues:

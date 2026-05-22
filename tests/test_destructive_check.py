@@ -1,11 +1,18 @@
 """Tests for scripts/destructive_check.py (vendored verbatim from atelier)."""
 
+import subprocess
+import sys
 import textwrap
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 from scripts.destructive_check import (
     _deleted_file_paths,
     _is_imported_by_any_file,
     detect_destructive,
+    get_diff,
 )
 
 
@@ -141,3 +148,55 @@ class TestDetectDestructive:
             assert "type" in issue
             assert "description" in issue
             assert "file" in issue
+
+
+# ── get_diff library error path ────────────────────────────────────────────
+
+
+class TestGetDiff:
+    def test_raises_runtime_error_when_git_diff_fails(self, tmp_path):
+        """get_diff() must raise RuntimeError (not sys.exit) when git diff fails."""
+        failed = subprocess.CompletedProcess(
+            args=["git", "diff", "HEAD"],
+            returncode=1,
+            stdout="",
+            stderr="fatal: not a git repository",
+        )
+        with (
+            patch("scripts.destructive_check.subprocess.run", return_value=failed),
+            pytest.raises(RuntimeError, match="git diff failed"),
+        ):
+            get_diff(tmp_path)
+
+    def test_runtime_error_includes_stderr(self, tmp_path):
+        """The RuntimeError message must embed the captured stderr text."""
+        failed = subprocess.CompletedProcess(
+            args=["git", "diff", "HEAD"],
+            returncode=1,
+            stdout="",
+            stderr="fatal: not a git repository",
+        )
+        with (
+            patch("scripts.destructive_check.subprocess.run", return_value=failed),
+            pytest.raises(RuntimeError, match="fatal: not a git repository"),
+        ):
+            get_diff(tmp_path)
+
+
+# ── CLI translation for destructive_check ─────────────────────────────────
+
+
+class TestDestructiveCheckCLI:
+    def test_cli_exits_1_and_writes_stderr_on_bad_path(self, tmp_path):
+        """CLI guard must catch RuntimeError and exit 1 with a stderr message."""
+        # Pass a path that is not a git repo so git diff fails
+        non_git = tmp_path / "not_a_repo"
+        non_git.mkdir()
+        result = subprocess.run(
+            [sys.executable, "scripts/destructive_check.py", str(non_git)],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).parent.parent),
+        )
+        assert result.returncode == 1
+        assert result.stderr.strip() != ""

@@ -33,6 +33,9 @@ _UPDATABLE = {
 # Fields that are stored as JSON-encoded TEXT but exposed as Python lists.
 _JSON_LIST_FIELDS = ("read_paths", "expert_roster")
 
+# Defense-in-depth: valid SQL identifier guard in case _UPDATABLE ever drifts.
+_COLUMN_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
@@ -138,8 +141,12 @@ def update_project(db_path: str, project_id: int, **fields) -> dict:
     for field in _JSON_LIST_FIELDS:
         if field in updates and not isinstance(updates[field], str):
             updates[field] = json.dumps(updates[field])
-    # nosec B608 — `set_clause` column names are filtered through the
-    # _UPDATABLE whitelist (line above); values flow through `?` binding.
+    # Defense-in-depth: catch future _UPDATABLE drift before it reaches the f-string.
+    for k in updates:
+        if not _COLUMN_NAME_RE.fullmatch(k):
+            raise ValueError(f"Invalid column name {k!r}: only [a-zA-Z_][a-zA-Z0-9_]* allowed")
+    # nosec B608 — column names pass _UPDATABLE allowlist (above) AND the
+    # _COLUMN_NAME_RE regex (two-layer defense); values flow through `?` binding.
     set_clause = ", ".join(f"{k} = ?" for k in updates)
     conn = get_connection(db_path)
     try:

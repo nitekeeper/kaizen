@@ -1,5 +1,5 @@
-import stat
 import sqlite3
+import stat
 from pathlib import Path
 
 from scripts.db import get_connection

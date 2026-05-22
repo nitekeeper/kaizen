@@ -6,20 +6,20 @@ from pathlib import Path
 
 import pytest
 
-ATELIER_CACHE = Path("~/.claude/plugins/cache/agora/atelier").expanduser()
-
-pytestmark = pytest.mark.skipif(
-    not ATELIER_CACHE.exists(),
-    reason="requires local Agora atelier cache",
-)
-
-from scripts.seed_atelier_in_clone import (  # noqa: E402
+from scripts.seed_atelier_in_clone import (
+    _AGORA_ATELIER,
     _atelier_env,
     ensure_wiki_dir,
     find_atelier_root,
     seed_all,
     seed_atelier_roles,
     seed_atelier_schema,
+)
+
+_ATELIER_PRESENT = _AGORA_ATELIER.is_dir()
+_SKIP_NO_ATELIER = pytest.mark.skipif(
+    not _ATELIER_PRESENT,
+    reason="Atelier plugin cache not present at ~/.claude/plugins/cache/agora/atelier/",
 )
 
 
@@ -34,6 +34,7 @@ def _init_clone(tmp_path: Path) -> Path:
     return clone
 
 
+@_SKIP_NO_ATELIER
 class TestFindAtelierRoot:
     def test_returns_a_path_with_atelier_markers(self):
         root = find_atelier_root()
@@ -103,6 +104,7 @@ class TestCopyRolesFromAtelier:
             _copy_roles_agents_from_atelier(clone_dir)
 
 
+@_SKIP_NO_ATELIER
 class TestSeedSchemaAndRoles:
     def test_schema_creates_atelier_tables(self, tmp_path):
         clone = _init_clone(tmp_path)

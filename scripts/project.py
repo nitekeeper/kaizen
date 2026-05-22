@@ -224,20 +224,22 @@ def _detect_base_branch(git_url: str) -> str:
     Used at project registration time to seed `projects.base_branch` from the
     actual repo, rather than assuming 'main'.
     """
-    result = subprocess.run(  # nosec B603 B607
-        ["git", "ls-remote", "--symref", git_url, "HEAD"],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        check=False,
-    )
+    try:
+        result = subprocess.run(  # nosec B603 B607
+            ["git", "ls-remote", "--symref", git_url, "HEAD"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            check=False,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        return "main"
     if result.returncode != 0:
         return "main"
-    # Expected output line: "ref: refs/heads/<branch>\tHEAD"
     for line in result.stdout.splitlines():
         if line.startswith("ref: refs/heads/"):
             ref = line[len("ref: refs/heads/") :]
-            # ref may be followed by "\tHEAD"; strip everything after first whitespace
             return ref.split()[0] if ref.split() else "main"
     return "main"
 

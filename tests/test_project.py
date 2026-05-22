@@ -234,3 +234,14 @@ def test_detect_base_branch_handles_main_default(tmp_path, bare_remote, source_r
     # bare_remote is a bare repo with branch 'main'; source_repo has pushed commits to it.
     result = _detect_base_branch(str(bare_remote))
     assert result == "main"
+
+
+def test_detect_base_branch_falls_back_on_timeout(monkeypatch):
+    """Timeout fallback: a stalled subprocess.run raises TimeoutExpired → returns 'main'."""
+    from scripts import project as project_mod
+
+    def _raise_timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0] if args else [], timeout=15)
+
+    monkeypatch.setattr(project_mod.subprocess, "run", _raise_timeout)
+    assert project_mod._detect_base_branch("https://example.com/repo.git") == "main"

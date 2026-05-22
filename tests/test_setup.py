@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import subprocess
+from pathlib import Path
 
 from scripts import setup as setup_mod
 from scripts.setup import (
@@ -28,7 +29,6 @@ def _fail_result(stdout: str = "", stderr: str = "", code: int = 1) -> subproces
 
 def _all_present(monkeypatch, tmp_path=None) -> None:
     """Patch the world so every dep check passes."""
-    import pathlib
 
     def fake_which(name: str):
         return f"/usr/bin/{name}" if name in {"git", "gh"} else None
@@ -46,7 +46,7 @@ def _all_present(monkeypatch, tmp_path=None) -> None:
 
     # Patch find_atelier_root to return a deterministic path without touching
     # the real plugin cache.
-    fake_atelier_root = pathlib.Path("/fake/atelier/v1.0.0")
+    fake_atelier_root = Path("/fake/atelier/v1.0.0")
     monkeypatch.setattr(setup_mod, "find_atelier_root", lambda: fake_atelier_root)
 
 
@@ -196,6 +196,7 @@ class TestRunSetup:
 
         monkeypatch.setattr(setup_mod.shutil, "which", fake_which)
         monkeypatch.setattr(setup_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(setup_mod, "find_atelier_root", lambda: Path("/fake/atelier"))
 
         db_path = tmp_path / ".ai" / "memex.db"
         monkeypatch.setattr(setup_mod, "DB_PATH", db_path)
@@ -228,7 +229,7 @@ class TestCheckAtelier:
         c = check_atelier()
         assert c.ok is False
         assert "atelier" in c.detail.lower() or "cache" in c.detail.lower()
-        assert "plugin install atelier" in c.fix.lower()
+        assert "agora install atelier" in c.fix.lower()
 
     def test_not_found_generic_exception(self, monkeypatch):
         """Sad path: find_atelier_root raises unexpected exception → treated as not-found."""
@@ -240,7 +241,7 @@ class TestCheckAtelier:
         c = check_atelier()
         assert c.ok is False
         assert "permission denied" in c.detail.lower()
-        assert "plugin install atelier" in c.fix.lower()
+        assert "agora install atelier" in c.fix.lower()
 
 
 class TestVerifyAll:

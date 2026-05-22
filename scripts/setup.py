@@ -83,11 +83,9 @@ def check_python_version() -> DepCheck:
 
 def check_atelier() -> DepCheck:
     name = "atelier"
-    fix = "Install atelier via Agora (`/plugin install atelier`)"
+    fix = "Install Atelier via Agora: run `agora install atelier` in Claude Code"
     try:
         root = find_atelier_root()
-    except RuntimeError as exc:
-        return DepCheck(name, False, str(exc), fix)
     except Exception as exc:
         return DepCheck(name, False, str(exc), fix)
     return DepCheck(name, True, str(root), fix)

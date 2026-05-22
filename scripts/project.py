@@ -33,10 +33,7 @@ _UPDATABLE = {
 # Fields that are stored as JSON-encoded TEXT but exposed as Python lists.
 _JSON_LIST_FIELDS = ("read_paths", "expert_roster")
 
-# Defense-in-depth: valid SQL identifier pattern.  Checked AFTER the
-# _UPDATABLE filter so unknown keys are still silently dropped; this guard
-# ensures that if _UPDATABLE ever drifts, no malformed identifier reaches
-# the f-string.
+# Defense-in-depth: valid SQL identifier guard in case _UPDATABLE ever drifts.
 _COLUMN_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 
@@ -144,9 +141,7 @@ def update_project(db_path: str, project_id: int, **fields) -> dict:
     for field in _JSON_LIST_FIELDS:
         if field in updates and not isinstance(updates[field], str):
             updates[field] = json.dumps(updates[field])
-    # Defense-in-depth: paranoid regex check after the _UPDATABLE filter.
-    # The allowlist already neutralises external injection; this guard ensures
-    # the protection survives any future refactor of _UPDATABLE.
+    # Defense-in-depth: catch future _UPDATABLE drift before it reaches the f-string.
     for k in updates:
         if not _COLUMN_NAME_RE.fullmatch(k):
             raise ValueError(f"Invalid column name {k!r}: only [a-zA-Z_][a-zA-Z0-9_]* allowed")

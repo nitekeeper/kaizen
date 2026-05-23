@@ -315,9 +315,6 @@ def test_render_pr_body_counts_from_cycles_when_run_counters_still_zero(db, proj
     (internal/run/SKILL.md), open-PR runs BEFORE finalize_run, so the run row's
     counters are still 0 when render_pr_body is called.
     """
-    from scripts.cycle import record_cycle_abandoned, record_cycle_success
-    from scripts.run import create_run
-
     run = create_run(
         db, project_id=project["id"], branch="kaizen/test", cycles_requested=3, subject=None
     )

@@ -1,43 +1,55 @@
-# Cycle 2 Minutes — Run 15
+# Cycle 2 Minutes — Run 16
 
 - **Date:** 2026-05-23
-- **Subject:** Phase 5b' fix-loop iteration counter helper (PR#22 deferred — converts prose contract into mechanical code)
-- **Participants:** Akira Sato (backend-engineer-1, implementer), Sara Lindqvist (prompt-engineer-1, independent reviewer)
+- **Subject:** Production TeamTools wrapper + 10 SendMessage dispatch templates (extracted from team_executor inline briefs)
+- **Participants:** Akira Sato (backend-engineer-1), Sara Lindqvist (prompt-engineer-1, independent reviewer)
 - **Status:** success
-- **Fix-loop iterations:** 2 (initial impl passed state machine but had 5 majors — silent severity typo, dead code in SKILL, undefined variable, undocumented collision, asserts strippable under `-O`)
+- **Fix-loop iterations:** 2 (initial extraction had wire-drift on phase_5b_ci_failure + _require accepted empty containers; iter 2 fixed both)
 
 ## Context
 
-PR#22 added the 4 structured columns (`review_iteration_count`, `unresolved_findings`, `convergence_summary`, `reviewer_attribution`) but no Python helper drove the fix loop or constructed the abandonment outcome. The Phase 5b' invariants (max 5 iterations, exit conditions, abandonment shape) lived only in `internal/cycle/SKILL.md:243-272` prose.
+Cycle 1 shipped the real Phase 1-5c orchestration with 8+ inline `_phase_*_brief` functions. This cycle extracts them into a formal dispatch-templates module + ships the production wrapper the orchestrating agent uses to wire real CC tool calls.
 
 ## Decisions
 
-1. **`scripts/fix_loop.py`** is the single source of truth for Phase 5b' fix-loop control flow. Pure-function module with `FixLoopState` dataclass, `Finding` frozen dataclass, `FixLoopExhausted` exception. No I/O, no DB.
-2. **Strict severity validation.** `Finding.__post_init__` rejects any severity not in `{blocker, major, minor, nit}` — a typo like `"blocer"` would have silently been treated as non-blocking and hidden real blockers.
-3. **Schema-invariant checks use `RuntimeError`, not `assert`.** `build_abandonment_outcome` verifies its output is accepted by cycle 1's allowlist guard (`scripts/run.py`'s `VALID_PHASES`/`VALID_REASONS`) — these checks must hold under `python3 -O`.
-4. **SKILL.md wiring is mechanical.** Phase 5b' fix-loop prose now shows the exact helper invocation; iteration cap, convergence gate, and abandonment outcome construction all come from the helper.
-5. **Documented collision policy** — `reviewer_attribution` is last-write-wins on duplicate `finding_id` per Python dict semantics; callers should dedupe upstream.
+1. **`scripts/dispatch_templates.py`** — 10 named templates, keyword-only, validated via `_require` (rejects missing, wrong-type, AND empty containers; numeric exempt). Each template is a pure function with explicit kwarg validation; failure is LOUD and LOCAL.
+2. **`scripts/team_tools_wrapper.py`** — `AgentTeamsWrapper` base class with default methods that `raise NotImplementedInThisRuntime` (the orchestrating agent subclasses to wrap real CC tool calls); `RecordingWrapper` for harness tests. Both satisfy the `TeamTools` Protocol.
+3. **Wire protocol BYTE-IDENTITY preserved** — 9 of 10 templates emit text byte-identical to cycle 1's inline `_phase_*_brief`. The 10th (`phase_5b_ci_failure`) was new (extracted from inlined detail string); reviewer iteration caught initial drift and restored byte-identity to cycle 1's `f"CI failed after wave {wave_n}: {failed_checks}"`. Literal-pin test locks it.
+4. **`internal/cycle/SKILL.md`** — `mode='team'` branch now references both `AgentTeamsWrapper` (the subclass contract) and `scripts.dispatch_templates` (the message contract). Tests use `RecordingWrapper`.
 
 ## Implementation
 
-- **New:** `scripts/fix_loop.py` (+185 LOC), `tests/test_fix_loop.py` (+167 LOC, 12 tests)
-- **Modified:** `internal/cycle/SKILL.md` Phase 5b' fix-loop section (+~30 LOC: helper invocation block + `pm_ruling_here` explanation)
+- **New:** `scripts/dispatch_templates.py` (10 templates + `_require` validator)
+- **New:** `scripts/team_tools_wrapper.py` (`NotImplementedInThisRuntime`, `AgentTeamsWrapper`, `RecordingWrapper`)
+- **Modified:** `scripts/team_executor.py` (deleted 8 inline brief functions + inlined CI-failure detail string; replaced with 10 template imports + call-site swaps)
+- **Modified:** `internal/cycle/SKILL.md` (callout for wrapper + dispatch_templates)
+- **New tests:** `tests/test_dispatch_templates.py` (15 tests including literal-pin for CI failure + empty-container rejection across all required-container slots), `tests/test_team_tools_wrapper.py` (6 tests)
 
 ## Fix-loop iteration history
 
-**Iteration 1:** 11 tests, state machine clean, all probes pass.
+**Iteration 1:** 14 dispatch_templates tests + 6 wrapper tests + 8 inline functions deleted + executor wired to new templates. Test count 339 → 359.
 
-**Independent review (Sara Lindqvist):** state machine clean — no blockers. 5 majors:
-- Severity validation missing (silent typo class-of-bug)
-- SKILL.md example contained dead `if state.history[-1] ... break ... break` with inverted comment
-- `pm_ruling_here` referenced but undefined in surrounding prose
-- `reviewer_attribution` collision policy undocumented
-- Module-level `assert` would be stripped under `python3 -O`
+**Independent review (Sara Lindqvist, prompt-engineer):** verified all 7 cycle-1 invariants intact + all 4 cycle-1 majors preserved + all 42 cycle-1 tests still pass + 9/10 templates byte-identical. Found 2 BLOCKERS:
+- B1: `phase_5b_ci_failure` text drifted (added `failed checks=` prefix and `Details: {results}` suffix). Test only checked substrings, would have shipped silently.
+- B2: `_require` accepted empty containers (`_require("agenda_items", [], list)` PASSED). Silent semantic failure — agent would receive a Phase-2 brief asking it to address no items.
 
-**Iteration 2:** all 5 majors fixed. +1 test for severity validation. Test count 293 → 294.
+Plus 2 majors folded into the blocker fixes (literal-pin test for CI failure + `={value!r}` in wrong-type message).
 
-**Re-review:** every major VERIFIED with file:line proof. `__post_init__` confirmed to fire on frozen-dataclass construction (probed live). Verdict: **READY TO COMMIT**.
+**Iteration 2:** all fixed. Wire text reverted to byte-identical cycle-1 string. `_require` now rejects empty list/dict/str; numeric types (`iter_n=0`) deliberately exempt. 5 new empty-rejection tests + 1 literal-pin replacement. Test count 359 → 365.
+
+**Re-review:** every blocker + major VERIFIED. Cycle-1 invariants + Major fixes RE-AFFIRMED intact. Verdict: **READY TO COMMIT**.
 
 ## What this unlocks
 
-The Phase 5b' fix loop is now mechanical. When `start_iteration` raises `FixLoopExhausted` after 5 rounds, `build_abandonment_outcome` constructs the exact `review_unrecoverable` dict that cycle 1's `scripts/run.py` allowlist guard accepts — closing the loop from PR#22 (which added the columns) through cycle 1 (which added the orchestrator guard) to this cycle (which adds the producer). All three layers share `scripts/abandonment.VALID_PHASES`/`VALID_REASONS` as the canonical enum source.
+Team-mode is now END-TO-END usable:
+- Substrate (cycle 4 of PR#23): lifecycle skeleton with team_delete-in-finally, runtime Protocol preflight, exact outcome shapes
+- Real orchestration (cycle 1 of this run): 6-phase flow using dag.py + fix_loop.py + reviewers.py + ci_runner.py
+- Dispatch templates + production wrapper (this cycle): the orchestrating agent subclasses `AgentTeamsWrapper`, overrides 3 methods to call real CC tools, and the executor handles everything else
+
+A `kaizen:improve --mode team` invocation can now run a real cycle against a real target. The orchestrating agent's only remaining job is to write the production `AgentTeamsWrapper` subclass — a small Python class wrapping `TeamCreate` / `SendMessage` / `TeamDelete` from its own tool context.
+
+## Residual minor (deferred — not blocking)
+
+- `phase_5b_ci_failure`'s `results` kwarg is validated but excluded from the returned string (kept as optional logging input). If no caller needs it, could be removed in a future cleanup cycle.
+- `_require` doesn't validate empty containers for `tuple` or `set` (only `list`/`dict`/`str`). Reasonable for the current template signatures; revisit if a template ever takes one.
+- The wire protocol byte-identity invariant is implicit in tests; a single "all templates byte-identical to cycle-1" CI guard test would be belt-and-braces.

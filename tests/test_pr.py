@@ -414,24 +414,20 @@ def test_render_pr_body_counts_from_cycles_when_run_counters_still_zero(db, proj
     assert "| Abandoned | 1 |" in body
 
 
-def test_render_pr_body_special_cases_skeleton_commit_sha(db, project):
-    """A cycle with commit_sha='(skeleton)' (team-mode skeleton cycle from
-    scripts.team_executor) must render a human-readable note, NOT slice
-    the sentinel to '(skelet' as if it were a real 13-char sha.
+def test_render_pr_body_handles_missing_commit_sha(db, project):
+    """A success cycle with an empty/None commit_sha must render the dash
+    placeholder instead of crashing on a slice. This covers degenerate DB
+    rows from older cycles or migrations that left commit_sha NULL.
     """
-    run = _make_run(db, project, subject="team-mode skeleton", cycles_requested=1)
-    _add_success_cycle(db, run["id"], 1, "skeleton cycle", "(skeleton)")
+    run = _make_run(db, project, subject="missing sha", cycles_requested=1)
+    _add_success_cycle(db, run["id"], 1, "no-sha cycle", "")
     finalize_run(db, run["id"], cycles_succeeded=1, cycles_abandoned=0)
 
     loaded_run, loaded_project, cycles, abandonments = load_run_context(db, run["id"])
     _title, body = render_pr_body(loaded_run, loaded_project, cycles, abandonments)
 
-    # Must NOT slice "(skeleton)" → "(skelet".
-    assert "(skelet`" not in body
-    assert "`(skelet`" not in body
-    # Must render a friendly explanation instead.
-    assert "(skeleton" in body
-    assert "no real commit" in body
+    # An empty sha renders as the dash placeholder, NOT as an empty backtick pair.
+    assert "- Commit: `—`" in body
 
 
 # ── open_pr (subprocess mocked) ────────────────────────────────────────────

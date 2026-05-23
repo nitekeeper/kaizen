@@ -1,42 +1,53 @@
-# Cycle 1 Minutes — Run 15
+# Cycle 1 Minutes — Run 16
 
 - **Date:** 2026-05-23
-- **Subject:** Close the "unknown" sentinel cluster — 3 deferred items from PR#22 review
-- **Participants:** Akira Sato (backend-engineer-1, implementer), Vivienne Holt (sdet-1, independent reviewer; latent-bug archaeology)
+- **Subject:** Real Phase 1-5c orchestration in scripts/team_executor.py (PR#23-deferred — flip the lifecycle skeleton into real integration)
+- **Participants:** Akira Sato (backend-engineer-1), Marcus Holbrook (agent-systems-architect-1, independent reviewer)
 - **Status:** success
-- **Fix-loop iterations:** 2 (initial implementation caught only `is None`; review iteration tightened to allowlist)
+- **Fix-loop iterations:** 2 (initial passed all 7 critical invariants but a category-error in fix-routing slipped through; iter 2 fixed it + 3 contract gaps)
 
 ## Context
 
-PR#22's review (Diane Park) flagged 3 pre-existing latent bugs sharing one root cause: the literal string `"unknown"` was used as a `phase_reached` sentinel but the CHECK constraint in `migrations/004` rejects it. No production run had hit the bug yet, but a single malformed cycle outcome would have raised `sqlite3.IntegrityError` at `INSERT INTO abandonments` time, crashing the run AFTER its work was done.
+PR#23's cycle 4 shipped the team_executor as a **lifecycle skeleton** — team_create → single send_message → team_delete in finally. The Phase 1-5c semantics were explicitly deferred. This cycle assembles the 4 substrate helpers (dag.py + fix_loop.py + reviewers.py + ci_runner.py + abandonment.py's frozensets) into the real Phase 1-5c orchestration.
 
 ## Decisions
 
-1. **`scripts/abandonment.py`** is the single source of truth for the enum values. New module-level frozensets `VALID_PHASES` and `VALID_REASONS` co-locate the Python contract with the SQL CHECK in `migrations/004`. Comment cross-references the migration in both directions.
-2. **`scripts/run.py::orchestrate_run`** is the enforcement layer. The cycle-loop abandonment branch now allowlist-checks `phase_reached` AND `reason` against the imported frozensets BEFORE calling `process_abandonment`. Any invalid value (including `None`, `"unknown"`, or any typo like `"review_unrecoverable_"`) raises `ValueError` fail-loud with a message naming the cycle, the rejected value, and the full canonical menu.
-3. **No DB-layer fallback.** `internal/abandonment-report/SKILL.md:170` hard rule was rewritten from a vague "raise `ValueError`" to an imperative naming the responsible layer (`scripts/run.py::orchestrate_run`) and forbidding fallback implementations inside `process_abandonment` / `record_abandonment` — by the time control reaches the DB layer, the CHECK has already fired and the cycle's work is lost.
-4. **The `outcome.get("reason", "other")` default at the old call site is removed.** `"other"` is schema-valid but the implicit default hid the symmetric `reason` typo bug. `reason` is now bound to the validated value.
-5. **`docs/design.md:173-174`** schema comment drift fixed — both `phase_reached` and `reason` comments now match `migrations/004` exactly.
+1. **6-phase orchestration** — Phase 1 (PM agenda) → Phase 2 (parallel pre-analysis to non-PM roster) → Phase 3 (synthesis Star→Mesh→Star with `dag.validate_dag` before posting) → Phase 4 (wave dispatch with `ci_runner.run_ci_checks` at every wave boundary) → Phase 5b' (`reviewers.select_reviewers` for disjoint review, `fix_loop` for iteration counter + PM-acceptance gate) → Phase 5c (real `commit_cycle` + `git rev-parse HEAD`).
+2. **Wire protocol documented in module docstring** — agents emit `ABANDON:` prefix for abandonment, fenced ```json``` blocks for Action Items, `[severity] file:line — text` for findings, `NO ISSUES` for empty rounds. Parsers are tolerant (garbage → empty list → clean abandonment).
+3. **Fix-round routes to Phase 4 implementer, not reviewer** — `_find_owner_for_finding(finding, file_to_owner, pm)` extracts the file from `finding.file_line` and looks up the owner via the `file_to_owner` index built at Phase 4 dispatch time. PM fallback for unowned files. This honors `internal/cycle/SKILL.md:258` ("Implementers (Owner from Phase 3 carries forward) fix all blocker + major issues").
+4. **PM acceptance gate plumbed** — after each reviewer round, `_phase_5b_prime_pm_acceptance_brief` asks PM to ACCEPT/REJECT remaining findings; case-insensitive `startswith("ACCEPT")` parse. Plumbed to `should_continue(state, pm_accepts_remaining=pm_accepts)`.
+5. **Iteration-aware reviewer brief** — `_phase_5b_prime_reviewer_brief(iter_n, action_items, prior_findings=None)` includes a "Previously unresolved findings" section on iteration 2+ so reviewers can do incremental review.
+6. **`_BLOCKING_SEVERITIES` imported from `scripts.fix_loop`** — no duplicate constants. Test uses `is` identity check to prevent drift.
+7. **`(skeleton)` sentinel removed** — `scripts/team_executor.py` no longer emits the magic string; `scripts/pr.py` special-case branch removed (dead code now). Real commit SHA flows through.
 
 ## Implementation
 
-- **Modified:** `scripts/abandonment.py` (+13 LOC — frozensets), `scripts/run.py` (+18 LOC — allowlist guards, drop default), `docs/design.md` (2-line comment fix), `internal/abandonment-report/SKILL.md` (hard rule rewrite)
-- **Tests:** `tests/test_abandonment.py` (+1 test: CHECK-rejects-unknown pinned to exact `"CHECK constraint failed"` string), `tests/test_run.py` (+4 tests: `*_phase_reached_missing` + `*_is_unknown` + `*_is_bogus` + `*_reason_is_invalid`; parametrize-6-phases acceptance test from iteration 1; new helpers `_assert_all_phases_in_message` / `_assert_all_reasons_in_message` enforce strict message contract)
+- **Rewritten:** `scripts/team_executor.py` — single send_message → 6-phase orchestration (~660 LOC of integration code)
+- **Modified:** `scripts/pr.py` — removed `(skeleton)` special case
+- **Rewritten:** `tests/test_team_executor.py` — new scripted MockTeamTools + 39 tests (was 26)
+- **Renamed:** `tests/test_pr.py::test_render_pr_body_special_cases_skeleton_commit_sha` → `test_render_pr_body_handles_missing_commit_sha` (asserts dash rendering for `sha=None`)
 
 ## Fix-loop iteration history
 
-**Iteration 1 (implementer self-review):** 5 deliverables done. Implementer chose `is None` as the guard scope. Test count 271 → 279.
+**Iteration 1:** 12 new tests, all 7 critical invariants intact, ruff clean.
 
-**Independent review (Vivienne Holt, SDET):** found 2 BLOCKERS:
-- Blocker 1: `is None` only catches missing-key; an executor that emits `phase_reached="unknown"` or `"bogus"` still crashes at INSERT — the exact original bug surface.
-- Blocker 2: enum sets not co-located with the SQL contract — drift will return.
+**Independent review (Marcus Holbrook, agent-systems-architect):** verified all 7 invariants. 0 blockers but **1 category error + 3 contract gaps**:
+- Major 1: fix-round sent to `finding.reviewer` instead of Phase 4 owner — direct violation of SKILL.md:258. Bug hides in mocks (MockTeamTools echoes strings without role-checking) but breaks production.
+- Major 2: `pm_accepts_remaining` hardcoded to False, eliminating a legit exit path the SKILL allows.
+- Major 3: reviewer brief identical every iteration — no incremental-review context.
+- Major 4: `_BLOCKING` duplicated, will drift from `scripts/fix_loop._BLOCKING_SEVERITIES`.
 
-Plus 4 majors (3 missing test cases for explicit-invalid; loose CHECK substring match; vague SKILL.md; missing all-values-in-message assertion).
+**Iteration 2:** all 4 fixed in one patch. +4 tests (fix-routing, PM-acceptance, reviewer-iteration-context, `_BLOCKING_SEVERITIES` identity check). Test count 335 → 339.
 
-**Iteration 2 (implementer fix patch):** all 2 blockers + all 4 majors fixed. Allowlist-based guards on both `phase_reached` AND `reason`. Frozensets hoisted into `scripts/abandonment.py`. Test count 279 → 282 (+3 explicit-invalid tests; existing missing-key test strengthened).
+**Re-review:** every major VERIFIED with file:line proof. All 7 critical invariants RE-AFFIRMED. Test 1000-1006 asserts BOTH owner-is-called AND reviewer-NOT-called. PM-acceptance parse handles ACCEPT_ALL, case-insensitive, with sensible REJECT-on-non-ACCEPT semantics. Test uses `is` identity check on `_BLOCKING_SEVERITIES` (bulletproof against re-introduction). Verdict: **READY TO COMMIT**.
 
-**Re-review (Vivienne Holt):** every blocker + major VERIFIED. Spot-checks confirmed `is None` was REPLACED not augmented; reason default truly removed everywhere; frozensets immutable; SKILL.md is imperative not advisory; new tests catch ValueError specifically (not IntegrityError). Verdict: **READY TO COMMIT**.
+## Residual minor (deferred — not blocking)
+
+- `_find_owner_for_finding` PM-fallback is silent (no log when reviewer flags a finding on an unowned file). Worth a follow-up.
+- PM's `"ABANDON: ..."` response in the acceptance brief is silently treated as REJECT (not escalated to cycle abandonment). Defensible; docstring should state behavior either way.
+- Windows-path `file_line` (`"C:\foo.py:10"`) would split at the drive colon. Out of scope (kaizen targets unix runners).
+- Dead `except FixLoopExhausted` defensive block — cosmetic.
 
 ## What this unlocks
 
-Every value `scripts/run.py` can possibly emit into the `abandonments` row is now provably schema-accepted. The bug class "sentinel string getting into a CHECK-constrained INSERT" cannot return without a deliberate code change that would also trip the new tests. Migration 005 (if it ever extends the enum) will need to update the frozenset in one place — no more 3-file drift.
+Team-mode dogfood is now ACTUALLY viable end-to-end. The next cycle (cycle 2) ships the production `TeamTools` wrapper that wires real CC tool calls + 8 named dispatch templates so the orchestrating agent has a concrete contract to fulfill. After cycle 2 lands, a `kaizen:improve --mode team` invocation can run a real cycle against a real target.

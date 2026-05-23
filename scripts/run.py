@@ -288,6 +288,14 @@ def orchestrate_run(
                     reason=outcome.get("reason", "other"),
                     detail=outcome.get("detail", ""),
                     artifacts=outcome.get("artifacts", []),
+                    # Phase 5b' review-loop fields — only populated by the
+                    # cycle executor when reason='review_unrecoverable'.
+                    # Defaulting to None preserves legacy abandonment shape
+                    # for all other reasons.
+                    review_iteration_count=outcome.get("review_iteration_count"),
+                    unresolved_findings=outcome.get("unresolved_findings"),
+                    convergence_summary=outcome.get("convergence_summary"),
+                    reviewer_attribution=outcome.get("reviewer_attribution"),
                 )
                 abandonment_rows.append(ab_row)
                 cycles_abandoned += 1

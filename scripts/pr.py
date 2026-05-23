@@ -28,7 +28,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
-from scripts.db import get_connection
+from scripts.db import ABANDONMENT_JSON_COLUMNS, get_connection, row_to_dict_with_json
 
 # ── DB loaders ─────────────────────────────────────────────────────────────
 
@@ -82,7 +82,11 @@ def load_run_context(db_path: str, run_id: int) -> tuple[dict, dict, list[dict],
             )
             rows = cur.fetchall()
             cols = [c[0] for c in cur.description]
-            abandonments = [_row_to_dict(r, cols) for r in rows]
+            # Use the JSON-decoding row helper so unresolved_findings /
+            # reviewer_attribution come back as list/dict (not TEXT).
+            # Same contract as scripts/abandonment.py._row_to_dict — keep
+            # them mechanically in sync via the shared helper.
+            abandonments = [row_to_dict_with_json(r, cols, ABANDONMENT_JSON_COLUMNS) for r in rows]
         else:
             abandonments = []
     finally:

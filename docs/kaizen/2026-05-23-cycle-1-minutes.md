@@ -1,90 +1,46 @@
-# Kaizen Run 12 Cycle 1 Minutes — kaizen
+# Cycle 1 Minutes — Run 14
 
-**Date:** 2026-05-23 UTC
-**Run ID:** 12
-**Facilitator:** Dr. Priya Nair (PM)
-**Subject:** Add team agent mode alongside existing subagent mode
-**Participants:**
-| Agent | Role |
-|---|---|
-| Dr. Nadia Petrov | Agent Systems Architect |
-| Dr. Fatima Al-Rashid | AI Safety Researcher |
-| Dr. Yusuf Okafor | Prompt Engineer |
-| Dr. Aisha Mensah | Cognitive Scientist |
-| Dr. Samuel Okafor | Software Engineer (Backend) |
-| Dr. Aisha Kamara | Data Engineer |
+- **Date:** 2026-05-23
+- **Subject:** Phase 5b' substrate — `scripts/reviewers.py` disjoint reviewer selection
+- **Participants:** Akira Sato (backend-engineer-1, implementer), Mei Tanaka (sdet-1, independent reviewer)
+- **Status:** success
 
----
+## Context
 
-## Discussion
+The 3-agent audit on 2026-05-23 (Holbrook, Lindqvist, Park) identified that Phase 5b' of `internal/cycle/SKILL.md` carried a load-bearing invariant — "a participant CANNOT review their own work" — that was enforced only by prose. No Python helper existed to make the disjointness mechanical. This cycle ships that helper.
 
-### Agenda Item 1: Where should the --mode flag be introduced?
+## Decisions
 
-**Proposals:**
-- Dr. Nadia Petrov (Agent Systems Architect): The `cycle_executor` injection point in `orchestrate_run` is already the right abstraction. Add `--mode subagent|team` to the skill invocation signature and thread it as `mode=` parameter to `orchestrate_run`. No orchestrator changes beyond a new parameter.
-- Dr. Samuel Okafor (Backend Engineer): Agreed. Mode as a runtime parameter, not a DB column. Select executor inside `orchestrate_run` based on `mode` value when no `cycle_executor` is explicitly injected.
-- Dr. Yusuf Okafor (Prompt Engineer): `skills/improve/SKILL.md` must document the new flag clearly — invocation signature, Step 2 parse/validate, and Step 3 route.
+1. **`scripts/reviewers.py::select_reviewers(roster, implementers, n=3, *, preferred_lenses=None)`** is the single source of truth for Phase 5b' reviewer selection. Pure function, no I/O, deterministic.
+2. **`InsufficientRosterError(ValueError)`** is the typed escalation point when the disjoint pool cannot supply enough reviewers. Caller-actionable error message includes pool size, requested count, and the implementer ids that overlapped with the roster.
+3. **Substring lens matching, case-sensitive, first-lens-wins**: `preferred_lenses=["security", "architect"]` matches `"security-engineer-1"` and `"agent-systems-architect-1"` by substring; documented in the docstring.
+4. **SKILL.md Phase 5b' step 1 wires the helper.** Reviewer dispatch now begins with the helper call rather than a prose claim; escalation to PM on `InsufficientRosterError` is documented inline.
 
-**Discussion:** All agents agreed immediately. No objections. The existing executor injection pattern is the right seam.
+## Implementation
 
-**Decision:** Add `mode: str = 'subagent'` to `orchestrate_run` signature. Select `team_cycle_executor` when `mode='team'` and no `cycle_executor` is injected. Update `skills/improve/SKILL.md` invocation section and Steps 2–3. — *Unanimous*
+- `scripts/reviewers.py` — new module, 75 LOC; type-hinted; no module-level state.
+- `tests/test_reviewers.py` — new file, 11 tests covering happy path, disjointness invariant, error completeness, determinism, input non-mutation, dedup, lens preference, lens no-match fallback, duplicate-overlap.
+- `internal/cycle/SKILL.md` — 14-line insertion in Phase 5b' step 1: helper call block + escalation note. Surrounding prose unchanged.
 
-### Agenda Item 2: Python implementation of team_executor.py
+## Independent review (Mei Tanaka)
 
-**Proposals:**
-- Dr. Nadia Petrov (Agent Systems Architect): Standalone `scripts/team_executor.py` with `team_cycle_executor(clone_dir, project, run_row, cycle_n)` — matches `execute_cycle` signature exactly.
-- Dr. Fatima Al-Rashid (AI Safety Researcher): Must include `_check_team_tools_available()` guard that raises `TeamToolsUnavailableError` when `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` env var is absent or falsy. Fail fast with a human-readable message rather than an obscure ToolNotFound error deep in the cycle.
-- Dr. Aisha Mensah (Cognitive Scientist): Standalone module is the right cognitive design — engineers understand two clear modules with identical interfaces better than a single module with mode-branching.
-- Dr. Samuel Okafor (Backend Engineer): The function body raises `NotImplementedError` because real execution requires live Agent Teams tool calls in a Claude Code session — a Python subprocess cannot call those tools. This mirrors the `execute_cycle` stub design.
+Reviewed against the cycle SKILL contract:
+- **Disjointness:** verified by static trace — both return paths draw exclusively from the disjoint `pool`.
+- **Determinism:** asserted by test; logic uses no random/hash/dict-iteration-order-dependent ops.
+- **Input non-mutation:** verified by round-trip; new containers throughout.
+- **Error completeness:** every documented `raises` fires on its documented input.
 
-**Discussion:** All agents aligned. The safety guard was unanimously accepted as a mandatory pre-flight check.
+Verdict: **READY TO COMMIT** with 3 minor nits.
 
-**Decision:** Create `scripts/team_executor.py` with `TeamToolsUnavailableError` class, `_check_team_tools_available()` guard, and `team_cycle_executor()` that raises `NotImplementedError` after passing the guard. — *Unanimous*
+## Fix loop
 
-### Agenda Item 3: Project-level field vs CLI flag
+All 3 nits applied in iteration 1:
+1. Docstring lens-semantics line added.
+2. `test_duplicate_role_in_both_roster_and_implementers` added.
+3. `InsufficientRosterError` message now includes the overlap list.
 
-**Proposals:**
-- Dr. Aisha Kamara (Data Engineer): Mode is a runtime concern, not a storage concern. No migration needed. Accepted trade-off: past runs don't record which mode they used. Document as known gap in `internal/cycle/SKILL.md`.
-- All other agents: Agreed. Adding a schema migration for a feature flag adds complexity with low payoff at this stage.
+Final pytest: 261 passed, 1 skipped (baseline skip count unchanged). `ruff check` and `ruff format --check` clean.
 
-**Decision:** No migration. Mode is a parameter only, not stored in the `runs` table. Document the known gap in `internal/cycle/SKILL.md`. — *Unanimous*
+## What this unlocks
 
-### Agenda Item 4: Tests
-
-**Proposals:**
-- Dr. Samuel Okafor (Backend Engineer): `tests/test_team_executor.py` — unit tests for the guard function (truthy/falsy/absent env var), executor signature match, and error message content. `tests/test_run.py` — two new tests: (1) `mode` key appears in result dict, (2) `mode='team'` without injected executor selects `team_cycle_executor` (verified via `TeamToolsUnavailableError` propagation and run finalization at `status='failed'`).
-- Dr. Fatima Al-Rashid (AI Safety Researcher): Signature match test is important — if `team_cycle_executor` diverges from `execute_cycle`, the orchestrator's swapping logic breaks silently.
-
-**Decision:** Add `tests/test_team_executor.py` (16 tests) and two new tests to `tests/test_run.py`. — *Unanimous*
-
-### Agenda Item 5: SKILL.md prose update
-
-**Proposals:**
-- Dr. Yusuf Okafor (Prompt Engineer): `internal/cycle/SKILL.md` gets a new "Execution modes" section (table + per-mode dispatch description + env var requirement + known gap on mode persistence). `skills/improve/SKILL.md` invocation updated with `--mode` flag, Step 2 validation extended, Step 3 route updated to pass `mode`.
-- All agents: Agreed.
-
-**Decision:** Update `internal/cycle/SKILL.md` with "Execution modes" section. Update `skills/improve/SKILL.md` invocation + Steps 2–3. — *Unanimous*
-
----
-
-## Decisions Log
-
-1. Add `mode: str = 'subagent'` parameter to `orchestrate_run` in `scripts/run.py`; select `team_cycle_executor` when `mode='team'` — `scripts/run.py`
-2. Create `scripts/team_executor.py` with `TeamToolsUnavailableError`, `_check_team_tools_available()`, and `team_cycle_executor()` — `scripts/team_executor.py`
-3. No DB migration; mode is runtime-only; known gap documented in `internal/cycle/SKILL.md` — `internal/cycle/SKILL.md`
-4. Add `tests/test_team_executor.py` (16 tests) + 2 new tests in `tests/test_run.py` — `tests/test_team_executor.py`, `tests/test_run.py`
-5. Update `skills/improve/SKILL.md` invocation + Steps 2–3; update `internal/cycle/SKILL.md` with "Execution modes" section — `skills/improve/SKILL.md`, `internal/cycle/SKILL.md`
-
-## Action Items
-
-| # | Change | File(s) | Assigned to |
-|---|---|---|---|
-| 1 | Add `mode` param to `orchestrate_run`, select executor by mode, include `mode` in result dict | `scripts/run.py` | Dr. Samuel Okafor |
-| 2 | Create team executor module with safety guard and `NotImplementedError` stub | `scripts/team_executor.py` | Dr. Fatima Al-Rashid |
-| 3 | Document "Execution modes" section + known persistence gap | `internal/cycle/SKILL.md` | Dr. Aisha Kamara |
-| 4 | Write test suite for team executor + orchestrator mode selection | `tests/test_team_executor.py`, `tests/test_run.py` | Dr. Samuel Okafor |
-| 5 | Update SKILL.md prose (invocation + Steps 2–3 + mode routing) | `skills/improve/SKILL.md`, `internal/cycle/SKILL.md` | Dr. Yusuf Okafor |
-
----
-
-*All action items implemented in this cycle. Tests: 249 passed, 1 skipped (18 new tests added).*
+Future Phase 5b' executions can now call `select_reviewers(...)` instead of trusting orchestrator prose. The next cycle (Cycle 2) builds the matching structured-fields substrate in `scripts/abandonment.py` so a `review_unrecoverable` abandonment can record the reviewer attribution and convergence summary that this helper's selections produce.

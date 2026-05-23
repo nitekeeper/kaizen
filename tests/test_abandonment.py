@@ -132,12 +132,256 @@ def test_record_abandonment_accepts_review_unrecoverable(db, run_and_cycle):
     row = record_abandonment(
         db_path=db,
         cycle_id=run_and_cycle["cycle"]["id"],
-        phase_reached="test",
+        phase_reached="review",
         reason="review_unrecoverable",
         detail="Phase 5b' fix loop exhausted at max 5 iterations",
         report_memex_slug="kaizen:abandonment:test-cycle-1",
     )
     assert row["reason"] == "review_unrecoverable"
+    assert row["phase_reached"] == "review"
+
+
+# ── Phase 5b' substrate — structured review-loop fields ──────────────────
+
+
+def test_record_abandonment_with_review_fields(db, run_and_cycle):
+    """All 4 review-loop kwargs round-trip through JSON serialisation."""
+    findings = [
+        {
+            "reviewer": "security-engineer-1",
+            "severity": "blocker",
+            "finding": "SQL injection in build_query",
+            "file_line": "scripts/db.py:42",
+        },
+        {
+            "reviewer": "prompt-engineer-1",
+            "severity": "major",
+            "finding": "Embedded SQL should be parameterised at the caller",
+            "file_line": "scripts/db.py:42",
+        },
+    ]
+    attribution = {
+        "f-001": "security-engineer-1",
+        "f-002": "prompt-engineer-1",
+    }
+    row = record_abandonment(
+        db_path=db,
+        cycle_id=run_and_cycle["cycle"]["id"],
+        phase_reached="review",
+        reason="review_unrecoverable",
+        detail="fix loop exhausted",
+        report_memex_slug="kaizen:abandonment:1-cycle-1",
+        review_iteration_count=5,
+        unresolved_findings=findings,
+        convergence_summary=(
+            "f-001 was re-flagged in rounds 2/3/4; the implementer's "
+            "parameterisation attempt did not satisfy security-engineer-1."
+        ),
+        reviewer_attribution=attribution,
+    )
+    # Scalar fields
+    assert row["review_iteration_count"] == 5
+    assert row["convergence_summary"].startswith("f-001 was re-flagged")
+    # JSON columns must come back as Python structures, NOT strings.
+    assert isinstance(row["unresolved_findings"], list)
+    assert row["unresolved_findings"] == findings
+    assert isinstance(row["reviewer_attribution"], dict)
+    assert row["reviewer_attribution"] == attribution
+
+
+def test_record_abandonment_review_phase_check_constraint_allows_review(db, run_and_cycle):
+    """phase_reached='review' must not raise after migration 004."""
+    row = record_abandonment(
+        db_path=db,
+        cycle_id=run_and_cycle["cycle"]["id"],
+        phase_reached="review",
+        reason="review_unrecoverable",
+        detail="d",
+        report_memex_slug=None,
+    )
+    assert row["phase_reached"] == "review"
+
+
+def test_record_abandonment_push_phase_check_constraint_allows_push(db, run_and_cycle):
+    """phase_reached='push' must not raise after migration 004."""
+    row = record_abandonment(
+        db_path=db,
+        cycle_id=run_and_cycle["cycle"]["id"],
+        phase_reached="push",
+        reason="other",
+        detail="git push failed: refs not advertised",
+        report_memex_slug=None,
+    )
+    assert row["phase_reached"] == "push"
+
+
+def test_record_abandonment_backwards_compatible_without_review_fields(db, run_and_cycle):
+    """Existing call sites that omit the 4 new kwargs still work."""
+    row = record_abandonment(
+        db_path=db,
+        cycle_id=run_and_cycle["cycle"]["id"],
+        phase_reached="meeting",
+        reason="no_consensus",
+        detail="agents could not agree",
+        report_memex_slug="kaizen:abandonment:1-cycle-1",
+    )
+    # All 4 new columns must come back as None when not provided.
+    assert row["review_iteration_count"] is None
+    assert row["unresolved_findings"] is None
+    assert row["convergence_summary"] is None
+    assert row["reviewer_attribution"] is None
+
+
+def test_format_report_includes_review_section_when_fields_present():
+    findings = [
+        {
+            "reviewer": "security-engineer-1",
+            "severity": "blocker",
+            "finding": "SQL injection",
+            "file_line": "scripts/db.py:42",
+        },
+    ]
+    attribution = {"f-001": "security-engineer-1"}
+    md = format_report(
+        project_name="owner-repo",
+        git_url="https://github.com/owner/repo.git",
+        run_id=7,
+        cycle_n=3,
+        subject="harden DB layer",
+        participants=["pm", "security-engineer-1"],
+        phase_reached="review",
+        reason="review_unrecoverable",
+        detail="fix loop exhausted",
+        artifacts=[],
+        review_iteration_count=5,
+        unresolved_findings=findings,
+        convergence_summary="implementer could not parameterise the query",
+        reviewer_attribution=attribution,
+    )
+    assert "## Review-loop details (Phase 5b' only)" in md
+    assert "Iterations run: 5/5" in md
+    assert "Convergence summary: implementer could not parameterise the query" in md
+    assert "Unresolved findings:" in md
+    assert "[blocker] security-engineer-1: SQL injection (scripts/db.py:42)" in md
+    assert "Reviewer attribution:" in md
+    assert "f-001: security-engineer-1" in md
+
+
+def test_format_report_review_section_snapshot_pins_exact_rendering():
+    """Pin the exact markdown for the Review-loop section against a golden string.
+
+    Catches accidental whitespace / ordering / punctuation drift in the
+    Phase 5b' renderer. The frontmatter & body above this section are
+    covered by other tests; we slice from the section header onward.
+    """
+    findings = [
+        {
+            "reviewer": "security-engineer-1",
+            "severity": "blocker",
+            "finding": "SQL injection in build_query",
+            "file_line": "scripts/db.py:42",
+        },
+        {
+            "reviewer": "prompt-engineer-1",
+            "severity": "major",
+            "finding": "Embedded SQL should be parameterised at caller",
+            "file_line": "scripts/db.py:42",
+        },
+    ]
+    attribution = {
+        "f-001": "security-engineer-1",
+        "f-002": "prompt-engineer-1",
+    }
+    md = format_report(
+        project_name="owner-repo",
+        git_url="https://github.com/owner/repo.git",
+        run_id=7,
+        cycle_n=3,
+        subject="harden DB layer",
+        participants=["pm", "security-engineer-1"],
+        phase_reached="review",
+        reason="review_unrecoverable",
+        detail="fix loop exhausted",
+        artifacts=[],
+        review_iteration_count=5,
+        unresolved_findings=findings,
+        convergence_summary="implementer could not parameterise the query",
+        reviewer_attribution=attribution,
+    )
+    expected = (
+        "\n## Review-loop details (Phase 5b' only)\n"
+        "Iterations run: 5/5\n"
+        "Convergence summary: implementer could not parameterise the query\n"
+        "Unresolved findings:\n"
+        "  - [blocker] security-engineer-1: SQL injection in build_query (scripts/db.py:42)\n"
+        "  - [major] prompt-engineer-1: Embedded SQL should be parameterised at caller (scripts/db.py:42)\n"
+        "Reviewer attribution:\n"
+        "  - f-001: security-engineer-1\n"
+        "  - f-002: prompt-engineer-1\n"
+    )
+    # Locate the review section start and compare from there to end-of-string.
+    idx = md.index("\n## Review-loop details")
+    assert md[idx:] == expected, (
+        f"Review-loop section drift.\n--- expected ---\n{expected!r}\n--- actual ---\n{md[idx:]!r}"
+    )
+
+
+def test_format_report_tolerates_findings_with_missing_keys():
+    """The renderer must not crash on a finding dict missing inner keys.
+
+    Contract: `unresolved_findings` SHOULD be `{reviewer, severity, finding,
+    file_line}` per scripts/abandonment.py docstring. The renderer enforces
+    this leniently — any missing key renders as '?' rather than raising
+    KeyError. This test pins that behaviour so a stricter rewrite (e.g.
+    `f["severity"]`) doesn't silently regress.
+    """
+    findings = [
+        {"severity": "blocker"},  # only severity
+        {},  # all keys missing
+        {
+            "reviewer": "security-engineer-1",
+            "severity": "major",
+            "finding": "issue",
+            "file_line": "f.py:1",
+        },  # well-formed
+    ]
+    md = format_report(
+        project_name="owner-repo",
+        git_url="https://github.com/owner/repo.git",
+        run_id=7,
+        cycle_n=3,
+        subject="x",
+        participants=["pm"],
+        phase_reached="review",
+        reason="review_unrecoverable",
+        detail="d",
+        artifacts=[],
+        review_iteration_count=1,
+        unresolved_findings=findings,
+        convergence_summary="c",
+        reviewer_attribution=None,
+    )
+    # Lenient placeholder for missing fields.
+    assert "[blocker] ?: ? (?)" in md  # severity-only finding
+    assert "[?] ?: ? (?)" in md  # all-missing finding
+    # Well-formed finding still renders normally.
+    assert "[major] security-engineer-1: issue (f.py:1)" in md
+
+
+def test_format_report_omits_review_section_when_fields_absent():
+    md = format_report(
+        project_name="owner-repo",
+        git_url="https://github.com/owner/repo.git",
+        run_id=7,
+        cycle_n=3,
+        subject="x",
+        participants=["pm"],
+        phase_reached="meeting",
+        reason="no_consensus",
+        detail="d",
+        artifacts=[],
+    )
+    assert "Review-loop details" not in md
 
 
 # ── process_abandonment full flow ──────────────────────────────────────────

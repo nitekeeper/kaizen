@@ -41,10 +41,16 @@ Outcome dict (matches internal/cycle/SKILL.md):
         "status": "abandoned",
         "subject": str | None,
         "participants": list[str],
-        "phase_reached": "agenda" | "meeting" | "implementation" | "test",
-        "reason": "no_consensus" | "destructive_rejected" | "tests_unrecoverable" | "other",
+        "phase_reached": "agenda" | "meeting" | "implementation" | "test" | "review" | "push",
+        "reason": "no_consensus" | "destructive_rejected" | "tests_unrecoverable" | "review_unrecoverable" | "other",
         "detail": str,
         "artifacts": list[str],
+        # Optional Phase 5b' review-loop fields — present only when
+        # reason='review_unrecoverable'. See scripts/abandonment.py.
+        "review_iteration_count": int | None,
+        "unresolved_findings": list[dict] | None,
+        "convergence_summary": str | None,
+        "reviewer_attribution": dict | None,
     }
 """
 

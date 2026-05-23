@@ -54,7 +54,7 @@ Return a dict:
   "status": "abandoned",
   "subject": "<cycle subject or None>",
   "participants": ["<agent_name>", ...],
-  "phase_reached": "agenda" | "meeting" | "implementation" | "test",
+  "phase_reached": "agenda" | "meeting" | "implementation" | "test" | "review" | "push",
   "reason": "no_consensus" | "destructive_rejected" | "tests_unrecoverable" | "review_unrecoverable" | "other",
   "detail": "<free-text describing what was attempted and what blocked it>",
   "artifacts": ["<memex slug or path>", ...],
@@ -228,6 +228,20 @@ After Phase 5b's tests pass, the cycle does not yet commit. A new independent-re
 
 1. **Spawn independent reviewer teammates** (different from the Phase 2/4 implementers; drawn from the same `expert_roster` but a participant CANNOT review their own work). Different lenses: security, prompt-clarity, architecture, etc. Typically 2-4 reviewers per cycle.
 
+   Pick the reviewer roster via the helper (enforces disjointness from Phase 4 implementers):
+
+   ```python
+   from scripts.reviewers import select_reviewers
+   reviewers = select_reviewers(
+       roster=project["expert_roster"],
+       implementers=[<agent role ids that owned Phase 4 tasks>],
+       n=3,
+       preferred_lenses=["security", "architect", "prompt", "safety"],
+   )
+   ```
+
+   If the helper raises `InsufficientRosterError`, escalate to the PM (the roster is too small for safe review — either expand the roster or abandon the cycle).
+
 2. **Parallel reviews.** Each reviewer examines the post-Phase-4 diff (use `git diff HEAD~N..HEAD` or `git diff` against the cycle's starting commit) and produces a structured findings block:
    - **Issue** — what's wrong, with file:line
    - **Severity** — blocker / major / minor / nit
@@ -255,11 +269,16 @@ After Phase 5b's tests pass, the cycle does not yet commit. A new independent-re
 If the fix loop exhausts all 5 iterations with unresolved issues, abandon:
 
 ```python
-{ "status": "abandoned", "phase_reached": "test",
+{ "status": "abandoned", "phase_reached": "review",
   "reason": "review_unrecoverable",
   "detail": "<summary: iteration count, final unresolved issues, why fix loop couldn't converge>",
   "participants": <resolved>, "artifacts": [<minutes slug if captured>],
-  "subject": run_row["subject"] }
+  "subject": run_row["subject"],
+  # Structured fields (passed to record_abandonment/process_abandonment as kwargs):
+  "review_iteration_count": <int 1..5>,
+  "unresolved_findings": [{"reviewer": ..., "severity": ..., "finding": ..., "file_line": ...}, ...],
+  "convergence_summary": "<why the fix loop couldn't converge>",
+  "reviewer_attribution": {"<finding_id>": "<reviewer_role_id>", ...} }
 ```
 
 The abandonment report MUST include:

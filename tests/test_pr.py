@@ -119,6 +119,65 @@ def test_load_run_context_raises_on_missing_run(db):
         load_run_context(db, 9999)
 
 
+def test_load_run_context_deserialises_abandonment_json_columns(db, project):
+    """load_run_context must JSON-decode the abandonments' review-loop columns.
+
+    Regression guard: scripts/pr.py previously used a plain
+    `dict(zip(...))` row helper, so `unresolved_findings` /
+    `reviewer_attribution` came back as TEXT strings instead of Python
+    list/dict. After the cycle-2 refactor both modules share the
+    `row_to_dict_with_json` helper from scripts/db.py.
+    """
+    run = _make_run(db, project, cycles_requested=1)
+    cycle = record_cycle_abandoned(
+        db,
+        run_id=run["id"],
+        cycle_n=1,
+        subject="harden DB",
+        started_at="2026-05-16T12:00:00+00:00",
+    )
+    findings = [
+        {
+            "reviewer": "security-engineer-1",
+            "severity": "blocker",
+            "finding": "SQL injection in build_query",
+            "file_line": "scripts/db.py:42",
+        }
+    ]
+    attribution = {"f-001": "security-engineer-1"}
+    record_abandonment(
+        db,
+        cycle_id=cycle["id"],
+        phase_reached="review",
+        reason="review_unrecoverable",
+        detail="fix loop exhausted",
+        report_memex_slug=f"kaizen:abandonment:{run['id']}-cycle-1",
+        review_iteration_count=5,
+        unresolved_findings=findings,
+        convergence_summary="implementer could not parameterise the query",
+        reviewer_attribution=attribution,
+    )
+    finalize_run(db, run["id"], cycles_succeeded=0, cycles_abandoned=1)
+
+    _run, _project, _cycles, abandonments = load_run_context(db, run["id"])
+    assert len(abandonments) == 1
+    ab = abandonments[0]
+    # The contract: JSON-bearing columns are Python structures, not strings.
+    assert isinstance(ab["unresolved_findings"], list), (
+        f"expected list, got {type(ab['unresolved_findings']).__name__}: "
+        f"{ab['unresolved_findings']!r}"
+    )
+    assert ab["unresolved_findings"] == findings
+    assert isinstance(ab["reviewer_attribution"], dict), (
+        f"expected dict, got {type(ab['reviewer_attribution']).__name__}: "
+        f"{ab['reviewer_attribution']!r}"
+    )
+    assert ab["reviewer_attribution"] == attribution
+    # Scalar columns pass through unchanged.
+    assert ab["review_iteration_count"] == 5
+    assert ab["convergence_summary"] == "implementer could not parameterise the query"
+
+
 # ── render_pr_body ─────────────────────────────────────────────────────────
 
 

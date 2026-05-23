@@ -91,7 +91,7 @@ For each `cycle_n` in `1..cycles_requested`:
    "
    ```
 
-   Then read `internal/abandonment-report/SKILL.md` and follow its procedure with `(project, run_id, cycle_id=<row id from above>, cycle_n, subject, participants, phase_reached, reason, detail, artifacts)` from `outcome`.
+   Then read `internal/abandonment-report/SKILL.md` and follow its procedure with `(project, run_id, cycle_id=<row id from above>, cycle_n, subject, participants, phase_reached, reason, detail, artifacts, review_iteration_count, unresolved_findings, convergence_summary, reviewer_attribution)` from `outcome`. The last 4 fields are only present when `reason='review_unrecoverable'` (Phase 5b' fix-loop exhaustion) — for every other abandonment reason they should be omitted (or passed as `None`), and the rendered report falls back to the legacy shape.
 
    Increment a running `cycles_abandoned` counter. **Do NOT stop the loop.**
 4. **If `outcome["status"]` is anything else:** abort the run with a loud error — the cycle executor returned malformed output.

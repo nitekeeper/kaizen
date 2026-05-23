@@ -1,0 +1,304 @@
+"""Tests for scripts/dispatch_templates.py — the Phase 1-5c brief templates.
+
+These tests cover:
+  - happy-path: each template produces the expected content (subject, cycle,
+    item ids, wave, severity, file:line, etc.) so wire-protocol drift is loud
+  - required-kwarg validation: missing kwargs raise ValueError naming the
+    kwarg; wrong-type kwargs raise ValueError naming both expected and
+    observed types
+  - optional-kwarg semantics: phase_1_agenda accepts subject=None;
+    phase_5b_prime_reviewer's iter-1 brief omits the carry-forward block,
+    iter-2+ includes prior finding text
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from scripts.dispatch_templates import (
+    phase_1_agenda,
+    phase_2_preanalysis,
+    phase_3_close,
+    phase_3_debate,
+    phase_3_open,
+    phase_4_implementer,
+    phase_5b_ci_failure,
+    phase_5b_prime_fix,
+    phase_5b_prime_pm_acceptance,
+    phase_5b_prime_reviewer,
+)
+from scripts.fix_loop import Finding
+
+
+def _finding(
+    *,
+    fid: str = "R1-1",
+    reviewer: str = "security-engineer-1",
+    severity: str = "blocker",
+    finding: str = "SQL injection in user query",
+    file_line: str = "scripts/run.py:42",
+) -> Finding:
+    return Finding(
+        finding_id=fid,
+        reviewer=reviewer,
+        severity=severity,
+        finding=finding,
+        file_line=file_line,
+    )
+
+
+# ── Phase 1 — Agenda ──────────────────────────────────────────────────────
+
+
+def test_phase_1_agenda_contains_subject_and_cycle_n():
+    msg = phase_1_agenda(subject="reduce flakiness", cycle_n=3)
+    assert "cycle 3" in msg
+    assert "reduce flakiness" in msg
+    assert "Phase 1" in msg
+
+
+def test_phase_1_agenda_handles_None_subject():
+    msg = phase_1_agenda(subject=None, cycle_n=1)
+    # No crash; falls back to a stable label so the PM understands intent.
+    assert "PM-directed" in msg
+    assert "cycle 1" in msg
+
+
+def test_phase_1_agenda_raises_when_cycle_n_missing():
+    with pytest.raises(ValueError) as exc:
+        phase_1_agenda(subject="x", cycle_n=None)  # type: ignore[arg-type]
+    assert "cycle_n" in str(exc.value)
+
+
+def test_phase_1_agenda_raises_when_cycle_n_wrong_type():
+    with pytest.raises(ValueError) as exc:
+        phase_1_agenda(subject="x", cycle_n="1")  # type: ignore[arg-type]
+    msg = str(exc.value)
+    assert "cycle_n" in msg
+    assert "int" in msg
+    assert "str" in msg
+
+
+# ── Phase 2 — Pre-analysis ────────────────────────────────────────────────
+
+
+def test_phase_2_preanalysis_raises_when_agenda_items_missing():
+    with pytest.raises(ValueError) as exc:
+        phase_2_preanalysis(agenda_items=None, participant="backend-engineer-1")  # type: ignore[arg-type]
+    assert "agenda_items" in str(exc.value)
+
+
+# ── Phase 3 — Synthesis meeting ───────────────────────────────────────────
+
+
+def test_phase_3_open_includes_proposal_summary():
+    msg = phase_3_open(proposals=[{"agent": "be-1", "raw": "switch from foo to bar"}])
+    assert "be-1" in msg
+    assert "switch from foo to bar" in msg
+
+
+def test_phase_3_debate_is_stateless():
+    msg = phase_3_debate()
+    assert "Phase 3 debate" in msg
+
+
+def test_phase_3_close_includes_proposals_and_agreements():
+    msg = phase_3_close(
+        proposals=[{"agent": "a", "raw": "x"}, {"agent": "b", "raw": "y"}],
+        agreements=[{"agent": "a", "raw": "ok"}],
+    )
+    assert "Proposals: 2" in msg
+    assert "agreements: 1" in msg
+
+
+# ── Phase 4 — Implementer ─────────────────────────────────────────────────
+
+
+def test_phase_4_implementer_includes_wave_n_and_item_id():
+    item = {"id": "AI-7", "touches": ["foo.py"], "reads": []}
+    msg = phase_4_implementer(item=item, wave_n=2)
+    assert "wave 2" in msg
+    assert "AI-7" in msg
+
+
+# ── Phase 5b CI failure ───────────────────────────────────────────────────
+
+
+def test_phase_5b_ci_failure_includes_failed_checks():
+    """Byte-identity pin: the returned string MUST match cycle-1's inline
+    emission f"CI failed after wave {wave_n}: {failed}" exactly. Drift
+    here breaks the wire-protocol invariant the cycle-2 refactor preserves.
+    """
+    msg = phase_5b_ci_failure(
+        wave_n=1,
+        failed_checks=["tests", "ruff_check"],
+    )
+    assert msg == "CI failed after wave 1: ['tests', 'ruff_check']"
+
+
+def test_phase_5b_ci_failure_rejects_empty_failed_checks():
+    """An empty failed_checks list is semantically invalid — if no checks
+    failed, the caller should not be invoking the failure template at all.
+    """
+    with pytest.raises(ValueError) as exc:
+        phase_5b_ci_failure(
+            wave_n=1,
+            failed_checks=[],
+        )
+    msg = str(exc.value)
+    assert "failed_checks" in msg
+    assert "empty" in msg
+
+
+# ── Empty-container rejection (Blocker 2 coverage) ───────────────────────
+
+
+def test_phase_2_preanalysis_rejects_empty_agenda_items():
+    with pytest.raises(ValueError) as exc:
+        phase_2_preanalysis(agenda_items=[], participant="backend-engineer-1")
+    msg = str(exc.value)
+    assert "agenda_items" in msg
+    assert "empty" in msg
+
+
+def test_phase_3_open_rejects_empty_proposals():
+    with pytest.raises(ValueError) as exc:
+        phase_3_open(proposals=[])
+    msg = str(exc.value)
+    assert "proposals" in msg
+    assert "empty" in msg
+
+
+@pytest.mark.parametrize(
+    "proposals,agreements,expected_kwarg",
+    [
+        ([], [{"agent": "a", "raw": "ok"}], "proposals"),
+        ([{"agent": "a", "raw": "x"}], [], "agreements"),
+    ],
+)
+def test_phase_3_close_rejects_empty_proposals_and_empty_agreements(
+    proposals, agreements, expected_kwarg
+):
+    with pytest.raises(ValueError) as exc:
+        phase_3_close(proposals=proposals, agreements=agreements)
+    msg = str(exc.value)
+    assert expected_kwarg in msg
+    assert "empty" in msg
+
+
+def test_phase_5b_prime_pm_acceptance_rejects_empty_findings():
+    with pytest.raises(ValueError) as exc:
+        phase_5b_prime_pm_acceptance(findings=[], iter_n=2)
+    msg = str(exc.value)
+    assert "findings" in msg
+    assert "empty" in msg
+
+
+# ── Phase 5b' Reviewer ────────────────────────────────────────────────────
+
+
+def test_phase_5b_prime_reviewer_iter1_omits_previously_unresolved():
+    msg = phase_5b_prime_reviewer(
+        iter_n=1,
+        action_items=[{"id": "A"}, {"id": "B"}],
+        prior_findings=None,
+    )
+    assert "iteration 1" in msg
+    assert "Previously unresolved" not in msg
+
+
+def test_phase_5b_prime_reviewer_iter2_includes_prior_findings():
+    prior = [_finding(fid="R1-1", finding="missing input validation")]
+    msg = phase_5b_prime_reviewer(
+        iter_n=2,
+        action_items=[{"id": "A"}],
+        prior_findings=prior,
+    )
+    assert "iteration 2" in msg
+    assert "Previously unresolved" in msg
+    assert "R1-1" in msg
+    assert "missing input validation" in msg
+
+
+# ── Phase 5b' Fix ─────────────────────────────────────────────────────────
+
+
+def test_phase_5b_prime_fix_includes_severity_and_file_line():
+    f = _finding(
+        severity="major",
+        file_line="scripts/foo.py:117",
+        finding="off-by-one in loop bound",
+    )
+    msg = phase_5b_prime_fix(finding=f)
+    assert "major" in msg
+    assert "scripts/foo.py:117" in msg
+    assert "off-by-one in loop bound" in msg
+
+
+# ── Phase 5b' PM acceptance ───────────────────────────────────────────────
+
+
+def test_phase_5b_prime_pm_acceptance_explains_accept_reject_protocol():
+    msg = phase_5b_prime_pm_acceptance(
+        findings=[_finding()],
+        iter_n=3,
+    )
+    assert "ACCEPT" in msg
+    assert "REJECT" in msg
+    assert "iteration 3" in msg
+
+
+# ── Item 2: PM-ABANDON semantics docstring + body protocol ───────────────
+
+
+def test_phase_5b_prime_pm_acceptance_docstring_specifies_ABANDON_treated_as_REJECT():
+    """Item 2: docstring must explicitly state that ABANDON: prefixes from
+    the PM at the acceptance prompt are treated as REJECT (not as cycle
+    abandonment). The body must also tell the PM about the ACCEPT/REJECT
+    protocol so the agent has the contract in-message.
+    """
+    assert phase_5b_prime_pm_acceptance.__doc__ is not None
+    assert "ABANDON" in phase_5b_prime_pm_acceptance.__doc__
+    assert "REJECT" in phase_5b_prime_pm_acceptance.__doc__
+    msg = phase_5b_prime_pm_acceptance(
+        findings=[
+            Finding(
+                finding_id="F-1",
+                reviewer="r",
+                severity="blocker",
+                finding="x",
+                file_line="a.py:1",
+            )
+        ],
+        iter_n=2,
+    )
+    assert "ACCEPT" in msg and "REJECT" in msg
+
+
+# ── Item 5: _require empty-container rejection extended to tuple & set ───
+
+
+def test_require_rejects_empty_tuple():
+    """Item 5: empty tuples must be rejected by `_require` with the same
+    'empty' substring in the error message that empty list/dict/str use.
+    """
+    from scripts.dispatch_templates import _require
+
+    with pytest.raises(ValueError) as exc:
+        _require("x", (), tuple)
+    msg = str(exc.value)
+    assert "x" in msg
+    assert "empty" in msg
+
+
+def test_require_rejects_empty_set():
+    """Item 5: empty sets must be rejected by `_require` with the same
+    'empty' substring in the error message that empty list/dict/str use.
+    """
+    from scripts.dispatch_templates import _require
+
+    with pytest.raises(ValueError) as exc:
+        _require("x", set(), set)
+    msg = str(exc.value)
+    assert "x" in msg
+    assert "empty" in msg

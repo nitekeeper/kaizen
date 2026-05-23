@@ -66,6 +66,7 @@ This is the only user-invocable command. All other operations live in `internal/
 
 - Design spec: `docs/design.md`
 - Implementation plan: `docs/plan.md`
+- Phase redesign spec: `docs/design/kaizen-phase-redesign-design.md` (Agent Teams + waves + reviewers; merged on the agent-team branch)
 - Public slash command: `skills/improve/SKILL.md`
 - Internal procedures: `internal/<name>/SKILL.md` (run, cycle, project, abandonment-report, etc.)
 - Scripts: `scripts/*.py` — deterministic infrastructure (DB, git, clone, PR, detect)

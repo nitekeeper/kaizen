@@ -169,20 +169,39 @@ def orchestrate_run(
     cycles_requested: int,
     subject: str | None = None,
     cycle_executor=None,
+    mode: str = "subagent",
+    *,
+    tools_provider=None,
 ) -> dict:
     """Full multi-cycle orchestration. See module docstring for the flow.
 
     `cycle_executor(clone_dir, project, run_row, cycle_n) -> dict` is the
-    per-cycle callback. When None, `scripts.cycle.execute_cycle` is used
-    (which is a Wave 4 stub — tests must inject).
+    per-cycle callback. When None, the executor is selected based on `mode`:
+      - mode='subagent' (default): uses `scripts.cycle.execute_cycle` (Wave 4
+        stub — tests must inject a real executor).
+      - mode='team': uses `scripts.team_executor.team_cycle_executor`, which
+        requires CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 in the environment.
+
+    Passing an explicit `cycle_executor` overrides `mode` selection — useful
+    for testing.
+
+    `tools_provider` is a `Callable[[Path, dict, dict, int], TeamTools] | None`
+    invoked once per cycle to build the `TeamTools` wrapper passed as the
+    `tools=` keyword arg into `team_cycle_executor`. It is REQUIRED when
+    `mode='team'` (the team executor cannot construct CC session-tool
+    wrappers itself — Python cannot directly call Claude Code session
+    tools). When `mode='subagent'` `tools_provider` is silently IGNORED for
+    minimum surprise. When `mode='team'` and `tools_provider` is None, the
+    orchestrator raises `ValueError` BEFORE any clone / seed / branch / run
+    row side effect so the failure leaves no garbage on disk or in the DB.
 
     Returns a dict with the state Wave 5 needs to render and open the PR:
       run_id, project_id, branch, clone_dir, experiment_dir,
       cycles_succeeded, cycles_abandoned, cycles (list of rows),
-      abandonments (list of rows), status.
+      abandonments (list of rows), status, mode.
     """
     # Local imports keep cycle.py / clone.py / etc. optional at import time.
-    from scripts.abandonment import process_abandonment
+    from scripts.abandonment import VALID_PHASES, VALID_REASONS, process_abandonment
     from scripts.clone import cleanup_experiment, clone_repo
     from scripts.cycle import (
         execute_cycle as default_executor,
@@ -196,8 +215,18 @@ def orchestrate_run(
     from scripts.project import get_project_by_url
     from scripts.seed_atelier_in_clone import seed_all
 
+    # Did the caller supply their own executor? Used by the bridge guard
+    # below — explicit-executor callers (tests injecting stubs) bypass the
+    # tools_provider requirement because they are wiring the cycle work
+    # themselves and may not need the real team_cycle_executor at all.
+    executor_was_injected = cycle_executor is not None
     if cycle_executor is None:
-        cycle_executor = default_executor
+        if mode == "team":
+            from scripts.team_executor import team_cycle_executor
+
+            cycle_executor = team_cycle_executor
+        else:
+            cycle_executor = default_executor
 
     # 1. Resolve project
     project = get_project_by_url(db_path, git_url)
@@ -205,6 +234,27 @@ def orchestrate_run(
         raise RuntimeError(
             f"No project registered for {git_url!r}. Register it first:\n"
             f"  python3 scripts/project.py register {git_url}"
+        )
+
+    # 1b. Bridge guard — team mode without a tools_provider would crash deep
+    # inside `team_cycle_executor`'s preflight (tools is None →
+    # TeamToolsUnavailableError) AFTER cloning, seeding atelier, branching,
+    # and creating a run row. Fire here so the failure leaves NO side
+    # effects on disk or in the DB.
+    #
+    # The guard ONLY fires when the caller did NOT inject their own
+    # `cycle_executor`. Explicit-executor callers (tests, custom drivers)
+    # are wiring the cycle themselves; for them the tools_provider is
+    # optional and the existing 4-positional-arg signature still works.
+    # This preserves backward compatibility with every existing call site
+    # that injects a stub executor for `mode='team'` to test mode plumbing.
+    if mode == "team" and tools_provider is None and not executor_was_injected:
+        raise ValueError(
+            "mode='team' requires a tools_provider callable to construct the "
+            "TeamTools wrapper for each cycle. Without it, team_cycle_executor "
+            "crashes deep inside the cycle. Pass "
+            "tools_provider=lambda clone_dir, project, run_row, cycle_n: ... "
+            "or use mode='subagent' instead."
         )
 
     # 2. Clone target
@@ -242,7 +292,16 @@ def orchestrate_run(
     try:
         for cycle_n in range(1, cycles_requested + 1):
             cycle_started = _now()
-            outcome = cycle_executor(experiment_dir, project, run_row, cycle_n)
+            # Team mode threads a per-cycle TeamTools wrapper into the
+            # executor via the `tools=` kwarg. Subagent mode preserves the
+            # 4-positional-arg call signature for backward compatibility
+            # with any existing executor callable (including the default
+            # `scripts.cycle.execute_cycle`).
+            if mode == "team" and tools_provider is not None:
+                tools = tools_provider(experiment_dir, project, run_row, cycle_n)
+                outcome = cycle_executor(experiment_dir, project, run_row, cycle_n, tools=tools)
+            else:
+                outcome = cycle_executor(experiment_dir, project, run_row, cycle_n)
 
             if outcome.get("status") == "success":
                 record_cycle_success(
@@ -256,6 +315,27 @@ def orchestrate_run(
                 )
                 cycles_succeeded += 1
             elif outcome.get("status") == "abandoned":
+                # Fail-loud allowlist guards: the schema CHECK constraints
+                # (migration 004) only permit specific values for phase_reached
+                # and reason. ANY out-of-set value (None, "unknown", "bogus",
+                # typos) would crash later with sqlite3.IntegrityError at
+                # INSERT INTO abandonments time, *after* the cycle's work was
+                # already done. Validating against the canonical frozensets
+                # imported from scripts.abandonment guarantees we fail before
+                # any DB write and that the error message names both the
+                # offending cycle and the full set of legal values.
+                phase_reached = outcome.get("phase_reached")
+                reason = outcome.get("reason")
+                if phase_reached not in VALID_PHASES:
+                    raise ValueError(
+                        f"cycle {cycle_n} outcome has invalid 'phase_reached'={phase_reached!r}; "
+                        f"valid values per migration 004: {sorted(VALID_PHASES)}"
+                    )
+                if reason not in VALID_REASONS:
+                    raise ValueError(
+                        f"cycle {cycle_n} outcome has invalid 'reason'={reason!r}; "
+                        f"valid values per migration 004: {sorted(VALID_REASONS)}"
+                    )
                 cycle_row = record_cycle_abandoned(
                     db_path=db_path,
                     run_id=run_row["id"],
@@ -272,10 +352,18 @@ def orchestrate_run(
                     cycle_n=cycle_n,
                     subject=outcome.get("subject", subject),
                     participants=outcome.get("participants", []),
-                    phase_reached=outcome.get("phase_reached", "unknown"),
-                    reason=outcome.get("reason", "other"),
+                    phase_reached=phase_reached,
+                    reason=reason,
                     detail=outcome.get("detail", ""),
                     artifacts=outcome.get("artifacts", []),
+                    # Phase 5b' review-loop fields — only populated by the
+                    # cycle executor when reason='review_unrecoverable'.
+                    # Defaulting to None preserves legacy abandonment shape
+                    # for all other reasons.
+                    review_iteration_count=outcome.get("review_iteration_count"),
+                    unresolved_findings=outcome.get("unresolved_findings"),
+                    convergence_summary=outcome.get("convergence_summary"),
+                    reviewer_attribution=outcome.get("reviewer_attribution"),
                 )
                 abandonment_rows.append(ab_row)
                 cycles_abandoned += 1
@@ -318,6 +406,7 @@ def orchestrate_run(
             "abandonments": abandonment_rows,
             "status": "failed",
             "error": str(push_exc),
+            "mode": mode,
             "run": finalized,
         }
 
@@ -345,6 +434,7 @@ def orchestrate_run(
         "cycles": list_cycles(db_path, run_row["id"]),
         "abandonments": abandonment_rows,
         "status": "complete",
+        "mode": mode,
         "run": finalized,
     }
 
@@ -354,7 +444,10 @@ def orchestrate_run(
 
 def main(argv: list[str]) -> int:
     if not argv or argv[0] != "orchestrate":
-        print('Usage: run.py orchestrate <git-url> [--cycles N] [--subject "..."]', file=sys.stderr)
+        print(
+            'Usage: run.py orchestrate <git-url> [--cycles N] [--subject "..."] [--mode subagent|team]',
+            file=sys.stderr,
+        )
         return 1
 
     rest = argv[1:]
@@ -365,6 +458,7 @@ def main(argv: list[str]) -> int:
     git_url = rest[0]
     cycles = 1
     subject = None
+    mode = "subagent"
     i = 1
     while i < len(rest):
         if rest[i] == "--cycles" and i + 1 < len(rest):
@@ -372,6 +466,12 @@ def main(argv: list[str]) -> int:
             i += 2
         elif rest[i] == "--subject" and i + 1 < len(rest):
             subject = rest[i + 1]
+            i += 2
+        elif rest[i] == "--mode" and i + 1 < len(rest):
+            mode = rest[i + 1]
+            if mode not in ("subagent", "team"):
+                print(f"--mode must be 'subagent' or 'team', got: {mode!r}", file=sys.stderr)
+                return 1
             i += 2
         else:
             print(f"Unknown arg: {rest[i]!r}", file=sys.stderr)
@@ -385,6 +485,7 @@ def main(argv: list[str]) -> int:
         git_url=git_url,
         cycles_requested=cycles,
         subject=subject,
+        mode=mode,
     )
     # Path objects aren't JSON serialisable
     result = {k: (str(v) if isinstance(v, Path) else v) for k, v in result.items()}

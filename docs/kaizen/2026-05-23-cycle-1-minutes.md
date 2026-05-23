@@ -1,73 +1,54 @@
-# Kaizen Run 5 Cycle 1 Meeting — kaizen (self-improvement)
+# Cycle 1 Minutes — Run 18
 
-**Date:** 2026-05-23 01:07 UTC
-**Facilitator:** Dr. Priya Nair (PM)
-**Subject:** kaizen orchestration ergonomics — 3 named items
-**Status:** consensus reached after 2 safety hard-stops materially reshaped items 1 and 3; 5 Action Items approved unanimously
+- **Date:** 2026-05-23
+- **Subject:** Tidy 7 soft residuals from runs 15-17 (cosmetic + robustness polish; no behavior change)
+- **Participants:** Akira Sato (backend-engineer-1), Mei Tanaka (sdet-1, independent reviewer)
+- **Status:** success
+- **Fix-loop iterations:** 1 (reviewer returned READY TO COMMIT on first pass — 0 blockers, 0 majors)
 
-## Participants
+## Context
 
-| Agent | Role |
-|---|---|
-| Dr. Samuel Okafor | Software Engineer (Backend) |
-| Dr. Fatima Al-Rashid | AI Safety Researcher |
-| Dr. Nadia Petrov | Agent Systems Architect |
+After the team-mode arc (runs 14-17) shipped, several small residuals were deferred — silent fallbacks, undocumented semantics, dead code, dead kwargs, narrow validation, missing CI guard, signature inconsistency. None blocking, all bounded, ideal for a single cleanup cycle.
 
-## PM Assessment (subject-directed)
+## Decisions
 
-User-specified 3 items targeting kaizen's own orchestration:
-1. Phase 5b should mirror target-repo CI (run ruff + format + tests, not just tests). Run 4 atelier#22 ruff-failed because Phase 5b only ran pytest.
-2. Phase 5d `memex:run capture` is no-op. 3 orphan `.ai/wiki/kaizen-cycle-*-1.md` files have accumulated in the host kaizen repo.
-3. Step 10 teardown is unconditional. Run 4's CI failure required a fresh git clone from remote to push the recovery commit.
+The 7 items shipped exactly as specified:
 
-## Discussion
+1. **`_find_owner_for_finding` PM-fallback now warns** — `logging.getLogger(__name__).warning(...)` fires when a finding's file maps to no owner, naming both the unowned file AND the responsible reviewer. Was silent.
+2. **`phase_5b_prime_pm_acceptance` docstring expanded** — explicitly states that responses NOT starting with `ACCEPT` (case-insensitive after strip) are treated as REJECT, including `ABANDON:` prefixes. The PM cannot signal cycle-abandonment from this prompt; that's a Phase 1-4 signal.
+3. **Dead `except FixLoopExhausted` block removed** from `scripts/team_executor.py`. Unreachable because `should_continue` returns False BEFORE `start_iteration` would raise. Comment added explaining the contract. Unused `FixLoopExhausted` import dropped.
+4. **`results` kwarg dropped from `phase_5b_ci_failure`** — was validated but never rendered into output. Caller in team_executor.py updated; prior tests stripped of the obsolete kwarg.
+5. **`_require` empty-rejection extended to `tuple` and `set`** — was only `list`/`dict`/`str`. Now `(list, dict, str, tuple, set)`. Two new tests pin the "empty" substring in the error message.
+6. **NEW `tests/test_dispatch_templates_byte_identity.py`** — 10 golden tests (one per template) pinning byte-exact output for canonical fixtures. Wire-protocol drift now LOUD instead of silent. The goldens are plain string literals — no f-string interpolation hazard. This is the **most valuable item long-term**: prevents the entire class of "template wording changed, parser silently misinterpreted" bugs.
+7. **`tools_provider` keyword-only** via `*,` in `orchestrate_run` signature. All 15 callers already used kwarg form; pytest confirms no breakage.
 
-**Item 1 (CI mirror)**:
-- Backend proposed `run_target_ci_locally` extending `scripts/test_runner.py`.
-- **Architect rebuttal**: `test_runner.py`'s contract is "run a test command + count passes" — lint tools are not test runners. Recommend a NEW `scripts/ci_runner.py` to preserve single-responsibility.
-- **Safety hard-stop FM1.2**: hard-coding ruff produces **false-negative pass** when target uses flake8/mypy/black. The cycle would report green; target CI then fails on push.
-- **PM ruling**: New `scripts/ci_runner.py`. Probe-based detection (`_has_ruff_config()` opt-in) per Backend; warning logged when no lint config detected per Safety; test fixture covers the no-ruff path. Per Architect, defer flake8/mypy/black probes to a future cycle (current ecosystem is ruff-only).
+## Implementation
 
-**Item 2 (memex capture)**:
-- Backend identified that `memex:run` is a Claude Code skill, not a CLI binary. Subprocess auto-invoke is **architecturally impossible**.
-- Architect confirmed no `scripts/` file needs changes — pure prose fix in `internal/cycle/SKILL.md` Phase 5d.
-- Safety: Option A (manual-only) worsens ergonomics. Option B (auto-invoke) impossible. Option C (defer, honest) is the minimum acceptable.
-- **PM ruling**: Option C. Phase 5d rewritten to tell the truth — minutes are committed to the PR branch; cross-run Memex indexing is **deferred** until a future architecture allows skill invocation from subprocess. Cleanup of the 3 orphan host-side wiki files is out of scope for this cycle (host vs clone boundary).
+- **Modified:** `scripts/team_executor.py` (items 1, 3, 4-caller), `scripts/dispatch_templates.py` (items 2, 4, 5), `scripts/run.py` (item 7)
+- **Modified:** `tests/test_team_executor.py` (item 1 tests), `tests/test_dispatch_templates.py` (item 4 cleanup + items 2, 5 new tests)
+- **New:** `tests/test_dispatch_templates_byte_identity.py` (item 6 — 10 golden tests)
 
-**Item 3 (teardown)**:
-- Backend proposed conditional teardown gated on `check_pr_ci_status` polling.
-- **Safety hard-stop FM3.1/3.2/3.3**: synchronous polling blocks the user's terminal; pending-state latch leaks clones across runs; session termination leaves orphan clones permanently. None of these has a clean fix while preserving conditional teardown semantics.
-- **Safety alternative**: keep teardown **unconditional**, add an **informational-only** post-PR CI status print. User sees "CI green ✓" or "CI failing — see <url>" but the clone is gone either way; PR branch is the recovery artifact.
-- **Architect**: the CI status helper belongs next to `open_pr` in `scripts/pr.py` (symmetric with `gh pr create` ↔ `gh pr checks`), not a separate `ci_poll.py`.
-- **PM ruling**: Adopt Safety's informational-only path. Add `wait_and_report_ci(pr_url, timeout=120) -> str` to `scripts/pr.py`. SKILL.md Step 10 keeps unconditional teardown; new Step 10.5 prints the CI status report before the final summary.
+## Fix-loop iteration history
 
-**Self-improvement meta (Safety F4)**: every change in this cycle modifies the very SKILL.md files the NEXT kaizen-on-kaizen cycle will read. **Mandatory guard**: new tests must exercise the new Phase 5b helper with a no-ruff-config fixture AND assert teardown still runs unconditionally.
+**Iteration 1:** all 7 items shipped + 15 new tests. Test count 384 → 399.
 
-## Decisions Log
+**Independent review (Mei Tanaka, SDET):** all 7 invariants VERIFIED with file:line proof. Reviewer ran a script to re-render each template and confirm byte-equality with the goldens; confirmed via grep that no caller still passes the removed `results=` kwarg; confirmed via pytest that the 8 Phase 5b' fix-loop tests still pass after the dead-except removal; confirmed all 15 positional-vs-kwarg call sites use kwarg form. 0 BLOCKERS, 0 MAJORS, 1 informational minor (`frozenset` not in empty-rejection list but no current template uses it). **READY TO COMMIT** on first pass.
 
-- **D1.** Item 1 helper lives in NEW `scripts/ci_runner.py`. Probe-based ruff detection. Warning when no lint config. (Unanimous after Architect/Safety overrode Backend's test_runner.py placement.)
-- **D2.** Item 2: Option C — Phase 5d prose tells the truth. No auto-invoke attempted. Host-side wiki cleanup deferred. (Unanimous after Backend confirmed architectural impossibility of Option B.)
-- **D3.** Item 3: teardown stays unconditional. Add `wait_and_report_ci` to `scripts/pr.py` as informational-only print. SKILL.md Step 10 unchanged; new Step 10.5 inserted. (Unanimous after Safety hard-stopped conditional teardown.)
-- **D4.** Phase 5b SKILL.md prose adds per-check routing — ruff format failures route to a formatter dispatch (`ruff format .` + recommit), test failures route to the implementer + test expert. (Architect's recommendation.)
-- **D5.** Risk classification: NON-DESTRUCTIVE. New file (ci_runner.py), additive function (wait_and_report_ci), prose-only SKILL.md edits. No existing code or tests removed.
-- **D6.** Mandatory test additions per Safety F4: (a) `test_ci_runner.py::test_no_ruff_config_skips_lint_with_warning`, (b) `test_ci_runner.py::test_ruff_config_runs_check_and_format`, (c) `test_pr.py::test_wait_and_report_ci_returns_status_string` with `gh` mocked.
+## What this unlocks
 
-## Action Items
+The team-mode arc (runs 14-18) is now in a tidy, robust state:
+- Substrate (PR#23): lifecycle skeleton + frozensets + dag.py + fix_loop.py + reviewers.py
+- Real Phase 1-5c (PR#24 cycle 1)
+- Dispatch templates + wrapper (PR#24 cycle 2)
+- Integration bridge (PR#25 cycle 1)
+- Reference subclass + E2E test (PR#25 cycle 2)
+- **Polish (this PR): warnings + docstrings + dead-code removal + byte-identity guard + signature consistency**
 
-| # | Action | Files |
-|---|---|---|
-| AI-1 | New `scripts/ci_runner.py::run_ci_checks(clone_dir, test_command)` returning `(all_passed, results_dict)` | `scripts/ci_runner.py` (new) |
-| AI-2 | `internal/cycle/SKILL.md` Phase 5b: replace `run_tests_in_clone` call with `ci_runner.run_ci_checks`; add per-check routing prose | `internal/cycle/SKILL.md` |
-| AI-3 | `internal/cycle/SKILL.md` Phase 5d: rewrite to Option C truth (deferred manual capture; minutes in git) | `internal/cycle/SKILL.md` |
-| AI-4 | `scripts/pr.py`: add `wait_and_report_ci(pr_url, timeout_seconds=120) -> str` (informational only — returns formatted status string for the orchestrator to print) | `scripts/pr.py` |
-| AI-5 | `internal/run/SKILL.md`: keep Step 10 (teardown unconditional). Insert new Step 10.5 calling `wait_and_report_ci` and surfacing its result. | `internal/run/SKILL.md` |
-| AI-6 | Tests for AI-1: `tests/test_ci_runner.py` (3 tests including no-ruff-config + ruff-config-present) | `tests/test_ci_runner.py` (new) |
-| AI-7 | Tests for AI-4: `tests/test_pr.py` add `test_wait_and_report_ci_returns_status_string` mocking `gh` | `tests/test_pr.py` |
+The wire-protocol byte-identity test (item 6) is the standing guard for all future template edits.
 
-**Total files touched:** 6 + minutes (= 7). All NON-DESTRUCTIVE.
+## Residual (genuinely none worth tracking)
 
-## Cycle outcome
+- `frozenset` not in `_require`'s empty-rejection — informational, no template uses it
+- The team-mode dogfood architectural question (Python → CC tool bridge) remains genuinely unresolved — but that's a CC platform-level question, not a kaizen-codebase issue
 
-Status: PROCEED to Phase 4.
-Approved Action Items: 7.
-Risk: NON-DESTRUCTIVE.
+The meta-improvement-of-kaizen arc is at a natural closeout point.

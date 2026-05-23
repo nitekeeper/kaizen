@@ -54,6 +54,8 @@ Read `internal/run-record/SKILL.md` and follow its `create` operation with `(pro
 
 ### Step 6 — Cycle loop (skip-and-continue)
 
+> **Team mode note.** When `mode='team'`, `scripts.run.orchestrate_run` requires a `tools_provider=Callable[[Path, dict, dict, int], TeamTools]` kwarg. It is invoked once per cycle to build the per-cycle `TeamTools` wrapper (typically an `AgentTeamsWrapper` subclass) and the wrapper is threaded into `team_cycle_executor` as a keyword-only `tools=` argument. Without it, `orchestrate_run` raises `ValueError` containing both `tools_provider` and `mode='team'` BEFORE any clone / seed / branch / run-row side effect — i.e. the run fails fast and leaves no garbage. Subagent mode silently ignores `tools_provider`. See `internal/cycle/SKILL.md` for the wrapper pattern and `scripts/team_tools_wrapper.py::AgentTeamsWrapper` for the base class.
+
 For each `cycle_n` in `1..cycles_requested`:
 
 1. Read `internal/cycle/SKILL.md` and follow its procedure with context `(clone_dir, project, run_row, cycle_n)`. The skill returns an outcome dict.
@@ -91,7 +93,7 @@ For each `cycle_n` in `1..cycles_requested`:
    "
    ```
 
-   Then read `internal/abandonment-report/SKILL.md` and follow its procedure with `(project, run_id, cycle_id=<row id from above>, cycle_n, subject, participants, phase_reached, reason, detail, artifacts)` from `outcome`.
+   Then read `internal/abandonment-report/SKILL.md` and follow its procedure with `(project, run_id, cycle_id=<row id from above>, cycle_n, subject, participants, phase_reached, reason, detail, artifacts, review_iteration_count, unresolved_findings, convergence_summary, reviewer_attribution)` from `outcome`. The last 4 fields are only present when `reason='review_unrecoverable'` (Phase 5b' fix-loop exhaustion) — for every other abandonment reason they should be omitted (or passed as `None`), and the rendered report falls back to the legacy shape.
 
    Increment a running `cycles_abandoned` counter. **Do NOT stop the loop.**
 4. **If `outcome["status"]` is anything else:** abort the run with a loud error — the cycle executor returned malformed output.

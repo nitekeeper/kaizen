@@ -16,8 +16,8 @@ Backed entirely by `scripts/abandonment.py` (which exposes `format_report`, `rec
 - `cycle_n` (int)
 - `subject` (str | None)
 - `participants` (list[str]) — agent names.
-- `phase_reached` (str) — one of `agenda`, `meeting`, `implementation`, `test`, `push`.
-- `reason` (str) — one of `no_consensus`, `destructive_rejected`, `tests_unrecoverable`, `other`.
+- `phase_reached` (str) — one of `agenda`, `meeting`, `implementation`, `test`, `review`, `push`. Use `review` for Phase 5b' fix-loop exhaustion (the independent-reviewer review-fix loop hit its max 5 iterations with unresolved findings); `push` is reserved for run-level push failures emitted by `internal/run/SKILL.md` Step 7.
+- `reason` (str) — one of `no_consensus`, `destructive_rejected`, `tests_unrecoverable`, `review_unrecoverable`, `other`. Use `review_unrecoverable` when the Phase 5b' independent-reviewer fix loop exhausts its maximum 5 iterations with unresolved issues.
 - `detail` (str) — free-text. What was attempted, what blocked it, what the next session should reconsider.
 - `artifacts` (list[str]) — slugs or paths of partial proposals, test logs, etc.
 
@@ -122,6 +122,19 @@ print(json.dumps(row, default=str))
 
 In practice the `process_abandonment` single-call path is what `internal/run/SKILL.md` invokes; the step-by-step is documented for debugging.
 
+### Review-loop structured fields (Phase 5b' only)
+
+For `reason='review_unrecoverable'` abandonments produced by the Phase 5b' independent-reviewer fix loop, pass four additional keyword arguments to `process_abandonment` (or `record_abandonment` / `format_report`):
+
+- `review_iteration_count` (int) — how many fix-loop iterations actually ran (max 5).
+- `unresolved_findings` (list[dict]) — final unresolved issues, each `{reviewer, severity, finding, file_line}`. JSON-serialised in the DB; deserialised on read.
+- `convergence_summary` (str) — one-paragraph explanation of why the fix loop couldn't converge.
+- `reviewer_attribution` (dict) — `{finding_id: reviewer_role_id}` mapping linking each finding to the reviewer who raised it. JSON-serialised in the DB; deserialised on read.
+
+All four default to `None` (omitted from the markdown report). Populate them ONLY for `review_unrecoverable`. For all other abandonment reasons, leave them unset — the rendered markdown will be identical to the legacy shape.
+
+The authoritative contract is the `record_abandonment` / `process_abandonment` signatures in `scripts/abandonment.py`.
+
 ## Report format (reference)
 
 `format_report` emits the canonical design §4.5 shape:
@@ -154,5 +167,5 @@ Do not edit this format ad hoc — it is the contract `format_report` enforces a
 
 - **Slug format is fixed:** `kaizen:abandonment:<run_id>-cycle-<n>`. Anything else breaks cross-referencing in PR bodies and `memex ask` queries.
 - **The caller's `memex:run capture` is best-effort.** If the wiki write or the skill invocation fails, the abandonment row is still recorded with the slug stored — the report can be re-ingested by the user later. Never let a missing memex plugin block abandonment recording.
-- **`phase_reached` and `reason` come from the cycle's structured outcome.** Do not invent values. If the cycle did not provide them, use `phase_reached="unknown"` and `reason="other"`.
+- **`phase_reached` and `reason` come from the cycle's structured outcome.** Do not invent values. If the cycle did not provide them, the orchestrator (`scripts/run.py::orchestrate_run`) MUST raise `ValueError` *before* invoking this skill. Do not implement a fallback inside `process_abandonment` or `record_abandonment` — by the time control reaches the DB layer, the CHECK has already fired and the cycle's work is lost. The valid enums are mirrored in `scripts/abandonment.py::VALID_PHASES` and `VALID_REASONS` — keep them in sync with `migrations/004`.
 - **The `cycles` row must already exist** when this skill is invoked. The orchestrator inserts it (with `status='abandoned'`) before calling this skill — `abandonments.cycle_id` references that row.

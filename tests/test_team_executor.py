@@ -1165,3 +1165,67 @@ class TestPhase5BPrimeMajorFixes:
             "team_executor still defines a local _BLOCKING constant — remove it "
             "and use _BLOCKING_SEVERITIES instead (Major 4)"
         )
+
+
+# ── _find_owner_for_finding unowned-file warning ──────────────────────────
+
+
+def test_find_owner_for_finding_logs_warning_when_file_unowned(caplog):
+    """Item 1: when a finding's file maps to no owner, fall back to PM and
+    emit a logging.warning naming BOTH the unowned file and the responsible
+    reviewer so an operator can audit the routing decision after the fact.
+    """
+    import logging
+
+    from scripts.fix_loop import Finding
+    from scripts.team_executor import _find_owner_for_finding
+
+    f = Finding(
+        finding_id="R1-9",
+        reviewer="security-engineer-7",
+        severity="blocker",
+        finding="unowned cross-cutting issue",
+        file_line="scripts/orphan_file.py:42",
+    )
+    file_to_owner = {"scripts/owned.py": "backend-engineer-1"}
+
+    with caplog.at_level(logging.WARNING, logger="scripts.team_executor"):
+        owner = _find_owner_for_finding(f, file_to_owner, pm="pm-1")
+
+    assert owner == "pm-1"
+    # The warning text must name BOTH the reviewer who flagged the finding
+    # AND the unowned file path so the routing decision is auditable.
+    warnings = [rec.getMessage() for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert any("security-engineer-7" in w for w in warnings), (
+        f"warning must name the reviewer; got: {warnings}"
+    )
+    assert any("scripts/orphan_file.py" in w for w in warnings), (
+        f"warning must name the unowned file; got: {warnings}"
+    )
+
+
+def test_find_owner_for_finding_does_not_warn_when_file_owned(caplog):
+    """Item 1 negative: when the file IS owned, no warning fires (we don't
+    want log noise on the happy path).
+    """
+    import logging
+
+    from scripts.fix_loop import Finding
+    from scripts.team_executor import _find_owner_for_finding
+
+    f = Finding(
+        finding_id="R1-1",
+        reviewer="security-engineer-1",
+        severity="blocker",
+        finding="x",
+        file_line="scripts/owned.py:1",
+    )
+    file_to_owner = {"scripts/owned.py": "backend-engineer-1"}
+
+    with caplog.at_level(logging.WARNING, logger="scripts.team_executor"):
+        owner = _find_owner_for_finding(f, file_to_owner, pm="pm-1")
+
+    assert owner == "backend-engineer-1"
+    assert not any(rec.levelno == logging.WARNING for rec in caplog.records), (
+        "no warning should fire when the file IS owned"
+    )

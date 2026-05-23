@@ -1,43 +1,54 @@
-# Cycle 1 Minutes — Run 17
+# Cycle 1 Minutes — Run 18
 
 - **Date:** 2026-05-23
-- **Subject:** orchestrate_run tools_provider plumbing — bridge the team-mode integration gap
-- **Participants:** Akira Sato (backend-engineer-1), Diane Park (sdet-1, independent reviewer)
+- **Subject:** Tidy 7 soft residuals from runs 15-17 (cosmetic + robustness polish; no behavior change)
+- **Participants:** Akira Sato (backend-engineer-1), Mei Tanaka (sdet-1, independent reviewer)
 - **Status:** success
-- **Fix-loop iterations:** 1 (reviewer found 0 blockers + 0 majors on first pass)
+- **Fix-loop iterations:** 1 (reviewer returned READY TO COMMIT on first pass — 0 blockers, 0 majors)
 
 ## Context
 
-After PR#24, team-mode had all the substrate (lifecycle skeleton, real Phase 1-5c orchestration, dispatch templates, AgentTeamsWrapper base class) but `scripts/run.py::orchestrate_run` had no way to thread a `TeamTools` wrapper into `team_cycle_executor`. Every `--mode team` invocation crashed at the `tools is None` preflight, AFTER `create_run` + clone + seed + branch had already executed (garbage on disk + an orphan run row).
+After the team-mode arc (runs 14-17) shipped, several small residuals were deferred — silent fallbacks, undocumented semantics, dead code, dead kwargs, narrow validation, missing CI guard, signature inconsistency. None blocking, all bounded, ideal for a single cleanup cycle.
 
 ## Decisions
 
-1. **`orchestrate_run` gains a `tools_provider` kwarg** — `Callable[[Path, dict, dict, int], TeamTools] | None`. When `mode='team'` and provider is set, invoked once per cycle and the result is threaded into `cycle_executor` via the existing `tools=` kwarg.
-2. **Fail-fast guard BEFORE any side effect** — when `mode='team'` AND `tools_provider is None` AND no explicit `cycle_executor` was injected: raise `ValueError` after project resolution but BEFORE clone/seed/branch/run-row. No garbage left on disk or in the DB. Error message names both `'tools_provider'` and `'mode=team'` so the fix is obvious.
-3. **Subagent mode unchanged** — `tools_provider` is ignored when `mode='subagent'`. All 365 prior tests pass unchanged.
-4. **Defense-in-depth preserved** — `team_cycle_executor`'s own `tools is None → TeamToolsUnavailableError` guard stays AS-IS. Anyone calling the executor directly (bypassing `orchestrate_run`) still gets a clear error.
-5. **Guard skipped when explicit cycle_executor injected** — principled deviation: tests injecting their own executor are bypassing `team_cycle_executor` entirely, so the wrapper is irrelevant. Reviewer verified by grep that no production caller hits this path; CLI `main()` never passes `cycle_executor`.
+The 7 items shipped exactly as specified:
+
+1. **`_find_owner_for_finding` PM-fallback now warns** — `logging.getLogger(__name__).warning(...)` fires when a finding's file maps to no owner, naming both the unowned file AND the responsible reviewer. Was silent.
+2. **`phase_5b_prime_pm_acceptance` docstring expanded** — explicitly states that responses NOT starting with `ACCEPT` (case-insensitive after strip) are treated as REJECT, including `ABANDON:` prefixes. The PM cannot signal cycle-abandonment from this prompt; that's a Phase 1-4 signal.
+3. **Dead `except FixLoopExhausted` block removed** from `scripts/team_executor.py`. Unreachable because `should_continue` returns False BEFORE `start_iteration` would raise. Comment added explaining the contract. Unused `FixLoopExhausted` import dropped.
+4. **`results` kwarg dropped from `phase_5b_ci_failure`** — was validated but never rendered into output. Caller in team_executor.py updated; prior tests stripped of the obsolete kwarg.
+5. **`_require` empty-rejection extended to `tuple` and `set`** — was only `list`/`dict`/`str`. Now `(list, dict, str, tuple, set)`. Two new tests pin the "empty" substring in the error message.
+6. **NEW `tests/test_dispatch_templates_byte_identity.py`** — 10 golden tests (one per template) pinning byte-exact output for canonical fixtures. Wire-protocol drift now LOUD instead of silent. The goldens are plain string literals — no f-string interpolation hazard. This is the **most valuable item long-term**: prevents the entire class of "template wording changed, parser silently misinterpreted" bugs.
+7. **`tools_provider` keyword-only** via `*,` in `orchestrate_run` signature. All 15 callers already used kwarg form; pytest confirms no breakage.
 
 ## Implementation
 
-- **Modified:** `scripts/run.py` (+44/-3) — new `tools_provider` kwarg, fail-fast guard, per-cycle dispatch branch
-- **Modified:** `tests/test_run.py` (+320/-30) — 6 new tests + 1 rewritten test (`test_orchestrate_run_selects_team_executor_when_mode_team` now pins the fail-fast contract instead of the old H3 "row marked failed" behavior)
-- **Modified:** `internal/run/SKILL.md` — Step 6 callout for team-mode wrapper requirement
-- **Modified:** `skills/improve/SKILL.md` — `--mode team` wrapper-construction note
-- **Unchanged:** `scripts/team_executor.py` (defense-in-depth preserved)
+- **Modified:** `scripts/team_executor.py` (items 1, 3, 4-caller), `scripts/dispatch_templates.py` (items 2, 4, 5), `scripts/run.py` (item 7)
+- **Modified:** `tests/test_team_executor.py` (item 1 tests), `tests/test_dispatch_templates.py` (item 4 cleanup + items 2, 5 new tests)
+- **New:** `tests/test_dispatch_templates_byte_identity.py` (item 6 — 10 golden tests)
 
 ## Fix-loop iteration history
 
-**Iteration 1:** 6 new tests + 1 rewritten + 4-file diff, all 7 critical invariants intact.
+**Iteration 1:** all 7 items shipped + 15 new tests. Test count 384 → 399.
 
-**Independent review (Diane Park, SDET):** verified all invariants. **0 BLOCKERS, 0 MAJORS, 3 minors** — all optional polish (keyword-only enforcement, type-hint addition, defense-in-depth mention in error message). Verdict: **READY TO COMMIT** on first pass — no fix iteration needed.
+**Independent review (Mei Tanaka, SDET):** all 7 invariants VERIFIED with file:line proof. Reviewer ran a script to re-render each template and confirm byte-equality with the goldens; confirmed via grep that no caller still passes the removed `results=` kwarg; confirmed via pytest that the 8 Phase 5b' fix-loop tests still pass after the dead-except removal; confirmed all 15 positional-vs-kwarg call sites use kwarg form. 0 BLOCKERS, 0 MAJORS, 1 informational minor (`frozenset` not in empty-rejection list but no current template uses it). **READY TO COMMIT** on first pass.
 
 ## What this unlocks
 
-The Python ↔ orchestrating-agent integration is now wired. Cycle 2 will ship a reference `AgentTeamsWrapper` subclass + end-to-end integration test that drives a full cycle through `orchestrate_run` with `mode='team'` + `tools_provider`. After cycle 2 lands, the only remaining step for true team-mode dogfood is the orchestrating Claude session writing a one-time `AgentTeamsWrapper` subclass that wraps its own `TeamCreate`/`SendMessage`/`TeamDelete` tool calls.
+The team-mode arc (runs 14-18) is now in a tidy, robust state:
+- Substrate (PR#23): lifecycle skeleton + frozensets + dag.py + fix_loop.py + reviewers.py
+- Real Phase 1-5c (PR#24 cycle 1)
+- Dispatch templates + wrapper (PR#24 cycle 2)
+- Integration bridge (PR#25 cycle 1)
+- Reference subclass + E2E test (PR#25 cycle 2)
+- **Polish (this PR): warnings + docstrings + dead-code removal + byte-identity guard + signature consistency**
 
-## Residual (minor — deferred per reviewer)
+The wire-protocol byte-identity test (item 6) is the standing guard for all future template edits.
 
-- `tools_provider` is `POSITIONAL_OR_KEYWORD` (not keyword-only via `*,`). All real callers use kwargs; tightening would be a deliberate API-breaking decision.
-- Type hint on `tools_provider` could be added (`Callable[[Path, dict, dict, int], TeamTools] | None`) but the surrounding signature has no hints either.
-- ValueError message doesn't mention the defense-in-depth guard in `team_cycle_executor`. Not needed for the caller to fix.
+## Residual (genuinely none worth tracking)
+
+- `frozenset` not in `_require`'s empty-rejection — informational, no template uses it
+- The team-mode dogfood architectural question (Python → CC tool bridge) remains genuinely unresolved — but that's a CC platform-level question, not a kaizen-codebase issue
+
+The meta-improvement-of-kaizen arc is at a natural closeout point.

@@ -170,6 +170,7 @@ def orchestrate_run(
     subject: str | None = None,
     cycle_executor=None,
     mode: str = "subagent",
+    *,
     tools_provider=None,
 ) -> dict:
     """Full multi-cycle orchestration. See module docstring for the flow.

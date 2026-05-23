@@ -93,6 +93,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import logging
 import os
 import re
 import subprocess
@@ -118,7 +119,6 @@ from scripts.dispatch_templates import (
 from scripts.fix_loop import (
     _BLOCKING_SEVERITIES,
     Finding,
-    FixLoopExhausted,
     FixLoopState,
     build_abandonment_outcome,
     record_findings,
@@ -126,6 +126,8 @@ from scripts.fix_loop import (
     start_iteration,
 )
 from scripts.reviewers import InsufficientRosterError, select_reviewers
+
+_log = logging.getLogger(__name__)
 
 
 class TeamToolsUnavailableError(RuntimeError):
@@ -361,7 +363,16 @@ def _find_owner_for_finding(
     """
     raw = finding.file_line or ""
     file = raw.split(":", 1)[0] if ":" in raw else raw
-    return file_to_owner.get(file, pm)
+    owner = file_to_owner.get(file)
+    if owner is None:
+        _log.warning(
+            "Phase 5b' finding from reviewer %s on unowned file %s — routing fix to PM %s",
+            finding.reviewer,
+            file,
+            pm,
+        )
+        return pm
+    return owner
 
 
 # ── Outcome helpers ────────────────────────────────────────────────────────
@@ -653,7 +664,6 @@ def team_cycle_executor(
                         detail=phase_5b_ci_failure(
                             wave_n=wave_n,
                             failed_checks=failed,
-                            results=results,
                         ),
                     )
                     break
@@ -691,21 +701,12 @@ def team_cycle_executor(
                 else:
                     state = FixLoopState()
                     review_outcome: dict | None = None
+                    # FixLoopExhausted is unreachable here because
+                    # should_continue returns False at iteration==MAX before
+                    # start_iteration is called. See scripts/fix_loop.py
+                    # docstring for the contract.
                     while True:
-                        try:
-                            iter_n = start_iteration(state)
-                        except FixLoopExhausted:
-                            # Should not normally reach here — the loop body
-                            # below catches the exhaustion case explicitly so
-                            # the abandonment outcome is built with the most
-                            # recent findings recorded. Kept as a defensive
-                            # guard in case future refactors change the flow.
-                            review_outcome = build_abandonment_outcome(
-                                state,
-                                subject=subject,
-                                participants=outcome_acc.participants,
-                            )
-                            break
+                        iter_n = start_iteration(state)
                         # Carry forward the previous round's findings so
                         # iteration 2+ reviewers do incremental review
                         # rather than a fresh scan (Major 3).

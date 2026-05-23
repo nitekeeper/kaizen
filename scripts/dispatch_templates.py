@@ -17,7 +17,7 @@ The 10 templates:
   - phase_3_debate() -> str
   - phase_3_close(proposals, agreements) -> str
   - phase_4_implementer(item, wave_n) -> str
-  - phase_5b_ci_failure(wave_n, failed_checks, results) -> str   # NEW, was inlined
+  - phase_5b_ci_failure(wave_n, failed_checks) -> str   # NEW, was inlined
   - phase_5b_prime_reviewer(iter_n, action_items, prior_findings=None) -> str
   - phase_5b_prime_fix(finding) -> str
   - phase_5b_prime_pm_acceptance(findings, iter_n) -> str
@@ -35,10 +35,11 @@ def _require(name: str, value: Any, type_: type) -> None:
 
     Raises ValueError with a clear, locator-friendly message naming the kwarg
     and (for type mismatches) both the expected and observed type+value. Empty
-    containers (list/dict/str of length 0) are rejected because every template
-    that takes a container would otherwise emit a degenerate brief (e.g. a
-    pre-analysis prompt asking the participant to address NO items). Numeric
-    types (int/bool) are NOT length-checked — `iter_n=0` is a legal value.
+    containers (list/dict/str/tuple/set of length 0) are rejected because every
+    template that takes a container would otherwise emit a degenerate brief
+    (e.g. a pre-analysis prompt asking the participant to address NO items).
+    Numeric types (int/bool) are NOT length-checked — `iter_n=0` is a legal
+    value.
     """
     if value is None:
         raise ValueError(f"dispatch_templates: required kwarg {name!r} is missing")
@@ -47,7 +48,7 @@ def _require(name: str, value: Any, type_: type) -> None:
             f"dispatch_templates: kwarg {name!r} must be {type_.__name__}, "
             f"got {type(value).__name__}={value!r}"
         )
-    if isinstance(value, (list, dict, str)) and len(value) == 0:
+    if isinstance(value, (list, dict, str, tuple, set)) and len(value) == 0:
         raise ValueError(
             f"dispatch_templates: required kwarg {name!r} is empty (got empty {type_.__name__})"
         )
@@ -127,25 +128,16 @@ def phase_4_implementer(*, item: dict, wave_n: int) -> str:
     )
 
 
-def phase_5b_ci_failure(
-    *, wave_n: int, failed_checks: list[str], results: dict | None = None
-) -> str:
+def phase_5b_ci_failure(*, wave_n: int, failed_checks: list[str]) -> str:
     """Phase 5b CI-failure routing detail message used in abandonment.
 
     Extracted from the inline CI-failure abandonment branch in
     team_executor.py Phase 4. The returned string is byte-identical to
     cycle 1's inline emission ``f"CI failed after wave {wave_n}: {failed}"``
-    so the wire protocol does not drift. `results` is accepted (and
-    validated when present) for callers that want to log the full check
-    map, but it is NOT included in the returned string.
+    so the wire protocol does not drift.
     """
     _require("wave_n", wave_n, int)
     _require("failed_checks", failed_checks, list)
-    if results is not None and not isinstance(results, dict):
-        raise ValueError(
-            "dispatch_templates: kwarg 'results' must be dict or None, "
-            f"got {type(results).__name__}={results!r}"
-        )
     return f"CI failed after wave {wave_n}: {failed_checks}"
 
 
@@ -209,6 +201,14 @@ def phase_5b_prime_pm_acceptance(*, findings: list[Finding], iter_n: int) -> str
 
     Per internal/cycle/SKILL.md the PM may rule remaining issues acceptable
     (a legitimate fix-loop exit). Reply must start with ACCEPT or REJECT.
+
+    Responses NOT starting with the literal substring ``ACCEPT``
+    (case-insensitive, after strip) are treated as REJECT by the executor.
+    This includes ``ABANDON:`` prefixes — the PM cannot signal
+    cycle-abandonment from this prompt; it only signals accept-or-reject
+    for this round's remaining findings. If a participant truly needs to
+    abandon the cycle, they do so via their Phase 1/2/3/4 message (where
+    the ``ABANDON:`` protocol IS the cycle-abandonment signal).
     """
     _require("findings", findings, list)
     _require("iter_n", iter_n, int)

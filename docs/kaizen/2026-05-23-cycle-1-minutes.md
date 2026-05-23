@@ -1,53 +1,43 @@
-# Cycle 1 Minutes — Run 16
+# Cycle 1 Minutes — Run 17
 
 - **Date:** 2026-05-23
-- **Subject:** Real Phase 1-5c orchestration in scripts/team_executor.py (PR#23-deferred — flip the lifecycle skeleton into real integration)
-- **Participants:** Akira Sato (backend-engineer-1), Marcus Holbrook (agent-systems-architect-1, independent reviewer)
+- **Subject:** orchestrate_run tools_provider plumbing — bridge the team-mode integration gap
+- **Participants:** Akira Sato (backend-engineer-1), Diane Park (sdet-1, independent reviewer)
 - **Status:** success
-- **Fix-loop iterations:** 2 (initial passed all 7 critical invariants but a category-error in fix-routing slipped through; iter 2 fixed it + 3 contract gaps)
+- **Fix-loop iterations:** 1 (reviewer found 0 blockers + 0 majors on first pass)
 
 ## Context
 
-PR#23's cycle 4 shipped the team_executor as a **lifecycle skeleton** — team_create → single send_message → team_delete in finally. The Phase 1-5c semantics were explicitly deferred. This cycle assembles the 4 substrate helpers (dag.py + fix_loop.py + reviewers.py + ci_runner.py + abandonment.py's frozensets) into the real Phase 1-5c orchestration.
+After PR#24, team-mode had all the substrate (lifecycle skeleton, real Phase 1-5c orchestration, dispatch templates, AgentTeamsWrapper base class) but `scripts/run.py::orchestrate_run` had no way to thread a `TeamTools` wrapper into `team_cycle_executor`. Every `--mode team` invocation crashed at the `tools is None` preflight, AFTER `create_run` + clone + seed + branch had already executed (garbage on disk + an orphan run row).
 
 ## Decisions
 
-1. **6-phase orchestration** — Phase 1 (PM agenda) → Phase 2 (parallel pre-analysis to non-PM roster) → Phase 3 (synthesis Star→Mesh→Star with `dag.validate_dag` before posting) → Phase 4 (wave dispatch with `ci_runner.run_ci_checks` at every wave boundary) → Phase 5b' (`reviewers.select_reviewers` for disjoint review, `fix_loop` for iteration counter + PM-acceptance gate) → Phase 5c (real `commit_cycle` + `git rev-parse HEAD`).
-2. **Wire protocol documented in module docstring** — agents emit `ABANDON:` prefix for abandonment, fenced ```json``` blocks for Action Items, `[severity] file:line — text` for findings, `NO ISSUES` for empty rounds. Parsers are tolerant (garbage → empty list → clean abandonment).
-3. **Fix-round routes to Phase 4 implementer, not reviewer** — `_find_owner_for_finding(finding, file_to_owner, pm)` extracts the file from `finding.file_line` and looks up the owner via the `file_to_owner` index built at Phase 4 dispatch time. PM fallback for unowned files. This honors `internal/cycle/SKILL.md:258` ("Implementers (Owner from Phase 3 carries forward) fix all blocker + major issues").
-4. **PM acceptance gate plumbed** — after each reviewer round, `_phase_5b_prime_pm_acceptance_brief` asks PM to ACCEPT/REJECT remaining findings; case-insensitive `startswith("ACCEPT")` parse. Plumbed to `should_continue(state, pm_accepts_remaining=pm_accepts)`.
-5. **Iteration-aware reviewer brief** — `_phase_5b_prime_reviewer_brief(iter_n, action_items, prior_findings=None)` includes a "Previously unresolved findings" section on iteration 2+ so reviewers can do incremental review.
-6. **`_BLOCKING_SEVERITIES` imported from `scripts.fix_loop`** — no duplicate constants. Test uses `is` identity check to prevent drift.
-7. **`(skeleton)` sentinel removed** — `scripts/team_executor.py` no longer emits the magic string; `scripts/pr.py` special-case branch removed (dead code now). Real commit SHA flows through.
+1. **`orchestrate_run` gains a `tools_provider` kwarg** — `Callable[[Path, dict, dict, int], TeamTools] | None`. When `mode='team'` and provider is set, invoked once per cycle and the result is threaded into `cycle_executor` via the existing `tools=` kwarg.
+2. **Fail-fast guard BEFORE any side effect** — when `mode='team'` AND `tools_provider is None` AND no explicit `cycle_executor` was injected: raise `ValueError` after project resolution but BEFORE clone/seed/branch/run-row. No garbage left on disk or in the DB. Error message names both `'tools_provider'` and `'mode=team'` so the fix is obvious.
+3. **Subagent mode unchanged** — `tools_provider` is ignored when `mode='subagent'`. All 365 prior tests pass unchanged.
+4. **Defense-in-depth preserved** — `team_cycle_executor`'s own `tools is None → TeamToolsUnavailableError` guard stays AS-IS. Anyone calling the executor directly (bypassing `orchestrate_run`) still gets a clear error.
+5. **Guard skipped when explicit cycle_executor injected** — principled deviation: tests injecting their own executor are bypassing `team_cycle_executor` entirely, so the wrapper is irrelevant. Reviewer verified by grep that no production caller hits this path; CLI `main()` never passes `cycle_executor`.
 
 ## Implementation
 
-- **Rewritten:** `scripts/team_executor.py` — single send_message → 6-phase orchestration (~660 LOC of integration code)
-- **Modified:** `scripts/pr.py` — removed `(skeleton)` special case
-- **Rewritten:** `tests/test_team_executor.py` — new scripted MockTeamTools + 39 tests (was 26)
-- **Renamed:** `tests/test_pr.py::test_render_pr_body_special_cases_skeleton_commit_sha` → `test_render_pr_body_handles_missing_commit_sha` (asserts dash rendering for `sha=None`)
+- **Modified:** `scripts/run.py` (+44/-3) — new `tools_provider` kwarg, fail-fast guard, per-cycle dispatch branch
+- **Modified:** `tests/test_run.py` (+320/-30) — 6 new tests + 1 rewritten test (`test_orchestrate_run_selects_team_executor_when_mode_team` now pins the fail-fast contract instead of the old H3 "row marked failed" behavior)
+- **Modified:** `internal/run/SKILL.md` — Step 6 callout for team-mode wrapper requirement
+- **Modified:** `skills/improve/SKILL.md` — `--mode team` wrapper-construction note
+- **Unchanged:** `scripts/team_executor.py` (defense-in-depth preserved)
 
 ## Fix-loop iteration history
 
-**Iteration 1:** 12 new tests, all 7 critical invariants intact, ruff clean.
+**Iteration 1:** 6 new tests + 1 rewritten + 4-file diff, all 7 critical invariants intact.
 
-**Independent review (Marcus Holbrook, agent-systems-architect):** verified all 7 invariants. 0 blockers but **1 category error + 3 contract gaps**:
-- Major 1: fix-round sent to `finding.reviewer` instead of Phase 4 owner — direct violation of SKILL.md:258. Bug hides in mocks (MockTeamTools echoes strings without role-checking) but breaks production.
-- Major 2: `pm_accepts_remaining` hardcoded to False, eliminating a legit exit path the SKILL allows.
-- Major 3: reviewer brief identical every iteration — no incremental-review context.
-- Major 4: `_BLOCKING` duplicated, will drift from `scripts/fix_loop._BLOCKING_SEVERITIES`.
-
-**Iteration 2:** all 4 fixed in one patch. +4 tests (fix-routing, PM-acceptance, reviewer-iteration-context, `_BLOCKING_SEVERITIES` identity check). Test count 335 → 339.
-
-**Re-review:** every major VERIFIED with file:line proof. All 7 critical invariants RE-AFFIRMED. Test 1000-1006 asserts BOTH owner-is-called AND reviewer-NOT-called. PM-acceptance parse handles ACCEPT_ALL, case-insensitive, with sensible REJECT-on-non-ACCEPT semantics. Test uses `is` identity check on `_BLOCKING_SEVERITIES` (bulletproof against re-introduction). Verdict: **READY TO COMMIT**.
-
-## Residual minor (deferred — not blocking)
-
-- `_find_owner_for_finding` PM-fallback is silent (no log when reviewer flags a finding on an unowned file). Worth a follow-up.
-- PM's `"ABANDON: ..."` response in the acceptance brief is silently treated as REJECT (not escalated to cycle abandonment). Defensible; docstring should state behavior either way.
-- Windows-path `file_line` (`"C:\foo.py:10"`) would split at the drive colon. Out of scope (kaizen targets unix runners).
-- Dead `except FixLoopExhausted` defensive block — cosmetic.
+**Independent review (Diane Park, SDET):** verified all invariants. **0 BLOCKERS, 0 MAJORS, 3 minors** — all optional polish (keyword-only enforcement, type-hint addition, defense-in-depth mention in error message). Verdict: **READY TO COMMIT** on first pass — no fix iteration needed.
 
 ## What this unlocks
 
-Team-mode dogfood is now ACTUALLY viable end-to-end. The next cycle (cycle 2) ships the production `TeamTools` wrapper that wires real CC tool calls + 8 named dispatch templates so the orchestrating agent has a concrete contract to fulfill. After cycle 2 lands, a `kaizen:improve --mode team` invocation can run a real cycle against a real target.
+The Python ↔ orchestrating-agent integration is now wired. Cycle 2 will ship a reference `AgentTeamsWrapper` subclass + end-to-end integration test that drives a full cycle through `orchestrate_run` with `mode='team'` + `tools_provider`. After cycle 2 lands, the only remaining step for true team-mode dogfood is the orchestrating Claude session writing a one-time `AgentTeamsWrapper` subclass that wraps its own `TeamCreate`/`SendMessage`/`TeamDelete` tool calls.
+
+## Residual (minor — deferred per reviewer)
+
+- `tools_provider` is `POSITIONAL_OR_KEYWORD` (not keyword-only via `*,`). All real callers use kwargs; tightening would be a deliberate API-breaking decision.
+- Type hint on `tools_provider` could be added (`Callable[[Path, dict, dict, int], TeamTools] | None`) but the surrounding signature has no hints either.
+- ValueError message doesn't mention the defense-in-depth guard in `team_cycle_executor`. Not needed for the caller to fix.

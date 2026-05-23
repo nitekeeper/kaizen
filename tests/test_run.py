@@ -509,41 +509,350 @@ def test_orchestrate_run_mode_returned_in_result(db, project, tmp_path, monkeypa
 
 def test_orchestrate_run_selects_team_executor_when_mode_team(db, project, tmp_path, monkeypatch):
     """When mode='team' and no cycle_executor is injected, orchestrate_run
-    must use team_cycle_executor from scripts.team_executor.
+    must select team_cycle_executor — and require a tools_provider.
 
-    The team_cycle_executor raises TeamToolsUnavailableError when
-    CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS is absent — we intercept this at
-    the orchestrator level by confirming the exception propagates unchanged
-    (proving the correct executor was selected, not the subagent stub).
+    Previously the orchestrator selected team_cycle_executor and let it crash
+    deep inside the cycle (after clone/seed/branch/create_run side effects).
+    With the bridge-team-mode-integration-gap fix, the orchestrator now
+    raises ValueError BEFORE any of those side effects when no
+    tools_provider is supplied. This test pins the new fail-fast contract.
+    """
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+
+    # No cycle_executor injected AND no tools_provider → orchestrator raises
+    # ValueError naming both 'tools_provider' and "mode='team'".
+    with pytest.raises(ValueError) as exc_info:
+        orchestrate_run(
+            db_path=db,
+            git_url=project["git_url"],
+            cycles_requested=1,
+            mode="team",
+            # no cycle_executor — forces mode-based selection
+            # no tools_provider — triggers the bridge guard
+        )
+
+    msg = str(exc_info.value)
+    assert "tools_provider" in msg, f"error must name tools_provider; got: {msg}"
+    assert "mode='team'" in msg or "mode=team" in msg, f"error must name mode='team'; got: {msg}"
+
+    # CONTRACT CHANGE: the guard fires BEFORE create_run, so NO run row
+    # exists. This is the whole point of the bridge fix — fail fast with no
+    # garbage on disk or in the DB.
+    rows = list_runs(db, project_id=project["id"])
+    assert rows == [], f"guard must fire before create_run; got rows={rows}"
+
+
+# ── tools_provider bridging (team mode integration gap) ───────────────────
+
+
+def _success_outcome(cycle_n):
+    return {
+        "status": "success",
+        "commit_sha": f"sha-{cycle_n}",
+        "minutes_memex_slug": f"kaizen:cycle:fake-{cycle_n}",
+    }
+
+
+def test_orchestrate_run_subagent_mode_ignores_tools_provider(db, project, tmp_path, monkeypatch):
+    """mode='subagent' must NEVER invoke the tools_provider — even when one
+    is passed — and must NEVER pass `tools=` into the cycle executor.
+
+    The subagent path is the unmodified back-compat surface; legacy callers
+    that accept 4 positional args must keep working.
+    """
+    import os
+
+    from scripts.team_tools_wrapper import RecordingWrapper
+
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+    monkeypatch.setitem(os.environ, "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
+
+    provider_calls: list[tuple] = []
+
+    def provider(clone_dir, proj, run_row, cycle_n):
+        provider_calls.append((clone_dir, proj, run_row, cycle_n))
+        return RecordingWrapper()
+
+    executor_calls: list[dict] = []
+
+    def fake_executor(*args, **kwargs):
+        executor_calls.append({"args": args, "kwargs": kwargs})
+        # Match a 4-positional-arg signature exactly — no `tools` kwarg expected.
+        assert "tools" not in kwargs, (
+            f"subagent mode must not pass tools= kwarg; got kwargs={kwargs}"
+        )
+        assert len(args) == 4, (
+            f"subagent mode must call executor with 4 positional args; got {args}"
+        )
+        return _success_outcome(args[3])
+
+    result = orchestrate_run(
+        db_path=db,
+        git_url=project["git_url"],
+        cycles_requested=2,
+        cycle_executor=fake_executor,
+        mode="subagent",
+        tools_provider=provider,
+    )
+
+    assert result["status"] == "complete"
+    assert result["cycles_succeeded"] == 2
+    # Provider is NEVER invoked in subagent mode.
+    assert provider_calls == [], (
+        f"tools_provider must not be invoked in subagent mode; got {provider_calls}"
+    )
+    # Executor was called once per cycle, all-positional.
+    assert len(executor_calls) == 2
+
+
+def test_orchestrate_run_team_mode_without_tools_provider_raises(
+    db, project, tmp_path, monkeypatch
+):
+    """mode='team' + tools_provider=None must raise ValueError naming both
+    'tools_provider' and 'mode=team' BEFORE any run row is created.
     """
     import os
 
     _install_orchestrator_stubs(monkeypatch, tmp_path)
+    monkeypatch.setitem(os.environ, "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
 
-    # Ensure the env var is absent so team_cycle_executor fails fast.
-    env_without_teams = {
-        k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"
-    }
-    with monkeypatch.context() as m:
-        m.setattr(os, "environ", env_without_teams)
-        from scripts.team_executor import TeamToolsUnavailableError
+    runs_before = list_runs(db, project_id=project["id"])
 
-        with pytest.raises((TeamToolsUnavailableError, RuntimeError)):
-            # No cycle_executor injected → orchestrator selects team_cycle_executor.
-            # That raises TeamToolsUnavailableError → orchestrator catches Exception
-            # and finalizes run as 'failed' before re-raising.
-            orchestrate_run(
-                db_path=db,
-                git_url=project["git_url"],
-                cycles_requested=1,
-                mode="team",
-                # no cycle_executor — forces mode-based selection
-            )
+    with pytest.raises(ValueError) as exc_info:
+        orchestrate_run(
+            db_path=db,
+            git_url=project["git_url"],
+            cycles_requested=1,
+            mode="team",
+            tools_provider=None,
+        )
 
-    # The run row must have been finalised as 'failed' (H3 guard in orchestrate_run).
-    rows = list_runs(db, project_id=project["id"])
-    assert len(rows) == 1
-    assert rows[0]["status"] == "failed"
+    msg = str(exc_info.value)
+    assert "tools_provider" in msg, f"error must mention 'tools_provider'; got: {msg}"
+    assert "mode='team'" in msg or "mode=team" in msg, f"error must mention mode='team'; got: {msg}"
+
+    # No new runs row was created — the guard fired before create_run.
+    runs_after = list_runs(db, project_id=project["id"])
+    assert len(runs_after) == len(runs_before), (
+        f"guard must fire BEFORE create_run; runs went from {len(runs_before)} → {len(runs_after)}"
+    )
+
+
+def test_orchestrate_run_team_mode_without_tools_provider_raises_before_clone(
+    db, project, tmp_path, monkeypatch
+):
+    """The team-mode-without-provider guard must fire BEFORE clone_repo,
+    seed_all, or create_branch run. None of those side effects may
+    materialise on disk.
+    """
+    import os
+
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+    monkeypatch.setitem(os.environ, "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
+
+    # Wrap the stubs to record whether they were touched.
+    clone_calls: list = []
+    seed_calls: list = []
+    branch_calls: list = []
+
+    import scripts.clone as clone_mod
+    import scripts.cycle_git as cg_mod
+    import scripts.seed_atelier_in_clone as seed_mod
+
+    orig_clone = clone_mod.clone_repo
+    orig_seed = seed_mod.seed_all
+    orig_branch = cg_mod.create_branch
+
+    def spy_clone(*a, **kw):
+        clone_calls.append((a, kw))
+        return orig_clone(*a, **kw)
+
+    def spy_seed(*a, **kw):
+        seed_calls.append((a, kw))
+        return orig_seed(*a, **kw)
+
+    def spy_branch(*a, **kw):
+        branch_calls.append((a, kw))
+        return orig_branch(*a, **kw)
+
+    monkeypatch.setattr(clone_mod, "clone_repo", spy_clone)
+    monkeypatch.setattr(seed_mod, "seed_all", spy_seed)
+    monkeypatch.setattr(cg_mod, "create_branch", spy_branch)
+
+    experiment_dir = tmp_path / "experiment" / "owner-repo"
+
+    with pytest.raises(ValueError, match="tools_provider"):
+        orchestrate_run(
+            db_path=db,
+            git_url=project["git_url"],
+            cycles_requested=1,
+            mode="team",
+            tools_provider=None,
+        )
+
+    # No clone, no seed, no branch — and no experiment dir on disk.
+    assert clone_calls == [], f"clone_repo must not run when guard fires; got {clone_calls}"
+    assert seed_calls == [], f"seed_all must not run when guard fires; got {seed_calls}"
+    assert branch_calls == [], f"create_branch must not run when guard fires; got {branch_calls}"
+    assert not experiment_dir.exists(), (
+        f"experiment_dir must not exist after guard fires; found {experiment_dir}"
+    )
+
+
+def test_orchestrate_run_team_mode_with_tools_provider_threads_through(
+    db, project, tmp_path, monkeypatch
+):
+    """Provider is invoked once per cycle with the SAME (clone_dir, project,
+    run_row) and DIFFERENT cycle_n values monotonically increasing.
+    """
+    import os
+
+    from scripts.team_tools_wrapper import RecordingWrapper
+
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+    monkeypatch.setitem(os.environ, "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
+
+    provider_calls: list[tuple] = []
+
+    def provider(clone_dir, proj, run_row, cycle_n):
+        provider_calls.append((clone_dir, proj, run_row, cycle_n))
+        return RecordingWrapper()
+
+    def fake_executor(clone_dir, proj, run_row, cycle_n, *, tools):
+        # Sanity: tools is the RecordingWrapper returned by our provider.
+        assert isinstance(tools, RecordingWrapper)
+        return _success_outcome(cycle_n)
+
+    cycles_requested = 3
+    result = orchestrate_run(
+        db_path=db,
+        git_url=project["git_url"],
+        cycles_requested=cycles_requested,
+        cycle_executor=fake_executor,
+        mode="team",
+        tools_provider=provider,
+    )
+
+    assert result["status"] == "complete"
+    assert result["cycles_succeeded"] == cycles_requested
+    # One provider call per cycle.
+    assert len(provider_calls) == cycles_requested
+
+    # cycle_n monotonically increasing 1..N.
+    cycle_ns = [c[3] for c in provider_calls]
+    assert cycle_ns == list(range(1, cycles_requested + 1))
+
+    # clone_dir + project + run_row are the SAME object across all calls.
+    clone_dirs = {id(c[0]) for c in provider_calls}
+    projects = {id(c[1]) for c in provider_calls}
+    run_rows = {id(c[2]) for c in provider_calls}
+    assert len(clone_dirs) == 1, "clone_dir must be the same object across provider calls"
+    assert len(projects) == 1, "project must be the same object across provider calls"
+    assert len(run_rows) == 1, "run_row must be the same object across provider calls"
+
+
+def test_orchestrate_run_team_mode_provider_receives_correct_args(
+    db, project, tmp_path, monkeypatch
+):
+    """The 4 args the provider receives are (Path, dict, dict, int) with the
+    project + run_row dicts populated as expected.
+    """
+    import os
+
+    from scripts.team_tools_wrapper import RecordingWrapper
+
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+    monkeypatch.setitem(os.environ, "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
+
+    captured: dict = {}
+
+    def provider(clone_dir, proj, run_row, cycle_n):
+        captured["clone_dir"] = clone_dir
+        captured["project"] = proj
+        captured["run_row"] = run_row
+        captured["cycle_n"] = cycle_n
+        return RecordingWrapper()
+
+    def fake_executor(*args, **kwargs):
+        return _success_outcome(args[3])
+
+    orchestrate_run(
+        db_path=db,
+        git_url=project["git_url"],
+        cycles_requested=1,
+        cycle_executor=fake_executor,
+        mode="team",
+        tools_provider=provider,
+    )
+
+    # Type shape checks.
+    assert isinstance(captured["clone_dir"], Path)
+    assert isinstance(captured["project"], dict)
+    assert isinstance(captured["run_row"], dict)
+    assert isinstance(captured["cycle_n"], int)
+    assert captured["cycle_n"] == 1
+
+    # Project dict has the expected keys.
+    for key in ("id", "git_url", "base_branch", "expert_roster"):
+        assert key in captured["project"], (
+            f"project dict missing expected key {key!r}: {captured['project']}"
+        )
+
+    # Run row has the expected keys.
+    assert "id" in captured["run_row"]
+    assert "branch" in captured["run_row"]
+    assert isinstance(captured["run_row"]["id"], int)
+    assert isinstance(captured["run_row"]["branch"], str)
+
+
+def test_orchestrate_run_team_mode_executor_receives_tools_kwarg(
+    db, project, tmp_path, monkeypatch
+):
+    """The executor must receive the wrapper instance as a `tools=` kwarg
+    (NOT positional), and the value passed must be the SAME instance the
+    provider returned on that cycle.
+    """
+    import os
+
+    from scripts.team_tools_wrapper import RecordingWrapper
+
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+    monkeypatch.setitem(os.environ, "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
+
+    produced_wrappers: list[RecordingWrapper] = []
+
+    def provider(clone_dir, proj, run_row, cycle_n):
+        wrapper = RecordingWrapper()
+        produced_wrappers.append(wrapper)
+        return wrapper
+
+    spy_calls: list[dict] = []
+
+    def spy_executor(*args, **kwargs):
+        spy_calls.append({"args": args, "kwargs": dict(kwargs)})
+        # tools MUST be a kwarg, never positional.
+        assert "tools" in kwargs, f"expected tools= kwarg; got args={args} kwargs={kwargs}"
+        # The args tuple is exactly (clone_dir, project, run_row, cycle_n).
+        assert len(args) == 4, f"expected 4 positional args; got {args}"
+        return _success_outcome(args[3])
+
+    cycles_requested = 2
+    orchestrate_run(
+        db_path=db,
+        git_url=project["git_url"],
+        cycles_requested=cycles_requested,
+        cycle_executor=spy_executor,
+        mode="team",
+        tools_provider=provider,
+    )
+
+    assert len(spy_calls) == cycles_requested
+    assert len(produced_wrappers) == cycles_requested
+    for i, call in enumerate(spy_calls):
+        assert call["kwargs"]["tools"] is produced_wrappers[i], (
+            f"cycle {i + 1}: executor received a different wrapper instance than the "
+            "provider returned"
+        )
 
 
 def test_orchestrate_run_push_failure_leaves_clone(db, project, tmp_path, monkeypatch):

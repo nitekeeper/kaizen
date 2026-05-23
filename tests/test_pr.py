@@ -536,8 +536,38 @@ def test_wait_and_report_ci_returns_failing_when_a_check_fails(monkeypatch):
     assert "Lint & format (Ruff)" in result
 
 
+def test_wait_and_report_ci_fails_fast_when_failed_check_with_other_pending(monkeypatch):
+    """If any check has bucket='fail', return failing immediately even if other
+    checks are still pending. Locks in the fail-fast behaviour change made when
+    dropping the `failed and not pending` guard."""
+    import json
+
+    from scripts.pr import wait_and_report_ci
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {"state": "IN_PROGRESS", "bucket": "pending", "name": "Tests"},
+                    {"state": "FAILURE", "bucket": "fail", "name": "Lint"},
+                ]
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("scripts.pr.subprocess.run", fake_run)
+    result = wait_and_report_ci(
+        "https://github.com/x/y/pull/1", timeout_seconds=60, poll_interval_seconds=0
+    )
+    assert "✗ CI failing" in result
+    assert "Lint" in result
+
+
 def test_wait_and_report_ci_returns_timeout_when_a_check_is_pending(monkeypatch):
-    """Checks still pending at deadline produce the ⌛ timeout message."""
+    """Pending checks are not misclassified as green; if they remain pending at
+    the deadline, the ⌛ message is returned. Regression for the conclusion-field
+    bug where pending checks silently passed through as green."""
     import json
 
     from scripts.pr import wait_and_report_ci

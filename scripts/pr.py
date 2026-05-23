@@ -334,6 +334,9 @@ def wait_and_report_ci(
             failed = [c for c in checks if c.get("bucket") == "fail"]
             if not pending and not failed:
                 return f"✓ CI green on {pr_url} ({len(checks)} checks passed in {elapsed}s)"
+            # Fail-fast: report failure as soon as any check fails, even if other
+            # checks are still pending. The previous code waited for all checks
+            # to finish; this returns the verdict the user cares about faster.
             if failed:
                 names = ", ".join(c.get("name", "?") for c in failed)
                 return (

@@ -260,6 +260,32 @@ After Phase 5b's tests pass, the cycle does not yet commit. A new independent-re
    - New consolidated report produced.
    - If the new report has zero unresolved issues OR PM rules remaining issues acceptable → exit loop; proceed to Phase 5c.
    - Otherwise: another fix iteration.
+
+   The iteration counter is mechanical — use the helper. The `pm_ruling_here` variable in the example is the PM's boolean acceptance ruling for this round's remaining issues — `True` when PM accepts the unresolved findings as known-and-acceptable, `False` otherwise. The orchestrator computes it after the reviewer meeting closes.
+
+   ```python
+   from scripts.fix_loop import (
+       FixLoopState, Finding,
+       start_iteration, record_findings, should_continue,
+       build_abandonment_outcome, FixLoopExhausted,
+   )
+
+   state = FixLoopState()
+   while True:
+       try:
+           n = start_iteration(state)  # raises FixLoopExhausted after 5
+       except FixLoopExhausted:
+           return build_abandonment_outcome(
+               state, subject=run_row["subject"], participants=resolved,
+           )
+       # ... reviewer round produces `findings: list[Finding]` ...
+       record_findings(state, findings)
+       if not should_continue(state, pm_accepts_remaining=pm_ruling_here):
+           break  # exit reason determined by should_continue's contract (zero blockers OR PM ruled acceptable)
+   ```
+
+   When `start_iteration` raises, the orchestrator returns the outcome from `build_abandonment_outcome` — which constructs the exact `review_unrecoverable` abandonment dict the orchestrator's allowlist guard (`scripts/run.py::orchestrate_run`, see Cycle 1) accepts.
+
    - **MAX 5 iterations.** If the loop exhausts with unresolved issues, abandon the cycle with `reason=review_unrecoverable`.
 
 5. **Mini-synthesis for conflicting reviewers.** When two reviewers disagree on the same file (e.g. Security says "parameterize the SQL", Prompt Engineer says "remove the embedded SQL entirely"), they `SendMessage` each other directly to reconcile. Lead intervenes only if 3+ exchanges fail to resolve.

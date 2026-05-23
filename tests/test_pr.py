@@ -476,6 +476,15 @@ def test_open_pr_for_run_full_flow(db, project, tmp_path, monkeypatch):
 
 
 # ── wait_and_report_ci ─────────────────────────────────────────────────────
+#
+# IMPORTANT — Mock fidelity note:
+# The JSON shape below mirrors what `gh pr checks --json state,bucket,name`
+# actually returns from the live CLI. To verify, run:
+#   gh pr checks <some-real-pr-url> --json state,bucket,name
+# The mock MUST mirror what the live CLI returns — divergence here caused
+# a classic mock-divergence failure that was only surfaced by smoke-testing
+# against a real PR (atelier#24). `conclusion` is NOT a valid gh JSON field;
+# `bucket` is the authoritative classifier (values: "pass", "fail", "pending").
 
 
 def test_wait_and_report_ci_returns_green_when_all_checks_succeed(monkeypatch):
@@ -489,8 +498,8 @@ def test_wait_and_report_ci_returns_green_when_all_checks_succeed(monkeypatch):
             returncode=0,
             stdout=json.dumps(
                 [
-                    {"state": "COMPLETED", "conclusion": "SUCCESS", "name": "Lint"},
-                    {"state": "COMPLETED", "conclusion": "SUCCESS", "name": "Tests"},
+                    {"state": "SUCCESS", "bucket": "pass", "name": "Lint"},
+                    {"state": "SUCCESS", "bucket": "pass", "name": "Tests"},
                 ]
             ),
             stderr="",
@@ -514,8 +523,8 @@ def test_wait_and_report_ci_returns_failing_when_a_check_fails(monkeypatch):
             returncode=0,
             stdout=json.dumps(
                 [
-                    {"state": "COMPLETED", "conclusion": "SUCCESS", "name": "Tests"},
-                    {"state": "COMPLETED", "conclusion": "FAILURE", "name": "Lint & format (Ruff)"},
+                    {"state": "SUCCESS", "bucket": "pass", "name": "Tests"},
+                    {"state": "FAILURE", "bucket": "fail", "name": "Lint & format (Ruff)"},
                 ]
             ),
             stderr="",
@@ -525,3 +534,61 @@ def test_wait_and_report_ci_returns_failing_when_a_check_fails(monkeypatch):
     result = wait_and_report_ci("https://github.com/x/y/pull/1", timeout_seconds=1)
     assert "✗ CI failing" in result
     assert "Lint & format (Ruff)" in result
+
+
+def test_wait_and_report_ci_fails_fast_when_failed_check_with_other_pending(monkeypatch):
+    """If any check has bucket='fail', return failing immediately even if other
+    checks are still pending. Locks in the fail-fast behaviour change made when
+    dropping the `failed and not pending` guard."""
+    import json
+
+    from scripts.pr import wait_and_report_ci
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {"state": "IN_PROGRESS", "bucket": "pending", "name": "Tests"},
+                    {"state": "FAILURE", "bucket": "fail", "name": "Lint"},
+                ]
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("scripts.pr.subprocess.run", fake_run)
+    result = wait_and_report_ci(
+        "https://github.com/x/y/pull/1", timeout_seconds=60, poll_interval_seconds=0
+    )
+    assert "✗ CI failing" in result
+    assert "Lint" in result
+
+
+def test_wait_and_report_ci_returns_timeout_when_a_check_is_pending(monkeypatch):
+    """Pending checks are not misclassified as green; if they remain pending at
+    the deadline, the ⌛ message is returned. Regression for the conclusion-field
+    bug where pending checks silently passed through as green."""
+    import json
+
+    from scripts.pr import wait_and_report_ci
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {"state": "IN_PROGRESS", "bucket": "pending", "name": "Tests"},
+                    {"state": "SUCCESS", "bucket": "pass", "name": "Lint"},
+                ]
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("scripts.pr.subprocess.run", fake_run)
+    # timeout_seconds=0 forces immediate deadline expiry after first poll.
+    result = wait_and_report_ci(
+        "https://github.com/x/y/pull/1", timeout_seconds=0, poll_interval_seconds=0
+    )
+    assert "⌛" in result
+    assert "CI did not complete" in result
+    assert "https://github.com/x/y/pull/1" in result

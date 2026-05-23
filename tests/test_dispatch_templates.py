@@ -132,7 +132,6 @@ def test_phase_5b_ci_failure_includes_failed_checks():
     msg = phase_5b_ci_failure(
         wave_n=1,
         failed_checks=["tests", "ruff_check"],
-        results={"tests": (False, "boom"), "ruff_check": (False, "x")},
     )
     assert msg == "CI failed after wave 1: ['tests', 'ruff_check']"
 
@@ -145,7 +144,6 @@ def test_phase_5b_ci_failure_rejects_empty_failed_checks():
         phase_5b_ci_failure(
             wave_n=1,
             failed_checks=[],
-            results={"tests": (True, "ok")},
         )
     msg = str(exc.value)
     assert "failed_checks" in msg
@@ -248,3 +246,59 @@ def test_phase_5b_prime_pm_acceptance_explains_accept_reject_protocol():
     assert "ACCEPT" in msg
     assert "REJECT" in msg
     assert "iteration 3" in msg
+
+
+# ── Item 2: PM-ABANDON semantics docstring + body protocol ───────────────
+
+
+def test_phase_5b_prime_pm_acceptance_docstring_specifies_ABANDON_treated_as_REJECT():
+    """Item 2: docstring must explicitly state that ABANDON: prefixes from
+    the PM at the acceptance prompt are treated as REJECT (not as cycle
+    abandonment). The body must also tell the PM about the ACCEPT/REJECT
+    protocol so the agent has the contract in-message.
+    """
+    assert phase_5b_prime_pm_acceptance.__doc__ is not None
+    assert "ABANDON" in phase_5b_prime_pm_acceptance.__doc__
+    assert "REJECT" in phase_5b_prime_pm_acceptance.__doc__
+    msg = phase_5b_prime_pm_acceptance(
+        findings=[
+            Finding(
+                finding_id="F-1",
+                reviewer="r",
+                severity="blocker",
+                finding="x",
+                file_line="a.py:1",
+            )
+        ],
+        iter_n=2,
+    )
+    assert "ACCEPT" in msg and "REJECT" in msg
+
+
+# ── Item 5: _require empty-container rejection extended to tuple & set ───
+
+
+def test_require_rejects_empty_tuple():
+    """Item 5: empty tuples must be rejected by `_require` with the same
+    'empty' substring in the error message that empty list/dict/str use.
+    """
+    from scripts.dispatch_templates import _require
+
+    with pytest.raises(ValueError) as exc:
+        _require("x", (), tuple)
+    msg = str(exc.value)
+    assert "x" in msg
+    assert "empty" in msg
+
+
+def test_require_rejects_empty_set():
+    """Item 5: empty sets must be rejected by `_require` with the same
+    'empty' substring in the error message that empty list/dict/str use.
+    """
+    from scripts.dispatch_templates import _require
+
+    with pytest.raises(ValueError) as exc:
+        _require("x", set(), set)
+    msg = str(exc.value)
+    assert "x" in msg
+    assert "empty" in msg

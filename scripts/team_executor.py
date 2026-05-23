@@ -103,6 +103,18 @@ from typing import Protocol
 from scripts.ci_runner import run_ci_checks
 from scripts.cycle_git import commit_cycle
 from scripts.dag import validate_dag
+from scripts.dispatch_templates import (
+    phase_1_agenda,
+    phase_2_preanalysis,
+    phase_3_close,
+    phase_3_debate,
+    phase_3_open,
+    phase_4_implementer,
+    phase_5b_ci_failure,
+    phase_5b_prime_fix,
+    phase_5b_prime_pm_acceptance,
+    phase_5b_prime_reviewer,
+)
 from scripts.fix_loop import (
     _BLOCKING_SEVERITIES,
     Finding,
@@ -324,133 +336,13 @@ def _collect_existing_files(clone_dir: Path) -> frozenset[str]:
     return frozenset(out)
 
 
-# ── Phase brief builders ───────────────────────────────────────────────────
-
-
-def _phase_1_agenda_brief(subject: str | None, cycle_n: int) -> str:
-    return (
-        f"Kaizen cycle {cycle_n} — Phase 1 (Agenda). "
-        f"Subject: {subject or 'PM-directed'}. "
-        "Propose 1-5 agenda items, one per line. Prefix 'ABANDON:' if you "
-        "cannot in good faith produce any useful agenda for this cycle."
-    )
-
-
-def _phase_2_preanalysis_brief(agenda_items: list[str], participant: str) -> str:
-    bullets = "\n".join(f"- {item}" for item in agenda_items)
-    return (
-        f"Phase 2 (Pre-analysis). You are {participant}. "
-        f"Agenda from PM:\n{bullets}\n\n"
-        "Produce a short proposal touching each item from your domain lens. "
-        "Prefix 'ABANDON:' to opt out."
-    )
-
-
-def _phase_3_open_brief(proposals: list[dict]) -> str:
-    summary_lines = [f"- {p['agent']}: {p['raw'][:200]}" for p in proposals]
-    body = "\n".join(summary_lines) if summary_lines else "(no proposals collected)"
-    return (
-        "Phase 3 open (Synthesis meeting — Star). All Phase-2 proposals "
-        f"below; read them and prepare your debate position:\n{body}"
-    )
-
-
-def _phase_3_debate_brief() -> str:
-    return (
-        "Phase 3 debate (Mesh). State your remaining concerns and your "
-        "agreed scope for this cycle. Prefix 'ABANDON:' if no consensus "
-        "is reachable from your seat."
-    )
-
-
-def _phase_3_close_brief(proposals: list[dict], agreements: list[dict]) -> str:
-    return (
-        "Phase 3 close (Star). Consolidate the proposals and the agreed "
-        f"scope into a single Action Items DAG. Proposals: {len(proposals)}; "
-        f"agreements: {len(agreements)}. "
-        "Reply with one fenced ```json``` block containing a JSON list of "
-        "Action Item dicts. Each dict must have keys: id (str), touches "
-        "(list[str]), reads (list[str]), depends_on (list[str]), "
-        "wave (int), owner (str role id). "
-        "Prefix 'ABANDON:' if no DAG can be agreed."
-    )
-
-
-def _phase_4_implementer_brief(item: dict, wave_n: int) -> str:
-    return (
-        f"Phase 4 wave {wave_n} — implement Action Item {item['id']}. "
-        f"You own this item. Touches: {item.get('touches')}; "
-        f"reads: {item.get('reads')}. Apply the change to disk in the "
-        "clone and reply with a one-line summary of what you did. "
-        "Prefix 'ABANDON:' if the change cannot be applied."
-    )
-
-
-def _phase_5b_prime_reviewer_brief(
-    iter_n: int,
-    action_items: list[dict],
-    prior_findings: list[Finding] | None = None,
-) -> str:
-    """Build the reviewer brief for iteration `iter_n`.
-
-    On iteration 1 (or when `prior_findings` is None/empty) the brief is the
-    fresh-review form. On iteration 2+ the brief carries forward the
-    previously-unresolved findings so reviewers can do incremental review
-    rather than re-scanning the whole diff from scratch.
-    """
-    ids = [item["id"] for item in action_items]
-    base = (
-        f"Phase 5b' iteration {iter_n} — independent review. "
-        f"Review the implemented Action Items: {ids}. Reply with either "
-        "'NO ISSUES' (case-insensitive) OR one finding per line in the "
-        "format: [severity] file:line — text  "
-        "(severity ∈ blocker|major|minor|nit)."
-    )
-    if not prior_findings:
-        return base
-    # Render the carry-forward block so iteration 2+ reviewers can do
-    # incremental review against the previous round's surviving findings.
-    prior_lines = [
-        f"  - {f.finding_id} [{f.severity}] {f.reviewer} @ {f.file_line}: {f.finding}"
-        for f in prior_findings
-    ]
-    prior_block = "\n".join(prior_lines)
-    return (
-        f"{base}\n\nPreviously unresolved findings (iteration {iter_n - 1}); "
-        f"verify whether the implementer's fix attempts resolved each:\n{prior_block}"
-    )
-
-
-def _phase_5b_prime_fix_brief(finding: Finding) -> str:
-    return (
-        f"Phase 5b' fix — address finding {finding.finding_id} "
-        f"({finding.severity}) at {finding.file_line}: {finding.finding}. "
-        "Apply the fix and reply with a one-line confirmation. Prefix "
-        "'ABANDON:' if the fix cannot be applied."
-    )
-
-
-def _phase_5b_prime_pm_acceptance_brief(
-    findings: list[Finding],
-    iter_n: int,
-) -> str:
-    """Ask the PM whether the unresolved findings are acceptable for this cycle.
-
-    Per internal/cycle/SKILL.md the PM may rule remaining issues acceptable
-    (a legitimate fix-loop exit). Reply must start with ACCEPT or REJECT.
-    """
-    finding_lines = [
-        f"  - {f.finding_id} [{f.severity}] {f.reviewer} @ {f.file_line}: {f.finding}"
-        for f in findings
-    ]
-    body = "\n".join(finding_lines) if finding_lines else "  (none)"
-    return (
-        f"Phase 5b' PM acceptance check (iteration {iter_n}). "
-        f"The reviewers surfaced these findings:\n{body}\n\n"
-        "As PM, do you accept them as out-of-scope for THIS cycle (we will "
-        "log them for follow-up), or do we keep iterating? Reply starting "
-        "with ACCEPT or REJECT, followed by a one-line rationale."
-    )
+# ── Phase brief builders (extracted to scripts/dispatch_templates.py) ─────
+#
+# The 10 Phase 1-5c dispatch templates live in `scripts/dispatch_templates`
+# (imported at the top of this module). Each template is a pure function
+# with explicit required-kwarg validation — see that module for the wire-
+# protocol-aligned bodies. The executor builds messages by calling those
+# templates; no brief text is constructed here.
 
 
 def _find_owner_for_finding(
@@ -584,7 +476,7 @@ def team_cycle_executor(
         agenda_response = tools.send_message(
             team_id,
             to=pm,
-            message=_phase_1_agenda_brief(subject, cycle_n),
+            message=phase_1_agenda(subject=subject, cycle_n=cycle_n),
         )
         if _is_abandon(agenda_response):
             _abandon(
@@ -615,7 +507,7 @@ def team_cycle_executor(
                 resp = tools.send_message(
                     team_id,
                     to=participant,
-                    message=_phase_2_preanalysis_brief(agenda_items, participant),
+                    message=phase_2_preanalysis(agenda_items=agenda_items, participant=participant),
                 )
                 if _is_abandon(resp):
                     _abandon(
@@ -638,7 +530,7 @@ def team_cycle_executor(
                 tools.send_message(
                     team_id,
                     to=participant,
-                    message=_phase_3_open_brief(proposals),
+                    message=phase_3_open(proposals=proposals),
                 )
 
             # Mesh (simplified): each participant signals consensus
@@ -647,7 +539,7 @@ def team_cycle_executor(
                 resp = tools.send_message(
                     team_id,
                     to=participant,
-                    message=_phase_3_debate_brief(),
+                    message=phase_3_debate(),
                 )
                 if _is_abandon(resp):
                     _abandon(
@@ -666,7 +558,7 @@ def team_cycle_executor(
             close_resp = tools.send_message(
                 team_id,
                 to=pm,
-                message=_phase_3_close_brief(proposals, agreements),
+                message=phase_3_close(proposals=proposals, agreements=agreements),
             )
             if _is_abandon(close_resp):
                 _abandon(
@@ -733,7 +625,7 @@ def team_cycle_executor(
                     impl_resp = tools.send_message(
                         team_id,
                         to=owner,
-                        message=_phase_4_implementer_brief(item, wave_n),
+                        message=phase_4_implementer(item=item, wave_n=wave_n),
                     )
                     if _is_abandon(impl_resp):
                         _abandon(
@@ -758,7 +650,11 @@ def team_cycle_executor(
                         outcome_acc,
                         phase_reached="test",
                         reason="tests_unrecoverable",
-                        detail=f"CI failed after wave {wave_n}: {failed}",
+                        detail=phase_5b_ci_failure(
+                            wave_n=wave_n,
+                            failed_checks=failed,
+                            results=results,
+                        ),
                     )
                     break
 
@@ -819,8 +715,10 @@ def team_cycle_executor(
                             resp = tools.send_message(
                                 team_id,
                                 to=reviewer,
-                                message=_phase_5b_prime_reviewer_brief(
-                                    iter_n, action_items, prior_findings=prior
+                                message=phase_5b_prime_reviewer(
+                                    iter_n=iter_n,
+                                    action_items=action_items,
+                                    prior_findings=prior,
                                 ),
                             )
                             findings.extend(
@@ -838,7 +736,9 @@ def team_cycle_executor(
                         pm_resp = tools.send_message(
                             team_id,
                             to=pm,
-                            message=_phase_5b_prime_pm_acceptance_brief(latest_blockers, iter_n),
+                            message=phase_5b_prime_pm_acceptance(
+                                findings=latest_blockers, iter_n=iter_n
+                            ),
                         )
                         pm_accepts = (pm_resp or "").strip().upper().startswith("ACCEPT")
                         if not should_continue(state, pm_accepts_remaining=pm_accepts):
@@ -863,7 +763,7 @@ def team_cycle_executor(
                             fix_resp = tools.send_message(
                                 team_id,
                                 to=fix_owner,
-                                message=_phase_5b_prime_fix_brief(finding),
+                                message=phase_5b_prime_fix(finding=finding),
                             )
                             if _is_abandon(fix_resp):
                                 review_outcome = build_abandonment_outcome(

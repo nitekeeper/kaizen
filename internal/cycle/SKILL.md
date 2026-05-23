@@ -27,6 +27,16 @@ The mode does not change the cycle's logical structure (Phase 1–5). It only ch
 
 When `mode='team'` and `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` is absent, `scripts/team_executor.py::team_cycle_executor` raises `TeamToolsUnavailableError` before any clone work begins.
 
+For `mode='team'`, the orchestrating agent provides a `TeamTools` wrapper
+by subclassing `scripts.team_tools_wrapper.AgentTeamsWrapper` and
+overriding `team_create` / `send_message` / `team_delete` to invoke the
+real CC tools. Tests inject `RecordingWrapper` for harness coverage.
+
+The dispatch templates the wrapper sends are exported from
+`scripts.dispatch_templates` — each is a pure function with explicit
+required-kwarg validation. Templates correspond 1:1 with the Phase 1-5c
+dispatch points in `scripts.team_executor`.
+
 ## Inputs
 
 - `clone_dir` (Path) — the experiment clone, already on the run branch with atelier seeded.

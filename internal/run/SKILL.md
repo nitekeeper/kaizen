@@ -120,9 +120,13 @@ If step 7 failed, run finalize with `status='failed'` and `pr_url=None` instead,
 
 ### Step 10 — Tear down the clone
 
+Teardown is **unconditional** — it runs after PR open regardless of CI outcome. The clone is ephemeral; the PR branch on GitHub is the recovery artifact for any post-merge issues. Step 10.5 (which follows) reports CI status to the user but cannot — and is not designed to — affect this teardown.
+
 Read `internal/clone-target/SKILL.md` and follow its `teardown` operation with `clone_dir`.
 
 ### Step 10.5 — Report CI status (informational only)
+
+This step runs AFTER teardown (Step 10) and is **informational only**. The poll's return value is printed for the user but does not control teardown, the run row, or any downstream behaviour. See `scripts/pr.py::wait_and_report_ci` for the failure-mode rationale (Safety hard-stop in kaizen#17 against conditional teardown).
 
 After teardown completes, poll `gh pr checks` to surface the CI outcome to the user. This step is informational only — it does NOT control teardown (which already happened in Step 10).
 
@@ -147,6 +151,7 @@ Return / print to the caller (`skills/improve/SKILL.md`):
 Run <run_id> complete.
   Branch:    <branch>
   PR:        <pr_url or "not opened — push failed">
+  CI status: <line from Step 10.5>
   Cycles:    <S> succeeded / <A> abandoned out of <N> requested
   Project:   <project name> (<git_url>)
 Abandonment memex slugs (read with `memex ask <slug>`):

@@ -390,6 +390,99 @@ def test_orchestrate_run_finalizes_failed_run_on_cycle_exception(
     assert final["ended_at"] is not None
 
 
+def test_orchestrate_run_skip_and_continue_on_abandonment(db, project, tmp_path, monkeypatch):
+    """Skip-and-continue policy: alternating abandoned/success over 4 cycles.
+
+    Verifies:
+    - The orchestrator does NOT abort after the first abandonment (all 4
+      cycles run).
+    - cycles_succeeded == 2, cycles_abandoned == 2.
+    - 4 cycle rows in the DB with statuses ['abandoned','success','abandoned','success']
+      in cycle_n order.
+    - 2 abandonment rows in the DB linked to the correct cycle rows.
+    - The run is finalised at status='complete'.
+    """
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+
+    cycles_called: list[int] = []
+
+    def stub_cycle_executor(clone_dir, proj, run_row, cycle_n):
+        cycles_called.append(cycle_n)
+        if cycle_n % 2 == 1:  # odd → abandoned
+            return {
+                "status": "abandoned",
+                "subject": None,
+                "phase_reached": "meeting",
+                "reason": "no_consensus",
+                "detail": f"stubbed abandonment for cycle {cycle_n}",
+                "participants": ["stub"],
+                "artifacts": [],
+            }
+        # even → success
+        return {
+            "status": "success",
+            "subject": None,
+            "commit_sha": "stub" + str(cycle_n),
+            "minutes_memex_slug": f"stub:{cycle_n}",
+            "participants": ["stub"],
+        }
+
+    result = orchestrate_run(
+        db_path=db,
+        git_url=project["git_url"],
+        cycles_requested=4,
+        cycle_executor=stub_cycle_executor,
+    )
+
+    # All 4 cycles ran — loop did NOT abort after first abandonment.
+    assert cycles_called == [1, 2, 3, 4], f"Expected all 4 cycles called, got {cycles_called}"
+
+    # Top-level counts.
+    assert result["cycles_succeeded"] == 2
+    assert result["cycles_abandoned"] == 2
+    assert result["status"] == "complete"
+
+    # Cycle rows: 4 total, statuses in cycle_n order.
+    cycle_rows = result["cycles"]
+    assert len(cycle_rows) == 4
+    expected_statuses = ["abandoned", "success", "abandoned", "success"]
+    actual_statuses = [c["status"] for c in sorted(cycle_rows, key=lambda c: c["cycle_n"])]
+    assert actual_statuses == expected_statuses
+
+    # Abandonment rows: 2, linked to the correct cycle rows.
+    ab_rows = result["abandonments"]
+    assert len(ab_rows) == 2
+
+    abandoned_cycle_ids = {c["id"] for c in cycle_rows if c["status"] == "abandoned"}
+    ab_cycle_ids = {ab["cycle_id"] for ab in ab_rows}
+    assert ab_cycle_ids == abandoned_cycle_ids
+
+    # Each abandonment row carries the correct reason.
+    assert all(ab["reason"] == "no_consensus" for ab in ab_rows)
+
+    # Verify DB state directly — run row must be finalised as complete.
+    final_run = get_run(db, result["run_id"])
+    assert final_run["status"] == "complete"
+    assert final_run["cycles_succeeded"] == 2
+    assert final_run["cycles_abandoned"] == 2
+    assert final_run["ended_at"] is not None
+
+    # Verify abandonment rows exist in DB (not just in-memory list).
+    from scripts.db import get_connection
+
+    conn = get_connection(db)
+    try:
+        cur = conn.execute(
+            "SELECT cycle_id FROM abandonments WHERE cycle_id IN "
+            f"({','.join('?' * len(abandoned_cycle_ids))})",
+            list(abandoned_cycle_ids),
+        )
+        db_ab_cycle_ids = {row[0] for row in cur.fetchall()}
+    finally:
+        conn.close()
+    assert db_ab_cycle_ids == abandoned_cycle_ids
+
+
 def test_orchestrate_run_push_failure_leaves_clone(db, project, tmp_path, monkeypatch):
     _install_orchestrator_stubs(monkeypatch, tmp_path)
 

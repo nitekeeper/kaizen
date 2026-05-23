@@ -170,8 +170,8 @@ CREATE TABLE cycles (
 CREATE TABLE abandonments (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
   cycle_id            INTEGER NOT NULL REFERENCES cycles(id) ON DELETE CASCADE,
-  phase_reached       TEXT NOT NULL,       -- agenda | meeting | implementation | test | push
-  reason              TEXT NOT NULL,       -- no_consensus | destructive_rejected | tests_unrecoverable | push_failed | other
+  phase_reached       TEXT NOT NULL,       -- agenda | meeting | implementation | test | review | push
+  reason              TEXT NOT NULL,       -- no_consensus | destructive_rejected | tests_unrecoverable | review_unrecoverable | other
   detail              TEXT NOT NULL,
   report_memex_slug   TEXT,
   created_at          TEXT NOT NULL

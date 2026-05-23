@@ -189,7 +189,7 @@ def orchestrate_run(
       abandonments (list of rows), status, mode.
     """
     # Local imports keep cycle.py / clone.py / etc. optional at import time.
-    from scripts.abandonment import process_abandonment
+    from scripts.abandonment import VALID_PHASES, VALID_REASONS, process_abandonment
     from scripts.clone import cleanup_experiment, clone_repo
     from scripts.cycle import (
         execute_cycle as default_executor,
@@ -268,6 +268,27 @@ def orchestrate_run(
                 )
                 cycles_succeeded += 1
             elif outcome.get("status") == "abandoned":
+                # Fail-loud allowlist guards: the schema CHECK constraints
+                # (migration 004) only permit specific values for phase_reached
+                # and reason. ANY out-of-set value (None, "unknown", "bogus",
+                # typos) would crash later with sqlite3.IntegrityError at
+                # INSERT INTO abandonments time, *after* the cycle's work was
+                # already done. Validating against the canonical frozensets
+                # imported from scripts.abandonment guarantees we fail before
+                # any DB write and that the error message names both the
+                # offending cycle and the full set of legal values.
+                phase_reached = outcome.get("phase_reached")
+                reason = outcome.get("reason")
+                if phase_reached not in VALID_PHASES:
+                    raise ValueError(
+                        f"cycle {cycle_n} outcome has invalid 'phase_reached'={phase_reached!r}; "
+                        f"valid values per migration 004: {sorted(VALID_PHASES)}"
+                    )
+                if reason not in VALID_REASONS:
+                    raise ValueError(
+                        f"cycle {cycle_n} outcome has invalid 'reason'={reason!r}; "
+                        f"valid values per migration 004: {sorted(VALID_REASONS)}"
+                    )
                 cycle_row = record_cycle_abandoned(
                     db_path=db_path,
                     run_id=run_row["id"],
@@ -284,8 +305,8 @@ def orchestrate_run(
                     cycle_n=cycle_n,
                     subject=outcome.get("subject", subject),
                     participants=outcome.get("participants", []),
-                    phase_reached=outcome.get("phase_reached", "unknown"),
-                    reason=outcome.get("reason", "other"),
+                    phase_reached=phase_reached,
+                    reason=reason,
                     detail=outcome.get("detail", ""),
                     artifacts=outcome.get("artifacts", []),
                     # Phase 5b' review-loop fields — only populated by the

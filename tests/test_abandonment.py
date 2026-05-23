@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sqlite3
+
 import pytest
 
 from scripts.abandonment import (
@@ -230,6 +232,37 @@ def test_record_abandonment_backwards_compatible_without_review_fields(db, run_a
     assert row["unresolved_findings"] is None
     assert row["convergence_summary"] is None
     assert row["reviewer_attribution"] is None
+
+
+# ── CHECK constraint — contract-pinning regression guard ─────────────────
+
+
+def test_record_abandonment_rejects_unknown_phase_reached(db, run_and_cycle):
+    """Contract-pinning test: phase_reached='unknown' MUST be rejected by the
+    schema CHECK constraint (migration 004 permits only agenda|meeting|
+    implementation|test|review|push).
+
+    The orchestrator used to default to "unknown" when the cycle outcome was
+    malformed — that default would crash here with sqlite3.IntegrityError
+    *after* the cycle's work was done. The defensive ValueError raise added
+    to scripts/run.py now prevents that, but this test pins the underlying
+    CHECK contract so any future loosening of the constraint (e.g. someone
+    adding "unknown" to the enum) fails this test and forces a deliberate
+    decision rather than silent reintroduction of the bug class.
+    """
+    with pytest.raises(sqlite3.IntegrityError) as exc_info:
+        record_abandonment(
+            db_path=db,
+            cycle_id=run_and_cycle["cycle"]["id"],
+            phase_reached="unknown",
+            reason="other",
+            detail="this insert must be rejected by the CHECK",
+            report_memex_slug=None,
+        )
+    # Pin the exact SQLite wording so a NOT NULL / FK violation cannot
+    # falsely satisfy this test — SQLite 3.x has been stable on this
+    # exact string for over a decade.
+    assert "CHECK constraint failed" in str(exc_info.value)
 
 
 def test_format_report_includes_review_section_when_fields_present():

@@ -276,6 +276,83 @@ def open_pr_for_run(db_path: str, run_id: int, clone_dir: Path) -> str:
     return pr_url
 
 
+# ── CI polling ─────────────────────────────────────────────────────────────
+
+
+def wait_and_report_ci(
+    pr_url: str,
+    timeout_seconds: int = 120,
+    poll_interval_seconds: int = 10,
+) -> str:
+    """Poll `gh pr checks` and return a formatted status string for the user.
+
+    This is **informational only** — the caller MUST NOT use the returned
+    status to decide whether to keep or delete the clone. Teardown is
+    unconditional (see internal/run/SKILL.md Step 10). Per safety review of
+    Run 5: conditional teardown has unbounded clone-accumulation risk.
+
+    Returns a single-line human-readable string. Examples:
+        "✓ CI green on <pr_url> (3 checks passed in 47s)"
+        "✗ CI failing on <pr_url> (1 of 3 checks failed: Lint & format (Ruff))"
+        "⌛ CI did not complete within 120s on <pr_url> — check manually"
+
+    Args:
+        pr_url: full GitHub PR URL.
+        timeout_seconds: max wall-clock seconds to poll.
+        poll_interval_seconds: seconds between polls.
+    """
+    import json
+    import time
+
+    deadline = time.monotonic() + timeout_seconds
+    start = time.monotonic()
+    while True:
+        result = subprocess.run(
+            ["gh", "pr", "checks", pr_url, "--json", "state,conclusion,name"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        elapsed = int(time.monotonic() - start)
+
+        if result.returncode == 0:
+            try:
+                checks = json.loads(result.stdout or "[]")
+            except json.JSONDecodeError:
+                checks = []
+        else:
+            checks = []
+
+        if checks:
+            pending = [
+                c
+                for c in checks
+                if str(c.get("state", "")).upper()
+                in ("PENDING", "IN_PROGRESS", "QUEUED", "WAITING", "REQUESTED")
+            ]
+            failed = [
+                c
+                for c in checks
+                if str(c.get("conclusion", "")).upper() not in ("SUCCESS", "SKIPPED", "")
+                and str(c.get("state", "")).upper()
+                not in ("PENDING", "IN_PROGRESS", "QUEUED", "WAITING", "REQUESTED")
+            ]
+            if not pending and not failed:
+                return f"✓ CI green on {pr_url} ({len(checks)} checks passed in {elapsed}s)"
+            if failed and not pending:
+                names = ", ".join(c.get("name", "?") for c in failed)
+                return (
+                    f"✗ CI failing on {pr_url} "
+                    f"({len(failed)} of {len(checks)} checks failed: {names})"
+                )
+
+        if time.monotonic() >= deadline:
+            return f"⌛ CI did not complete within {timeout_seconds}s on {pr_url} — check manually"
+        time.sleep(poll_interval_seconds)
+
+
 # ── CLI ────────────────────────────────────────────────────────────────────
 
 

@@ -473,3 +473,55 @@ def test_open_pr_for_run_full_flow(db, project, tmp_path, monkeypatch):
     assert url == "https://github.com/owner/repo/pull/123"
     final = get_run(db, run["id"])
     assert final["pr_url"] == "https://github.com/owner/repo/pull/123"
+
+
+# ── wait_and_report_ci ─────────────────────────────────────────────────────
+
+
+def test_wait_and_report_ci_returns_green_when_all_checks_succeed(monkeypatch):
+    """wait_and_report_ci returns the green-formatted string when all checks pass."""
+    import json
+
+    from scripts.pr import wait_and_report_ci
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {"state": "COMPLETED", "conclusion": "SUCCESS", "name": "Lint"},
+                    {"state": "COMPLETED", "conclusion": "SUCCESS", "name": "Tests"},
+                ]
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("scripts.pr.subprocess.run", fake_run)
+    result = wait_and_report_ci("https://github.com/x/y/pull/1", timeout_seconds=1)
+    assert "✓ CI green" in result
+    assert "2 checks passed" in result
+    assert "https://github.com/x/y/pull/1" in result
+
+
+def test_wait_and_report_ci_returns_failing_when_a_check_fails(monkeypatch):
+    """Failing check returns the ✗ line with the check name surfaced."""
+    import json
+
+    from scripts.pr import wait_and_report_ci
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps(
+                [
+                    {"state": "COMPLETED", "conclusion": "SUCCESS", "name": "Tests"},
+                    {"state": "COMPLETED", "conclusion": "FAILURE", "name": "Lint & format (Ruff)"},
+                ]
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr("scripts.pr.subprocess.run", fake_run)
+    result = wait_and_report_ci("https://github.com/x/y/pull/1", timeout_seconds=1)
+    assert "✗ CI failing" in result
+    assert "Lint & format (Ruff)" in result

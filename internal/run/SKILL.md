@@ -122,6 +122,23 @@ If step 7 failed, run finalize with `status='failed'` and `pr_url=None` instead,
 
 Read `internal/clone-target/SKILL.md` and follow its `teardown` operation with `clone_dir`.
 
+### Step 10.5 — Report CI status (informational only)
+
+After teardown completes, poll `gh pr checks` to surface the CI outcome to the user. This step is informational only — it does NOT control teardown (which already happened in Step 10).
+
+```python
+from scripts.pr import wait_and_report_ci
+status_line = wait_and_report_ci(pr_url, timeout_seconds=120)
+print(status_line)
+```
+
+The function returns one of:
+- `"✓ CI green on <pr_url> ..."` — all checks passed.
+- `"✗ CI failing on <pr_url> ..."` — the PR branch is the recovery artifact (the clone is gone by design; CI failures recover by checking out the PR branch fresh).
+- `"⌛ CI did not complete within 120s ..."` — check manually.
+
+Surface the line to the user verbatim in the final summary.
+
 ### Step 11 — Surface the summary
 
 Return / print to the caller (`skills/improve/SKILL.md`):

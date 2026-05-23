@@ -132,17 +132,22 @@ If, after all rejections, the working tree is clean (no remaining changes), aban
 ```
 python3 -c "
 from pathlib import Path
-from scripts.test_runner import run_tests_in_clone
-passed, count = run_tests_in_clone(Path(r'<clone_dir>'), '<project[\"test_command\"]>')
-print('PASS' if passed else 'FAIL', count)
+from scripts.ci_runner import run_ci_checks
+all_passed, results = run_ci_checks(Path(r'<clone_dir>'), '<project[\"test_command\"]>')
+for name, (ok, output) in results.items():
+    print(f'{\"PASS\" if ok else \"FAIL\"}: {name}')
 "
 ```
 
-- **PASS:** record `n_tests = count`, proceed to Phase 5c.
+- **PASS (all checks green):** proceed to Phase 5c.
 - **FAIL:**
   1. Capture the failing output for the agents to read.
-  2. Dispatch the relevant agents (typically the implementers from Phase 4 plus any test-focused experts in the roster) to read the failure, propose a fix, and apply it to the clone.
-  3. Re-run the test command. Iterate this fix-and-retest loop **within Phase 5b** — do NOT escalate a test failure to "next cycle." Multiple fix rounds happen in the same cycle.
+  2. **Per-check routing**: when `results` contains failed checks, route by check name:
+     - `tests` failure → dispatch the implementer agents from Phase 4 plus any test-focused experts. Diagnose the failure and apply a fix in the clone working tree.
+     - `ruff_check` failure → dispatch a single style-focused agent (or the implementer); apply `ruff check --fix .` in the clone; recommit if changes were produced.
+     - `ruff_format` failure → run `ruff format .` in the clone; recommit.
+     - `lint_warning` → not a failure; surface the warning to the user but proceed.
+  3. Re-run the CI checks. Iterate this fix-and-retest loop **within Phase 5b** — do NOT escalate a test failure to "next cycle." Multiple fix rounds happen in the same cycle.
   4. Bound the iteration: if after 3 fix attempts the suite is still red, OR if the agents conclude the failure is structural (test exposes a design flaw the proposed change cannot fix), abandon:
 
      ```python
@@ -179,21 +184,20 @@ Capture the resulting commit sha (`git -C <clone_dir> rev-parse HEAD`).
 
 Also write the full meeting minutes into the clone at the same relative path before committing — the commit message references it.
 
-### Phase 5d — Capture minutes to Kaizen's memex
+### Phase 5d — Minutes (committed in Phase 5c; cross-run capture deferred)
 
-The cycle minutes belong in Kaizen's own wiki (not the target's), so future runs can search across past cycles.
+The cycle minutes are committed into the clone at `docs/kaizen/<YYYY-MM-DD>-cycle-<n>-minutes.md` during Phase 5c. The PR therefore preserves them in git history — that is the canonical store for cycle minutes.
 
-Slug: `kaizen:cycle:<run_id>-<cycle_n>`
-
-Invoke `memex capture` against the Kaizen repo:
+The original spec also intended to capture minutes into Kaizen's own Memex wiki via `memex:run capture` for cross-run search. **This is currently deferred** — `memex:run` is a Claude Code skill, not a CLI binary, and a Python subprocess cannot invoke a Claude Code skill. Until a future architecture allows skill invocation from subprocess, cross-run Memex capture is a manual step the user can perform post-cycle:
 
 ```
-cd <kaizen-root>
-memex capture --id kaizen:cycle:<run_id>-<cycle_n>
-# stdin: the full minutes markdown
+# After the PR opens, from the kaizen repo root:
+memex:run capture --id kaizen:cycle:<run_id>-<cycle_n> docs/kaizen/<YYYY-MM-DD>-cycle-<n>-minutes.md
 ```
 
-If `memex` is not on PATH or capture fails, do not abandon the cycle — log a warning and continue with `minutes_memex_slug=None`. The cycle still succeeded; the minutes can be re-ingested manually later.
+Slug convention: `kaizen:cycle:<run_id>-<cycle_n>`.
+
+Set `minutes_memex_slug = "kaizen:cycle:<run_id>-<cycle_n>"` in the cycle return dict so the orchestrator surfaces it in the run summary — the slug is the intended identifier even though capture is manual.
 
 ### Return outcome
 

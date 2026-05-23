@@ -71,16 +71,27 @@ def run_ci_checks(
             ("ruff_check", ["ruff", "check", "."]),
             ("ruff_format", ["ruff", "format", "--check", "."]),
         ]:
-            r = subprocess.run(
-                argv_ruff,
-                cwd=clone_dir,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
-            results[name] = (r.returncode == 0, r.stdout + r.stderr)
+            try:
+                r = subprocess.run(
+                    argv_ruff,
+                    cwd=clone_dir,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+                results[name] = (r.returncode == 0, r.stdout + r.stderr)
+            except FileNotFoundError:
+                # Safety F1.3: ruff binary absent. Fail loudly with a named
+                # error rather than crashing the cycle. Caller should install
+                # ruff (or stop opting in via pyproject.toml [tool.ruff]).
+                results[name] = (
+                    False,
+                    f"ruff binary not found on PATH — install ruff to enable "
+                    f"the '{name}' CI mirror check (or remove [tool.ruff] "
+                    f"from the target's pyproject.toml to skip lint).",
+                )
     else:
         results["lint_warning"] = (
             True,

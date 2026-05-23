@@ -6,12 +6,6 @@ as callables — Python cannot directly call Claude Code session tools.
 The orchestrating agent (running internal/cycle/SKILL.md with mode='team')
 provides the wrappers from its own tool context. Tests inject mocks.
 
-**Cycle 4 ships only the lifecycle skeleton.** Phase 1-5c orchestration
-is stubbed via a single send_message to the first roster member. A
-future cycle replaces the skeleton body with the real agenda/wave/
-review-loop dispatch; the lifecycle (team_create → ... → team_delete
-in finally) is the load-bearing contract this cycle locks down.
-
 # Architecture
 
 The Agent Teams API (TeamCreate, SendMessage, TeamDelete) is a Claude Code
@@ -31,6 +25,40 @@ inject mocks.
 If it is absent, ``team_cycle_executor`` raises ``TeamToolsUnavailableError``
 immediately so the caller can surface a clear error rather than silently
 falling back to subagent mode.
+
+# Wire protocol — agent response messages
+
+The wrapper-side agent responses come back as **plain strings**. To keep
+the orchestration deterministic and testable, this executor reads the
+strings using a small set of conventions defined here as the single
+source of truth (the production wrapper must follow them — drift = bugs):
+
+1. **ABANDON signal** — any response whose first non-whitespace text is
+   the prefix ``ABANDON:`` means "this participant cannot continue";
+   the rest of the line is treated as the reason text.
+
+2. **Agenda items (Phase 1)** — the PM's response is a list of items,
+   one per non-blank line. The whole-line content is the agenda item.
+   Lines starting with ``#`` are treated as headers and ignored.
+
+3. **Action Items DAG (Phase 3 close)** — the PM's close response is
+   expected to contain a fenced ```json``` block whose body parses to a
+   list of Action Item dicts matching ``scripts.dag.validate_dag``'s
+   schema (id/touches/reads/depends_on/wave/owner). If no JSON block is
+   found, the parser returns ``[]`` and the executor surfaces this as a
+   no_consensus abandonment with a clear detail message.
+
+4. **Reviewer findings (Phase 5b')** — each reviewer's response is a
+   list of finding lines, one per line, in the format
+   ``[severity] file:line — text``. A response containing the literal
+   substring ``NO ISSUES`` (case-insensitive) returns an empty list,
+   which the fix loop treats as "this reviewer is satisfied".
+
+These conventions are minimal-by-design: the orchestrator doesn't try
+to parse free-form prose; the wrapper-side agents emit the small
+amount of structure documented above. If a future cycle wants a richer
+protocol, it should evolve this module and ``internal/cycle/SKILL.md``
+together.
 
 # Outcome dict (matches internal/cycle/SKILL.md)
 
@@ -63,10 +91,29 @@ falling back to subagent mode.
 
 from __future__ import annotations
 
+import datetime
+import json
 import os
+import re
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
+
+from scripts.ci_runner import run_ci_checks
+from scripts.cycle_git import commit_cycle
+from scripts.dag import validate_dag
+from scripts.fix_loop import (
+    _BLOCKING_SEVERITIES,
+    Finding,
+    FixLoopExhausted,
+    FixLoopState,
+    build_abandonment_outcome,
+    record_findings,
+    should_continue,
+    start_iteration,
+)
+from scripts.reviewers import InsufficientRosterError, select_reviewers
 
 
 class TeamToolsUnavailableError(RuntimeError):
@@ -140,6 +187,312 @@ def _check_team_tools_available() -> None:
         )
 
 
+# ── Wire protocol helpers ─────────────────────────────────────────────────
+
+
+def _is_abandon(response: str) -> bool:
+    """True if `response` is an ABANDON signal per the wire protocol."""
+    return isinstance(response, str) and response.lstrip().startswith("ABANDON:")
+
+
+def _abandon_reason(response: str) -> str:
+    """Extract the reason text after the ABANDON: prefix; returns '' if none."""
+    stripped = response.lstrip()
+    if not stripped.startswith("ABANDON:"):
+        return ""
+    return stripped[len("ABANDON:") :].strip()
+
+
+def _parse_agenda_items(response: str) -> list[str]:
+    """Parse the PM's Phase-1 agenda response into items, one per non-blank line.
+
+    Lines starting with ``#`` are skipped (treated as section headers).
+    Empty input → empty list. Whitespace is stripped per item.
+
+    See module docstring §2 for the protocol.
+    """
+    items: list[str] = []
+    for line in (response or "").splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        if text.startswith("#"):
+            continue
+        items.append(text)
+    return items
+
+
+_JSON_BLOCK_RE = re.compile(r"```json\s*\n(.*?)\n```", re.DOTALL)
+
+
+def _parse_action_items(response: str) -> list[dict]:
+    """Parse the PM's Phase-3 close response into Action Item dicts.
+
+    Looks for the first ```json``` fenced block and parses its body as a
+    JSON list. Each element is returned as-is — `scripts.dag.validate_dag`
+    will fail-loud on shape mismatch. Returns ``[]`` when no JSON block
+    is found or when the body fails to parse (the caller surfaces this
+    as a no_consensus abandonment).
+
+    See module docstring §3 for the protocol.
+    """
+    if not response:
+        return []
+    match = _JSON_BLOCK_RE.search(response)
+    if match is None:
+        return []
+    try:
+        data = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, list):
+        return []
+    return data
+
+
+# Accept ASCII hyphen, em-dash (U+2014), and en-dash (U+2013) as the optional
+# separator between "file:line" and the finding text - real reviewers use any.
+# Unicode escapes here so ruff's RUF001 ambiguous-char check stays quiet.
+_FINDING_LINE_RE = re.compile(
+    "^\\s*\\[(?P<severity>blocker|major|minor|nit)\\]\\s+"
+    "(?P<file_line>\\S+)\\s+"
+    "(?:[-\u2014\u2013]\\s*)?(?P<text>.+?)\\s*$"
+)
+
+
+def _parse_reviewer_response(
+    response: str,
+    reviewer: str,
+    prefix: str,
+) -> list[Finding]:
+    """Parse a reviewer's response into `Finding` objects.
+
+    Per the wire protocol (§4): a literal ``NO ISSUES`` substring (case
+    insensitive) → empty list. Otherwise each line matching
+    ``[severity] file:line — text`` becomes a `Finding`. Lines that don't
+    match are silently skipped — reviewers may include prose before/after
+    their finding list. `prefix` is used to build stable per-iteration
+    finding ids (e.g. ``R1-1``, ``R1-2``).
+    """
+    if not response:
+        return []
+    if "no issues" in response.lower():
+        return []
+    findings: list[Finding] = []
+    seq = 0
+    for line in response.splitlines():
+        m = _FINDING_LINE_RE.match(line)
+        if m is None:
+            continue
+        seq += 1
+        findings.append(
+            Finding(
+                finding_id=f"{prefix}-{seq}",
+                reviewer=reviewer,
+                severity=m.group("severity"),
+                finding=m.group("text"),
+                file_line=m.group("file_line"),
+            )
+        )
+    return findings
+
+
+def _collect_existing_files(clone_dir: Path) -> frozenset[str]:
+    """Return the set of repo-relative file paths currently on disk in clone_dir.
+
+    Used by `validate_dag` gate 3 (reads satisfiable). Walks the working
+    tree, skipping the usual transient/VCS directories. Errors (e.g. clone
+    doesn't exist yet) are tolerated by returning an empty frozenset — the
+    DAG validator will then surface unsatisfiable-reads errors with
+    meaningful messages.
+    """
+    if not clone_dir or not Path(clone_dir).exists():
+        return frozenset()
+    skip = {".git", ".ai", "__pycache__", ".pytest_cache", ".ruff_cache", "node_modules"}
+    out: set[str] = set()
+    root = Path(clone_dir)
+    try:
+        for p in root.rglob("*"):
+            if not p.is_file():
+                continue
+            # Skip if any path part is in the skip set
+            if any(part in skip for part in p.relative_to(root).parts):
+                continue
+            out.add(str(p.relative_to(root)))
+    except OSError:
+        return frozenset()
+    return frozenset(out)
+
+
+# ── Phase brief builders ───────────────────────────────────────────────────
+
+
+def _phase_1_agenda_brief(subject: str | None, cycle_n: int) -> str:
+    return (
+        f"Kaizen cycle {cycle_n} — Phase 1 (Agenda). "
+        f"Subject: {subject or 'PM-directed'}. "
+        "Propose 1-5 agenda items, one per line. Prefix 'ABANDON:' if you "
+        "cannot in good faith produce any useful agenda for this cycle."
+    )
+
+
+def _phase_2_preanalysis_brief(agenda_items: list[str], participant: str) -> str:
+    bullets = "\n".join(f"- {item}" for item in agenda_items)
+    return (
+        f"Phase 2 (Pre-analysis). You are {participant}. "
+        f"Agenda from PM:\n{bullets}\n\n"
+        "Produce a short proposal touching each item from your domain lens. "
+        "Prefix 'ABANDON:' to opt out."
+    )
+
+
+def _phase_3_open_brief(proposals: list[dict]) -> str:
+    summary_lines = [f"- {p['agent']}: {p['raw'][:200]}" for p in proposals]
+    body = "\n".join(summary_lines) if summary_lines else "(no proposals collected)"
+    return (
+        "Phase 3 open (Synthesis meeting — Star). All Phase-2 proposals "
+        f"below; read them and prepare your debate position:\n{body}"
+    )
+
+
+def _phase_3_debate_brief() -> str:
+    return (
+        "Phase 3 debate (Mesh). State your remaining concerns and your "
+        "agreed scope for this cycle. Prefix 'ABANDON:' if no consensus "
+        "is reachable from your seat."
+    )
+
+
+def _phase_3_close_brief(proposals: list[dict], agreements: list[dict]) -> str:
+    return (
+        "Phase 3 close (Star). Consolidate the proposals and the agreed "
+        f"scope into a single Action Items DAG. Proposals: {len(proposals)}; "
+        f"agreements: {len(agreements)}. "
+        "Reply with one fenced ```json``` block containing a JSON list of "
+        "Action Item dicts. Each dict must have keys: id (str), touches "
+        "(list[str]), reads (list[str]), depends_on (list[str]), "
+        "wave (int), owner (str role id). "
+        "Prefix 'ABANDON:' if no DAG can be agreed."
+    )
+
+
+def _phase_4_implementer_brief(item: dict, wave_n: int) -> str:
+    return (
+        f"Phase 4 wave {wave_n} — implement Action Item {item['id']}. "
+        f"You own this item. Touches: {item.get('touches')}; "
+        f"reads: {item.get('reads')}. Apply the change to disk in the "
+        "clone and reply with a one-line summary of what you did. "
+        "Prefix 'ABANDON:' if the change cannot be applied."
+    )
+
+
+def _phase_5b_prime_reviewer_brief(
+    iter_n: int,
+    action_items: list[dict],
+    prior_findings: list[Finding] | None = None,
+) -> str:
+    """Build the reviewer brief for iteration `iter_n`.
+
+    On iteration 1 (or when `prior_findings` is None/empty) the brief is the
+    fresh-review form. On iteration 2+ the brief carries forward the
+    previously-unresolved findings so reviewers can do incremental review
+    rather than re-scanning the whole diff from scratch.
+    """
+    ids = [item["id"] for item in action_items]
+    base = (
+        f"Phase 5b' iteration {iter_n} — independent review. "
+        f"Review the implemented Action Items: {ids}. Reply with either "
+        "'NO ISSUES' (case-insensitive) OR one finding per line in the "
+        "format: [severity] file:line — text  "
+        "(severity ∈ blocker|major|minor|nit)."
+    )
+    if not prior_findings:
+        return base
+    # Render the carry-forward block so iteration 2+ reviewers can do
+    # incremental review against the previous round's surviving findings.
+    prior_lines = [
+        f"  - {f.finding_id} [{f.severity}] {f.reviewer} @ {f.file_line}: {f.finding}"
+        for f in prior_findings
+    ]
+    prior_block = "\n".join(prior_lines)
+    return (
+        f"{base}\n\nPreviously unresolved findings (iteration {iter_n - 1}); "
+        f"verify whether the implementer's fix attempts resolved each:\n{prior_block}"
+    )
+
+
+def _phase_5b_prime_fix_brief(finding: Finding) -> str:
+    return (
+        f"Phase 5b' fix — address finding {finding.finding_id} "
+        f"({finding.severity}) at {finding.file_line}: {finding.finding}. "
+        "Apply the fix and reply with a one-line confirmation. Prefix "
+        "'ABANDON:' if the fix cannot be applied."
+    )
+
+
+def _phase_5b_prime_pm_acceptance_brief(
+    findings: list[Finding],
+    iter_n: int,
+) -> str:
+    """Ask the PM whether the unresolved findings are acceptable for this cycle.
+
+    Per internal/cycle/SKILL.md the PM may rule remaining issues acceptable
+    (a legitimate fix-loop exit). Reply must start with ACCEPT or REJECT.
+    """
+    finding_lines = [
+        f"  - {f.finding_id} [{f.severity}] {f.reviewer} @ {f.file_line}: {f.finding}"
+        for f in findings
+    ]
+    body = "\n".join(finding_lines) if finding_lines else "  (none)"
+    return (
+        f"Phase 5b' PM acceptance check (iteration {iter_n}). "
+        f"The reviewers surfaced these findings:\n{body}\n\n"
+        "As PM, do you accept them as out-of-scope for THIS cycle (we will "
+        "log them for follow-up), or do we keep iterating? Reply starting "
+        "with ACCEPT or REJECT, followed by a one-line rationale."
+    )
+
+
+def _find_owner_for_finding(
+    finding: Finding,
+    file_to_owner: dict[str, str],
+    pm: str,
+) -> str:
+    """Map a `Finding` to the implementer who should fix it.
+
+    Per internal/cycle/SKILL.md Phase 5b' the IMPLEMENTER (the Action Item
+    owner from Phase 3) fixes findings — never the reviewer who flagged
+    them. We extract the file from `finding.file_line` ("file:line") and
+    look it up in the file→owner index built at Phase 4 dispatch time.
+    When the file isn't owned by any Action Item (e.g. a reviewer surfaced
+    a cross-cutting issue) we fall back to the PM, who can re-route.
+    """
+    raw = finding.file_line or ""
+    file = raw.split(":", 1)[0] if ":" in raw else raw
+    return file_to_owner.get(file, pm)
+
+
+# ── Outcome helpers ────────────────────────────────────────────────────────
+
+
+def _abandon(
+    outcome_acc: TeamCycleOutcome,
+    *,
+    phase_reached: str,
+    reason: str,
+    detail: str,
+) -> TeamCycleOutcome:
+    """Mark `outcome_acc` abandoned and return it. Caller returns out of try:."""
+    outcome_acc.abandoned = True
+    outcome_acc.phase_reached = phase_reached
+    outcome_acc.reason = reason
+    outcome_acc.detail = detail
+    return outcome_acc
+
+
+# ── Main entry point ───────────────────────────────────────────────────────
+
+
 def team_cycle_executor(
     clone_dir: Path,
     project: dict,
@@ -160,35 +513,31 @@ def team_cycle_executor(
       1. ``_check_team_tools_available()`` — env-var preflight
       2. If ``tools is None``: raise ``TeamToolsUnavailableError`` with a
          message telling the caller to inject a ``TeamTools`` implementation
-      3. ``team_id = tools.team_create(name, members=project["expert_roster"])``
-      4. try:
-             run the Phase 1-5c flow (SKELETON for this cycle):
-               - Phase 1 (agenda): ``tools.send_message(team_id, to=pm, message=...)``
-               - Phase 2 (parallel pre-analysis): send_message to each participant
-               - Phase 3 (synthesis meeting): orchestrated via send_message round-trips
-               - Phase 4 (implementation): each owner's send_message returns their work
-               - Phase 5a-c (destructive check, tests, commit): same orchestration
+      3. Runtime Protocol shape check — every required method callable
+      4. ``team_id = tools.team_create(name, members=project["expert_roster"])``
+      5. try:
+             - Phase 1 (agenda): PM proposes agenda items
+             - Phase 2 (pre-analysis): each non-PM participant proposes
+             - Phase 3 (synthesis): Star → Mesh → Star, PM consolidates Action
+               Items DAG, validate_dag enforces the 4 gates
+             - Phase 4 (waves): each wave dispatches its owners' work, then
+               runs CI at the wave boundary
+             - Phase 5b' (reviewers): disjoint reviewer selection + fix loop
+               (max 5 iterations, blocker+major findings drive re-review)
+             - Phase 5c (commit): real git commit via commit_cycle()
          finally:
              ``tools.team_delete(team_id)``  # ALWAYS — even on abandon or exception
-      5. Return the outcome dict matching the contract in the module docstring
-
-    For THIS cycle, the Phase 1-5c implementation is a SKELETON that:
-      - Calls ``team_create`` / ``send_message`` / ``team_delete`` in the right order
-      - Returns a success outcome on the happy path
-      - Returns an abandonment outcome with ``phase_reached='meeting'`` and
-        ``reason='other'`` when ``send_message`` returns a string starting
-        with ``"ABANDON:"`` (the wrapper's convention for "this participant
-        signaled abandonment")
-
-    Real Phase 1-5c semantics are out of scope for this cycle — the
-    skeleton's purpose is to prove the LIFECYCLE invariants (team_create
-    fires, team_delete ALWAYS fires, outcome dict shape is honored) so
-    that a future cycle can fill in the agenda/meeting/wave logic without
-    re-litigating the dispatch architecture.
+      6. Return the outcome dict matching the contract in the module docstring
 
     The ``team_delete``-in-``finally`` invariant is the critical behavioral
     contract — without it, orphan teams pollute the user's Claude Code
     session across cycles.
+
+    # NOTE Phase 2 is sequential under the executor's view: `tools.send_message`
+    # is synchronous from this side per the wrapper contract (the wrapper is
+    # responsible for the underlying parallelism, if any). The real Agent
+    # Teams API could fan-out, but the wrapper's contract is one-call →
+    # one-response.
     """
     _check_team_tools_available()
 
@@ -227,35 +576,344 @@ def team_cycle_executor(
 
     outcome_acc = TeamCycleOutcome(participants=list(roster) if roster else [pm])
 
+    commit_sha: str | None = None
     team_id = tools.team_create(team_name, members=roster if roster else [pm])
 
     try:
-        # SKELETON: this single send_message stands in for the full Phase
-        # 1-5c orchestration (agenda → pre-analysis → synthesis → waves
-        # → destructive check → tests → commit). A future cycle will
-        # expand this into the real flow. The lifecycle invariants
-        # (team_create → send_message → team_delete in a finally) are
-        # what this skeleton is here to lock down.
-        response = tools.send_message(
+        # ── Phase 1 — Agenda (PM) ─────────────────────────────────────────
+        agenda_response = tools.send_message(
             team_id,
             to=pm,
-            message=(
-                f"Kaizen cycle {cycle_n} (skeleton). "
-                f"Subject: {subject or 'PM-directed'}. "
-                "Respond with a one-line agenda or prefix 'ABANDON:' to abandon."
-            ),
+            message=_phase_1_agenda_brief(subject, cycle_n),
         )
-
-        if isinstance(response, str) and response.startswith("ABANDON:"):
-            reasoning = response[len("ABANDON:") :].strip()
-            outcome_acc.abandoned = True
-            outcome_acc.phase_reached = "meeting"
-            outcome_acc.reason = "other"
-            outcome_acc.detail = (
-                f"Participant {pm} signaled abandonment during Phase 1 (agenda): {reasoning}"
+        if _is_abandon(agenda_response):
+            _abandon(
+                outcome_acc,
+                phase_reached="agenda",
+                reason="other",
+                detail=f"PM {pm} abandoned at agenda: {_abandon_reason(agenda_response)}",
             )
         else:
-            outcome_acc.decisions.append(response if isinstance(response, str) else str(response))
+            agenda_items = _parse_agenda_items(agenda_response)
+            if not agenda_items:
+                _abandon(
+                    outcome_acc,
+                    phase_reached="agenda",
+                    reason="other",
+                    detail="PM produced no agenda items (response empty or unparseable).",
+                )
+
+        # ── Phase 2 — Parallel pre-analysis ───────────────────────────────
+        # NOTE: tools.send_message is synchronous from the executor's view
+        # per the wrapper contract. Serial dispatch here is a deliberate
+        # simplification; the wrapper could parallelise internally.
+        proposals: list[dict] = []
+        if not outcome_acc.abandoned:
+            for participant in roster:
+                if participant == pm:
+                    continue
+                resp = tools.send_message(
+                    team_id,
+                    to=participant,
+                    message=_phase_2_preanalysis_brief(agenda_items, participant),
+                )
+                if _is_abandon(resp):
+                    _abandon(
+                        outcome_acc,
+                        phase_reached="meeting",
+                        reason="other",
+                        detail=(
+                            f"{participant} abandoned at pre-analysis: {_abandon_reason(resp)}"
+                        ),
+                    )
+                    break
+                proposals.append({"agent": participant, "raw": resp or ""})
+
+        # ── Phase 3 — Synthesis meeting (Star → Mesh → Star) ──────────────
+        action_items: list[dict] = []
+        waves: tuple[tuple[str, ...], ...] = ()
+        if not outcome_acc.abandoned:
+            # Star open: brief every roster member with the proposals
+            for participant in roster:
+                tools.send_message(
+                    team_id,
+                    to=participant,
+                    message=_phase_3_open_brief(proposals),
+                )
+
+            # Mesh (simplified): each participant signals consensus
+            agreements: list[dict] = []
+            for participant in roster:
+                resp = tools.send_message(
+                    team_id,
+                    to=participant,
+                    message=_phase_3_debate_brief(),
+                )
+                if _is_abandon(resp):
+                    _abandon(
+                        outcome_acc,
+                        phase_reached="meeting",
+                        reason="no_consensus",
+                        detail=(
+                            f"{participant} could not reach consensus: {_abandon_reason(resp)}"
+                        ),
+                    )
+                    break
+                agreements.append({"agent": participant, "raw": resp or ""})
+
+        if not outcome_acc.abandoned:
+            # Star close: PM consolidates into Action Items DAG
+            close_resp = tools.send_message(
+                team_id,
+                to=pm,
+                message=_phase_3_close_brief(proposals, agreements),
+            )
+            if _is_abandon(close_resp):
+                _abandon(
+                    outcome_acc,
+                    phase_reached="meeting",
+                    reason="no_consensus",
+                    detail=f"PM could not consolidate: {_abandon_reason(close_resp)}",
+                )
+            else:
+                action_items = _parse_action_items(close_resp)
+                if not action_items:
+                    _abandon(
+                        outcome_acc,
+                        phase_reached="meeting",
+                        reason="no_consensus",
+                        detail=(
+                            "PM close response contained no parseable Action "
+                            "Items JSON block (expected a ```json``` fenced list)."
+                        ),
+                    )
+                else:
+                    existing_files = _collect_existing_files(clone_dir)
+                    try:
+                        validation = validate_dag(action_items, existing_files=existing_files)
+                    except ValueError as shape_err:
+                        _abandon(
+                            outcome_acc,
+                            phase_reached="meeting",
+                            reason="no_consensus",
+                            detail=(f"Action Items DAG shape error: {shape_err}"),
+                        )
+                    else:
+                        if not validation.ok:
+                            _abandon(
+                                outcome_acc,
+                                phase_reached="meeting",
+                                reason="no_consensus",
+                                detail=(
+                                    "Action Items DAG failed validation: "
+                                    + "; ".join(str(e) for e in validation.errors)
+                                ),
+                            )
+                        else:
+                            waves = validation.waves
+
+        # ── Phase 4 — Wave-based dispatch ─────────────────────────────────
+        # Build file→owner index up-front so Phase 5b' fix routing
+        # (implementer fixes, NOT reviewer) has a deterministic lookup
+        # table. Per internal/cycle/SKILL.md: "Implementers (Owner from
+        # Phase 3 carries forward) fix all blocker + major issues."
+        file_to_owner: dict[str, str] = {}
+        if action_items:
+            for item in action_items:
+                owner = item.get("owner") or pm
+                for f in item.get("touches", []):
+                    file_to_owner.setdefault(f, owner)
+        if not outcome_acc.abandoned and waves:
+            items_by_id = {item["id"]: item for item in action_items}
+            for wave_n, wave_ids in enumerate(waves, start=1):
+                wave_abandoned = False
+                for ai_id in wave_ids:
+                    item = items_by_id[ai_id]
+                    owner = item.get("owner") or pm
+                    impl_resp = tools.send_message(
+                        team_id,
+                        to=owner,
+                        message=_phase_4_implementer_brief(item, wave_n),
+                    )
+                    if _is_abandon(impl_resp):
+                        _abandon(
+                            outcome_acc,
+                            phase_reached="implementation",
+                            reason="other",
+                            detail=(
+                                f"Owner {owner} abandoned AI {ai_id}: {_abandon_reason(impl_resp)}"
+                            ),
+                        )
+                        wave_abandoned = True
+                        break
+                    outcome_acc.decisions.append(f"AI {ai_id}: {(impl_resp or '')[:200]}")
+                if wave_abandoned:
+                    break
+                # CI mirror at every wave boundary
+                test_command = project.get("test_command") or "pytest"
+                all_passed, results = run_ci_checks(clone_dir, test_command)
+                if not all_passed:
+                    failed = [name for name, (ok, _) in results.items() if not ok]
+                    _abandon(
+                        outcome_acc,
+                        phase_reached="test",
+                        reason="tests_unrecoverable",
+                        detail=f"CI failed after wave {wave_n}: {failed}",
+                    )
+                    break
+
+        # ── Phase 5b' — Independent reviewers + fix loop ──────────────────
+        if not outcome_acc.abandoned and action_items:
+            implementers = [item.get("owner") for item in action_items if item.get("owner")]
+            disjoint_pool_size = len([r for r in roster if r not in set(implementers)])
+            n_reviewers = min(3, disjoint_pool_size) if disjoint_pool_size > 0 else 0
+            if n_reviewers < 1:
+                _abandon(
+                    outcome_acc,
+                    phase_reached="review",
+                    reason="other",
+                    detail=(
+                        "Cannot select any disjoint reviewer — roster too small "
+                        f"(roster={len(roster)}, implementers={len(set(implementers))})."
+                    ),
+                )
+            else:
+                try:
+                    reviewers = select_reviewers(
+                        roster,
+                        implementers,
+                        n=n_reviewers,
+                        preferred_lenses=["security", "architect", "prompt", "safety"],
+                    )
+                except InsufficientRosterError as e:
+                    _abandon(
+                        outcome_acc,
+                        phase_reached="review",
+                        reason="other",
+                        detail=f"Cannot select disjoint reviewers: {e}",
+                    )
+                else:
+                    state = FixLoopState()
+                    review_outcome: dict | None = None
+                    while True:
+                        try:
+                            iter_n = start_iteration(state)
+                        except FixLoopExhausted:
+                            # Should not normally reach here — the loop body
+                            # below catches the exhaustion case explicitly so
+                            # the abandonment outcome is built with the most
+                            # recent findings recorded. Kept as a defensive
+                            # guard in case future refactors change the flow.
+                            review_outcome = build_abandonment_outcome(
+                                state,
+                                subject=subject,
+                                participants=outcome_acc.participants,
+                            )
+                            break
+                        # Carry forward the previous round's findings so
+                        # iteration 2+ reviewers do incremental review
+                        # rather than a fresh scan (Major 3).
+                        prior = state.history[-1] if state.history else None
+                        findings: list[Finding] = []
+                        for reviewer in reviewers:
+                            resp = tools.send_message(
+                                team_id,
+                                to=reviewer,
+                                message=_phase_5b_prime_reviewer_brief(
+                                    iter_n, action_items, prior_findings=prior
+                                ),
+                            )
+                            findings.extend(
+                                _parse_reviewer_response(resp or "", reviewer, prefix=f"R{iter_n}")
+                            )
+                        record_findings(state, findings)
+                        latest_blockers = [
+                            f for f in findings if f.severity in _BLOCKING_SEVERITIES
+                        ]
+                        if not latest_blockers:
+                            break  # zero blocking findings → clean exit
+                        # Ask the PM whether the remaining findings are
+                        # acceptable for this cycle. PM-acceptance is a
+                        # legit exit per SKILL contract (Major 2).
+                        pm_resp = tools.send_message(
+                            team_id,
+                            to=pm,
+                            message=_phase_5b_prime_pm_acceptance_brief(latest_blockers, iter_n),
+                        )
+                        pm_accepts = (pm_resp or "").strip().upper().startswith("ACCEPT")
+                        if not should_continue(state, pm_accepts_remaining=pm_accepts):
+                            if pm_accepts:
+                                # Clean exit — PM ruled remaining issues
+                                # acceptable; no abandonment outcome.
+                                break
+                            # MAX_ITERATIONS reached with blockers still
+                            # present — this is the review_unrecoverable case.
+                            review_outcome = build_abandonment_outcome(
+                                state,
+                                subject=subject,
+                                participants=outcome_acc.participants,
+                            )
+                            break
+                        # Fix round — dispatch fixes for blocker+major findings.
+                        # Per SKILL: the IMPLEMENTER (Action Item owner) fixes,
+                        # never the reviewer who flagged it (Major 1).
+                        fix_loop_aborted = False
+                        for finding in latest_blockers:
+                            fix_owner = _find_owner_for_finding(finding, file_to_owner, pm)
+                            fix_resp = tools.send_message(
+                                team_id,
+                                to=fix_owner,
+                                message=_phase_5b_prime_fix_brief(finding),
+                            )
+                            if _is_abandon(fix_resp):
+                                review_outcome = build_abandonment_outcome(
+                                    state,
+                                    subject=subject,
+                                    participants=outcome_acc.participants,
+                                )
+                                fix_loop_aborted = True
+                                break
+                        if fix_loop_aborted:
+                            break
+
+                    if review_outcome is not None:
+                        # Bubble the fix_loop-built abandonment fields up so
+                        # the success path is bypassed and the dict shape is
+                        # the canonical Phase 5b' review_unrecoverable form.
+                        _abandon(
+                            outcome_acc,
+                            phase_reached=review_outcome["phase_reached"],
+                            reason=review_outcome["reason"],
+                            detail=review_outcome["detail"],
+                        )
+                        outcome_acc.review_iteration_count = review_outcome[
+                            "review_iteration_count"
+                        ]
+                        outcome_acc.unresolved_findings = review_outcome["unresolved_findings"]
+                        outcome_acc.convergence_summary = review_outcome["convergence_summary"]
+                        outcome_acc.reviewer_attribution = review_outcome["reviewer_attribution"]
+
+        # ── Phase 5c — Commit ────────────────────────────────────────────
+        if not outcome_acc.abandoned:
+            minutes_rel = (
+                f"docs/kaizen/{datetime.date.today().isoformat()}-cycle-{cycle_n}-minutes.md"
+            )
+            commit_cycle(
+                clone_dir=clone_dir,
+                cycle_n=cycle_n,
+                decisions=outcome_acc.decisions or ["team-mode cycle"],
+                participants=outcome_acc.participants,
+                n_tests=0,
+                subject=subject or "team-mode",
+                minutes_rel_path=minutes_rel,
+            )
+            rev = subprocess.run(
+                ["git", "-C", str(clone_dir), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            commit_sha = rev.stdout.strip()
     finally:
         # CRITICAL INVARIANT: team_delete ALWAYS fires — even on exception
         # or abandonment — so the user's Claude Code session does not leak
@@ -286,7 +944,7 @@ def team_cycle_executor(
     return {
         "status": "success",
         "subject": subject,
-        "commit_sha": "(skeleton)",
+        "commit_sha": commit_sha or "",
         "minutes_memex_slug": f"kaizen:cycle:{run_row['id']}-{cycle_n}",
         "participants": outcome_acc.participants,
     }

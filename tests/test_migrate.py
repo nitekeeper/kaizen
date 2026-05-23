@@ -31,16 +31,17 @@ def test_migration_recorded(tmp_path):
     filenames = [row[0] for row in rows]
     assert "001_kaizen_schema.sql" in filenames
     assert "002_add_fk_indexes.sql" in filenames
+    assert "003_review_unrecoverable.sql" in filenames
 
 
 def test_migration_is_idempotent(tmp_path):
-    """Re-running migrations is a no-op and does not double-apply."""
+    """Re-running migrations is a no-op and does not double-apply (001 + 002 + 003)."""
     db_path = str(tmp_path / "test.db")
     apply_migrations(db_path, MIGRATIONS_DIR)
     apply_migrations(db_path, MIGRATIONS_DIR)  # must not raise
     with closing(get_connection(db_path)) as conn:
         count = conn.execute("SELECT COUNT(*) FROM migrations").fetchone()[0]
-    assert count == 2
+    assert count == 3
 
 
 def test_fk_indexes_created(tmp_path):
@@ -233,7 +234,13 @@ def test_abandonments_valid_values_accepted(tmp_path):
         project_id = _insert_project(conn)
         cycle_id = _insert_run_and_cycle(conn, project_id)
         valid_phases = ("agenda", "meeting", "implementation", "test")
-        valid_reasons = ("no_consensus", "destructive_rejected", "tests_unrecoverable", "other")
+        valid_reasons = (
+            "no_consensus",
+            "destructive_rejected",
+            "tests_unrecoverable",
+            "review_unrecoverable",
+            "other",
+        )
         for phase in valid_phases:
             for reason in valid_reasons:
                 conn.execute(

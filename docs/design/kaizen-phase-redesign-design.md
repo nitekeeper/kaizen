@@ -1,6 +1,6 @@
 # Kaizen Phase Redesign — Agent Teams + Waves + Independent Reviewers
 
-**Status:** seed design — kaizen-on-kaizen run 10 will iterate on this in detail.
+**Status:** implemented — Run 10 (kaizen-on-kaizen) shipped cycles 1-3.
 **Branch:** `agent-team` (long-lived; merges to main after dogfood validation).
 **Date:** 2026-05-23.
 
@@ -120,7 +120,7 @@ That way the next session can pick up surgically or change approach.
 
 Add `review_unrecoverable` to the `abandonments.reason` CHECK constraint.
 
-Migration: `migrations/002_review_unrecoverable.sql` — `ALTER TABLE abandonments` not directly possible with SQLite CHECK constraints; will require a table recreation with the updated constraint. Schema migration following the existing pattern in `001_kaizen_schema.sql`.
+Migration: `migrations/003_review_unrecoverable.sql` — `ALTER TABLE abandonments` not directly possible with SQLite CHECK constraints; will require a table recreation with the updated constraint. Schema migration following the existing pattern in `001_kaizen_schema.sql`.
 
 Updated reasons list: `no_consensus`, `destructive_rejected`, `tests_unrecoverable`, `review_unrecoverable`, `other`.
 
@@ -164,3 +164,12 @@ The new Phase 3 / Phase 4 / Phase 5b' prose changes only take effect on the NEXT
 3. Does the Phase 4 wave-based dispatch produce per-wave commits or one cycle commit? Current proposal: one cycle commit (PR-readability over git granularity).
 4. Should `mini-synthesis` inside Phase 5b' be a formal sub-step or just a normal `SendMessage` conversation between conflicting reviewers? Current proposal: normal conversation; only escalate to explicit mini-synthesis when 3 reviewers triangulate.
 5. Should the abandonment report's "unresolved issues" section be machine-readable JSON or human-readable markdown? Current proposal: markdown (human-readable, matches existing report format).
+
+## Implementation status
+
+| Cycle | Scope | Commit |
+|---|---|---|
+| 1 | Phase 3 SKILL.md redesign + Phase 2 template extension | (cycle 10-1) |
+| 2 | Phase 4 SKILL.md wave-based dispatch | (cycle 10-2) |
+| 3 | NEW Phase 5b' + abandonment reason + migration + tests | (cycle 10-3) |
+| 4 | Polish + design doc finalization (this cycle) | (cycle 10-4) |

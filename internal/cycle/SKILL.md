@@ -38,7 +38,7 @@ Return a dict:
   "subject": "<cycle subject or None>",
   "participants": ["<agent_name>", ...],
   "phase_reached": "agenda" | "meeting" | "implementation" | "test",
-  "reason": "no_consensus" | "destructive_rejected" | "tests_unrecoverable" | "other",
+  "reason": "no_consensus" | "destructive_rejected" | "tests_unrecoverable" | "review_unrecoverable" | "other",
   "detail": "<free-text describing what was attempted and what blocked it>",
   "artifacts": ["<memex slug or path>", ...],
 }
@@ -73,15 +73,25 @@ Dispatch every participant in parallel (one agent per role from the resolved ros
    - **Proposal** — concrete change and rationale.
    - **Risk classification** — destructive or non-destructive (per Kaizen's destructive_check categories).
    - **Anticipated conflicts** with other agents' likely positions.
+   - **Touches** — files this proposal modifies if accepted.
+   - **Reads** — files this proposal needs in a specific state (post-other-changes) before it can be applied.
+   - **Likely depends on** — the proposing agent's best guess of which other agenda items must land first.
 
 Collect every proposal before Phase 3 begins. Do not let one slow agent block the others — give each a bounded budget; if an agent fails to respond, drop them from this cycle's roster and note in the minutes.
 
+The participants who complete Phase 2 carry through as teammates into Phase 3 — their pre-analysis context and skin-in-the-game ownership of their proposals are exactly what the synthesis meeting needs.
+
 ### Phase 3 — Synthesis meeting
 
-Read `internal/synthesis-meeting/SKILL.md` and follow its procedure with the agenda items + all collected proposals. The skill returns:
+Read `internal/synthesis-meeting/SKILL.md` and follow its procedure with the agenda items, the resolved participant list, and all collected proposals.
+
+The meeting runs as a **Star → Mesh → Star** agent-teams pattern: the lead opens by broadcasting all proposals to every participant; teammates debate directly (mesh) to validate proposals, surface false positives, and detect ripple effects; the lead closes by writing a consolidated Decisions Log and an **Action Items DAG with wave assignments**.
+
+The skill returns:
 
 - A meeting minutes block (Discussion + Decisions Log + Action Items)
 - An outcome signal: either `proceed` with at least one approved Action Item, or `abandon` with `reason=no_consensus`
+- For `proceed`: a structured Action Items list where each item carries `id`, `description`, `touches`, `reads`, `owner`, `depends_on`, and `wave`
 
 If outcome is `abandon`:
 
@@ -93,13 +103,46 @@ If outcome is `abandon`:
   "subject": run_row["subject"] }
 ```
 
-Otherwise continue with the list of approved Action Items.
+Otherwise continue with the Action Items DAG produced by the meeting. Phase 4 will use the `wave` and `depends_on` fields to coordinate parallel implementation.
 
-### Phase 4 — Implementation
+### Phase 4 — Implementation (wave-based parallel dispatch)
 
-Each agent listed in an Action Item's "Assigned to" column applies their changes directly to `clone_dir`. Agents may use any tooling appropriate — the only constraint is that the changes must land in the clone's working tree.
+The synthesis meeting (Phase 3) handed off a DAG of Action Items with `depends_on` set per task. Phase 4 consumes that DAG via the Agent Teams shared task list — execution is driven by the dependency graph, not an explicit wave loop.
 
-Coordinate to avoid stomping on the same file in incompatible ways. If a conflict surfaces mid-implementation, escalate to a mini-synthesis (one item) before proceeding — do not abandon the whole cycle for a per-file disagreement that can be resolved.
+#### Procedure
+
+1. **Lead posts the DAG to the shared task list.** Each Action Item becomes a task with the columns from Phase 3 (`Touches`, `Reads`, `Owner`, `Depends on`). Tasks start in `pending` state.
+
+2. **Teammates self-claim unblocked tasks.** A task is unblocked when all its `Depends on` predecessors are in `completed` state. File-locked claim semantics (per Agent Teams docs) prevent races when multiple teammates compete for the same task.
+
+3. **Owner-driven implementation.** Each Action Item's `Owner` (assigned in Phase 3) is the teammate that claims and implements it. The agent who proposed the change is the agent applying it — skin in the game across phases.
+
+4. **Tests run at wave boundaries.** After all tasks at topological level N complete (i.e. the "wave" closes), the lead runs:
+   ```
+   from pathlib import Path
+   from scripts.ci_runner import run_ci_checks
+   all_passed, results = run_ci_checks(Path(r'<clone_dir>'), '<project["test_command"]>')
+   ```
+   If `all_passed=False`: dispatch the wave's owners (and any test-focused experts in the roster) to fix the failing checks BEFORE wave N+1's tasks unblock. In-cycle fix iteration applies (max 3 fix rounds; abandon as `tests_unrecoverable` if not recovered).
+   If `all_passed=True`: wave N+1's tasks (which depend on wave N) automatically unblock; teammates self-claim and continue.
+
+5. **Mini-synthesis on mid-implementation conflicts.** If two teammates' work surfaces a conflict that wasn't caught in Phase 3 (e.g. an unforeseen ripple effect), they `SendMessage` each other to resolve. Lead intervenes if no resolution within 2 exchanges. Do not abandon the cycle for a resolvable per-file disagreement.
+
+6. **Wave completion = all tasks claimed and completed.** No mid-wave commits; tasks land in the clone working tree but are not committed until Phase 5c. The cycle's tests run continuously at wave boundaries to catch regressions.
+
+#### Failure modes
+
+- **A task fails repeatedly** (test failures, claimed but completion stalled): the owner abandons it back to the task list with `status=pending` and a failure note. Lead reassigns or escalates.
+- **DAG deadlock** (a task's `Depends on` references something that itself failed): break by either (a) marking the failed predecessor as `acceptable` per PM ruling, or (b) abandoning the cycle as `tests_unrecoverable`.
+
+#### What changed from the pre-redesign Phase 4
+
+| Before | After |
+|---|---|
+| Single implementer subagent ran all Action Items sequentially | Multiple teammates self-claim from shared task list with deps |
+| Mid-cycle conflict escalated to "mini-synthesis (one item)" | Mid-cycle conflict resolved via teammate-to-teammate SendMessage |
+| Test run once at end of cycle | Tests run at every wave boundary |
+| Owner = same implementer for everything | Owner = the agent who proposed it in Phase 3 (skin in the game) |
 
 ### Phase 5a — Destructive check
 
@@ -160,6 +203,57 @@ for name, (ok, output) in results.items():
 
   When abandoning at this phase, also revert the working tree (`git reset --hard HEAD`) so the next cycle starts clean.
 
+### Phase 5b' — Independent Reviewers (parallel reviews + meeting + fix loop)
+
+After Phase 5b's tests pass, the cycle does not yet commit. A new independent-reviewer phase runs to surface bugs, design issues, and false positives the implementers may have missed. Same shape as Phase 2 → Phase 3 but scoped to review.
+
+#### Procedure
+
+1. **Spawn independent reviewer teammates** (different from the Phase 2/4 implementers; drawn from the same `expert_roster` but a participant CANNOT review their own work). Different lenses: security, prompt-clarity, architecture, etc. Typically 2-4 reviewers per cycle.
+
+2. **Parallel reviews.** Each reviewer examines the post-Phase-4 diff (use `git diff HEAD~N..HEAD` or `git diff` against the cycle's starting commit) and produces a structured findings block:
+   - **Issue** — what's wrong, with file:line
+   - **Severity** — blocker / major / minor / nit
+   - **Recommended fix** — concrete change
+   - **Confidence** — high / medium / low (how sure they are the issue is real)
+
+3. **Reviewer meeting (Star → Mesh → Star).** Mirrors Phase 3 but scoped to validating findings:
+   - **Open (Star):** Lead `SendMessage`s each reviewer the consolidated raw findings + everyone else's findings.
+   - **Debate (Mesh):** Reviewers `SendMessage` each other to validate each other's claims, weed out false positives (cross-confirmation: a finding survives only if another reviewer can confirm or it withstands challenge), calibrate severity, surface ripple effects between findings.
+   - **Convergence:** Max 3 mesh exchanges per reviewer OR explicit "agreed" signals to lead.
+   - **Close (Star):** Lead writes the **consolidated review report** — only peer-validated findings + agreed severity + recommended fixes.
+
+4. **Fix loop.** The consolidated report drives a closed review-fix-review iteration:
+   - Implementers (Owner from Phase 3 carries forward) fix all blocker + major issues; minor/nit may be deferred per PM ruling.
+   - Reviewers re-examine the new diff.
+   - New consolidated report produced.
+   - If the new report has zero unresolved issues OR PM rules remaining issues acceptable → exit loop; proceed to Phase 5c.
+   - Otherwise: another fix iteration.
+   - **MAX 5 iterations.** If the loop exhausts with unresolved issues, abandon the cycle with `reason=review_unrecoverable`.
+
+5. **Mini-synthesis for conflicting reviewers.** When two reviewers disagree on the same file (e.g. Security says "parameterize the SQL", Prompt Engineer says "remove the embedded SQL entirely"), they `SendMessage` each other directly to reconcile. Lead intervenes only if 3+ exchanges fail to resolve.
+
+#### Abandonment (review_unrecoverable)
+
+If the fix loop exhausts all 5 iterations with unresolved issues, abandon:
+
+```python
+{ "status": "abandoned", "phase_reached": "test",
+  "reason": "review_unrecoverable",
+  "detail": "<summary: iteration count, final unresolved issues, why fix loop couldn't converge>",
+  "participants": <resolved>, "artifacts": [<minutes slug if captured>],
+  "subject": run_row["subject"] }
+```
+
+The abandonment report MUST include:
+- Iteration count actually run (e.g. 5)
+- Final consolidated review report verbatim with all unresolved issues + severity
+- Which reviewer flagged each issue
+- Summary of why the fix loop couldn't converge (e.g. "issue X re-flagged in rounds 2/3/4 — implementer's fix didn't satisfy reviewer")
+- Suggested next-session approach: pick up surgically, change approach, or accept partial work
+
+When abandoning, also revert the working tree (`git reset --hard HEAD`) so the next cycle starts clean.
+
 ### Phase 5c — Commit
 
 Compile the decisions and participants into the inputs the commit helper expects, then:
@@ -206,7 +300,7 @@ Return the success dict described under "Outcome (return)" with the slug, commit
 ## Hard rules
 
 - **In-cycle test fix iteration is mandatory.** Do not escalate a test failure to "next cycle" until the agents have actually attempted to repair it (typically up to 3 rounds).
-- **Abandonment is structured.** Always return a dict with a `reason` from the four named codes (`no_consensus`, `destructive_rejected`, `tests_unrecoverable`, `other`). The orchestrator depends on this for the abandonment report.
+- **Abandonment is structured.** Always return a dict with a `reason` from the five named codes (`no_consensus`, `destructive_rejected`, `tests_unrecoverable`, `review_unrecoverable`, `other`). The orchestrator depends on this for the abandonment report.
 - **Working tree must be clean at cycle end** — committed (success path) or reset (abandon path). The next cycle inherits the same clone; an unclean tree leaks state.
 - **Unanimous consensus is required** (synthesis meeting). Anything less drops the item; if every item drops, the cycle abandons.
 - **Destructive changes require explicit user approval** — never bypass the destructive check, even when the user has pre-authorized other parts of the flow.

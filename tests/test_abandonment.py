@@ -124,6 +124,22 @@ def test_record_abandonment_inserts_row(db, run_and_cycle):
     assert row["created_at"]
 
 
+# ── new reason: review_unrecoverable ──────────────────────────────────────
+
+
+def test_record_abandonment_accepts_review_unrecoverable(db, run_and_cycle):
+    """Confirm the new reason `review_unrecoverable` is accepted by the schema."""
+    row = record_abandonment(
+        db_path=db,
+        cycle_id=run_and_cycle["cycle"]["id"],
+        phase_reached="test",
+        reason="review_unrecoverable",
+        detail="Phase 5b' fix loop exhausted at max 5 iterations",
+        report_memex_slug="kaizen:abandonment:test-cycle-1",
+    )
+    assert row["reason"] == "review_unrecoverable"
+
+
 # ── process_abandonment full flow ──────────────────────────────────────────
 
 

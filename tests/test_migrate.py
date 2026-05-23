@@ -32,16 +32,17 @@ def test_migration_recorded(tmp_path):
     assert "001_kaizen_schema.sql" in filenames
     assert "002_add_fk_indexes.sql" in filenames
     assert "003_review_unrecoverable.sql" in filenames
+    assert "004_phase_reached_review.sql" in filenames
 
 
 def test_migration_is_idempotent(tmp_path):
-    """Re-running migrations is a no-op and does not double-apply (001 + 002 + 003)."""
+    """Re-running migrations is a no-op and does not double-apply (001 + 002 + 003 + 004)."""
     db_path = str(tmp_path / "test.db")
     apply_migrations(db_path, MIGRATIONS_DIR)
     apply_migrations(db_path, MIGRATIONS_DIR)  # must not raise
     with closing(get_connection(db_path)) as conn:
         count = conn.execute("SELECT COUNT(*) FROM migrations").fetchone()[0]
-    assert count == 3
+    assert count == 4
 
 
 def test_fk_indexes_created(tmp_path):
@@ -195,7 +196,7 @@ def test_runs_status_check_rejects_invalid(tmp_path):
 
 
 def test_abandonments_phase_reached_check_rejects_invalid(tmp_path):
-    """abandonments.phase_reached CHECK rejects values outside ('agenda','meeting','implementation','test')."""
+    """abandonments.phase_reached CHECK rejects values outside ('agenda','meeting','implementation','test','review','push')."""
     db_path = str(tmp_path / "test.db")
     apply_migrations(db_path, MIGRATIONS_DIR)
     with closing(get_connection(db_path)) as conn:
@@ -227,13 +228,13 @@ def test_abandonments_reason_check_rejects_push_failed(tmp_path):
 
 
 def test_abandonments_valid_values_accepted(tmp_path):
-    """All 16 valid (phase_reached x reason) combinations must succeed."""
+    """All valid (phase_reached x reason) combinations must succeed (6 phases x 5 reasons = 30)."""
     db_path = str(tmp_path / "test.db")
     apply_migrations(db_path, MIGRATIONS_DIR)
     with closing(get_connection(db_path)) as conn:
         project_id = _insert_project(conn)
         cycle_id = _insert_run_and_cycle(conn, project_id)
-        valid_phases = ("agenda", "meeting", "implementation", "test")
+        valid_phases = ("agenda", "meeting", "implementation", "test", "review", "push")
         valid_reasons = (
             "no_consensus",
             "destructive_rejected",
@@ -249,3 +250,35 @@ def test_abandonments_valid_values_accepted(tmp_path):
                     (cycle_id, phase, reason),
                 )
         conn.commit()
+
+
+def test_abandonments_phase_reached_post_004_allows_review_and_push_rejects_bogus(tmp_path):
+    """After migrations 001→004, phase_reached accepts 'review' and 'push' and still rejects bogus values."""
+    db_path = str(tmp_path / "test.db")
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    with closing(get_connection(db_path)) as conn:
+        project_id = _insert_project(conn)
+        cycle_id = _insert_run_and_cycle(conn, project_id)
+        # Original 4 phases must still be accepted.
+        for phase in ("agenda", "meeting", "implementation", "test"):
+            conn.execute(
+                "INSERT INTO abandonments (cycle_id, phase_reached, reason, detail, created_at) "
+                "VALUES (?, ?, 'other', 'd', datetime('now'))",
+                (cycle_id, phase),
+            )
+        # New phases ('review','push') must be accepted.
+        for phase in ("review", "push"):
+            conn.execute(
+                "INSERT INTO abandonments (cycle_id, phase_reached, reason, detail, created_at) "
+                "VALUES (?, ?, 'other', 'd', datetime('now'))",
+                (cycle_id, phase),
+            )
+        conn.commit()
+        # Invalid value must still raise.
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO abandonments (cycle_id, phase_reached, reason, detail, created_at) "
+                "VALUES (?, 'bogus', 'other', 'd', datetime('now'))",
+                (cycle_id,),
+            )
+            conn.commit()

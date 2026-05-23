@@ -54,7 +54,7 @@ Return a dict:
   "status": "abandoned",
   "subject": "<cycle subject or None>",
   "participants": ["<agent_name>", ...],
-  "phase_reached": "agenda" | "meeting" | "implementation" | "test",
+  "phase_reached": "agenda" | "meeting" | "implementation" | "test" | "review" | "push",
   "reason": "no_consensus" | "destructive_rejected" | "tests_unrecoverable" | "review_unrecoverable" | "other",
   "detail": "<free-text describing what was attempted and what blocked it>",
   "artifacts": ["<memex slug or path>", ...],
@@ -269,11 +269,16 @@ After Phase 5b's tests pass, the cycle does not yet commit. A new independent-re
 If the fix loop exhausts all 5 iterations with unresolved issues, abandon:
 
 ```python
-{ "status": "abandoned", "phase_reached": "test",
+{ "status": "abandoned", "phase_reached": "review",
   "reason": "review_unrecoverable",
   "detail": "<summary: iteration count, final unresolved issues, why fix loop couldn't converge>",
   "participants": <resolved>, "artifacts": [<minutes slug if captured>],
-  "subject": run_row["subject"] }
+  "subject": run_row["subject"],
+  # Structured fields (passed to record_abandonment/process_abandonment as kwargs):
+  "review_iteration_count": <int 1..5>,
+  "unresolved_findings": [{"reviewer": ..., "severity": ..., "finding": ..., "file_line": ...}, ...],
+  "convergence_summary": "<why the fix loop couldn't converge>",
+  "reviewer_attribution": {"<finding_id>": "<reviewer_role_id>", ...} }
 ```
 
 The abandonment report MUST include:

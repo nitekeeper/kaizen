@@ -483,6 +483,69 @@ def test_orchestrate_run_skip_and_continue_on_abandonment(db, project, tmp_path,
     assert db_ab_cycle_ids == abandoned_cycle_ids
 
 
+def test_orchestrate_run_mode_returned_in_result(db, project, tmp_path, monkeypatch):
+    """The `mode` key must appear in the result dict for both modes."""
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+
+    def fake_executor(*a):
+        return {
+            "status": "success",
+            "commit_sha": "sha-1",
+            "minutes_memex_slug": None,
+        }
+
+    for mode in ("subagent", "team"):
+        result = orchestrate_run(
+            db_path=db,
+            git_url=project["git_url"],
+            cycles_requested=1,
+            cycle_executor=fake_executor,  # injected → bypasses mode-based selection
+            mode=mode,
+        )
+        assert result["mode"] == mode, (
+            f"Expected mode={mode!r} in result, got {result.get('mode')!r}"
+        )
+
+
+def test_orchestrate_run_selects_team_executor_when_mode_team(db, project, tmp_path, monkeypatch):
+    """When mode='team' and no cycle_executor is injected, orchestrate_run
+    must use team_cycle_executor from scripts.team_executor.
+
+    The team_cycle_executor raises TeamToolsUnavailableError when
+    CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS is absent — we intercept this at
+    the orchestrator level by confirming the exception propagates unchanged
+    (proving the correct executor was selected, not the subagent stub).
+    """
+    import os
+
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+
+    # Ensure the env var is absent so team_cycle_executor fails fast.
+    env_without_teams = {
+        k: v for k, v in os.environ.items() if k != "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"
+    }
+    with monkeypatch.context() as m:
+        m.setattr(os, "environ", env_without_teams)
+        from scripts.team_executor import TeamToolsUnavailableError
+
+        with pytest.raises((TeamToolsUnavailableError, RuntimeError)):
+            # No cycle_executor injected → orchestrator selects team_cycle_executor.
+            # That raises TeamToolsUnavailableError → orchestrator catches Exception
+            # and finalizes run as 'failed' before re-raising.
+            orchestrate_run(
+                db_path=db,
+                git_url=project["git_url"],
+                cycles_requested=1,
+                mode="team",
+                # no cycle_executor — forces mode-based selection
+            )
+
+    # The run row must have been finalised as 'failed' (H3 guard in orchestrate_run).
+    rows = list_runs(db, project_id=project["id"])
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+
+
 def test_orchestrate_run_push_failure_leaves_clone(db, project, tmp_path, monkeypatch):
     _install_orchestrator_stubs(monkeypatch, tmp_path)
 

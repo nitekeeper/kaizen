@@ -21,12 +21,15 @@ Priority order when instructions conflict:
 ## Invocation
 
 ```
-/kaizen:improve <git-url> [--cycles N] [--subject "<area to improve>"]
+/kaizen:improve <git-url> [--cycles N] [--subject "<area to improve>"] [--mode subagent|team]
 ```
 
 - `<git-url>` — required. https or ssh (e.g., `https://github.com/owner/repo.git` or `git@github.com:owner/repo.git`).
 - `--cycles N` — number of independent improvement cycles to run. Default: 1.
 - `--subject "..."` — optional focus area. If omitted, the PM agent decides per cycle.
+- `--mode subagent|team` — execution mode. Default: `subagent`.
+  - `subagent` — fire-and-forget `Agent` tool calls (existing behaviour).
+  - `team` — persistent named team via the Agent Teams API (`TeamCreate`, `SendMessage`, `TeamDelete`). Requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in the environment. If the env var is absent, the run aborts with a clear error before any clone is created.
 
 ## Procedure
 
@@ -46,16 +49,19 @@ If `scripts/setup.py` has not previously run on this machine, it will also apply
 
 ### Step 2 — Parse arguments
 
-Extract `git_url`, `cycles` (default 1), and `subject` (default None) from the user's invocation. Validate:
+Extract `git_url`, `cycles` (default 1), `subject` (default None), and `mode` (default `'subagent'`) from the user's invocation. Validate:
 
 - `git_url` is present and looks like a git URL (https or ssh form).
 - `cycles` is a positive integer.
+- `mode` is one of `'subagent'` or `'team'`.
 
-If either check fails, ask the user to correct and stop until they do.
+If any check fails, ask the user to correct and stop until they do.
+
+**Additional validation for `--mode team`:** confirm `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` is present in the environment (read `~/.claude/settings.json` or check `os.environ`). If absent, surface: "Agent Teams mode requires CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1. Set it in your environment before running with --mode team." and **abort**.
 
 ### Step 3 — Route to internal/run
 
-Read `internal/run/SKILL.md` and follow its procedure inline, passing along `(git_url, cycles, subject)`. That procedure handles project lookup/registration, clone setup, cycle loop, push, PR open, and teardown.
+Read `internal/run/SKILL.md` and follow its procedure inline, passing along `(git_url, cycles, subject, mode)`. That procedure handles project lookup/registration, clone setup, cycle loop (selecting the correct executor based on `mode`), push, PR open, and teardown.
 
 ### Step 4 — Print the final summary
 

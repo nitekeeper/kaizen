@@ -73,15 +73,25 @@ Dispatch every participant in parallel (one agent per role from the resolved ros
    - **Proposal** — concrete change and rationale.
    - **Risk classification** — destructive or non-destructive (per Kaizen's destructive_check categories).
    - **Anticipated conflicts** with other agents' likely positions.
+   - **Touches** — files this proposal modifies if accepted.
+   - **Reads** — files this proposal needs in a specific state (post-other-changes) before it can be applied.
+   - **Likely depends on** — the proposing agent's best guess of which other agenda items must land first.
 
 Collect every proposal before Phase 3 begins. Do not let one slow agent block the others — give each a bounded budget; if an agent fails to respond, drop them from this cycle's roster and note in the minutes.
 
+The participants who complete Phase 2 carry through as teammates into Phase 3 — their pre-analysis context and skin-in-the-game ownership of their proposals are exactly what the synthesis meeting needs.
+
 ### Phase 3 — Synthesis meeting
 
-Read `internal/synthesis-meeting/SKILL.md` and follow its procedure with the agenda items + all collected proposals. The skill returns:
+Read `internal/synthesis-meeting/SKILL.md` and follow its procedure with the agenda items, the resolved participant list, and all collected proposals.
+
+The meeting runs as a **Star → Mesh → Star** agent-teams pattern: the lead opens by broadcasting all proposals to every participant; teammates debate directly (mesh) to validate proposals, surface false positives, and detect ripple effects; the lead closes by writing a consolidated Decisions Log and an **Action Items DAG with wave assignments**.
+
+The skill returns:
 
 - A meeting minutes block (Discussion + Decisions Log + Action Items)
 - An outcome signal: either `proceed` with at least one approved Action Item, or `abandon` with `reason=no_consensus`
+- For `proceed`: a structured Action Items list where each item carries `id`, `description`, `touches`, `reads`, `owner`, `depends_on`, and `wave`
 
 If outcome is `abandon`:
 
@@ -93,7 +103,7 @@ If outcome is `abandon`:
   "subject": run_row["subject"] }
 ```
 
-Otherwise continue with the list of approved Action Items.
+Otherwise continue with the Action Items DAG produced by the meeting. Phase 4 will use the `wave` and `depends_on` fields to coordinate parallel implementation.
 
 ### Phase 4 — Implementation
 

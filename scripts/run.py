@@ -169,17 +169,24 @@ def orchestrate_run(
     cycles_requested: int,
     subject: str | None = None,
     cycle_executor=None,
+    mode: str = "subagent",
 ) -> dict:
     """Full multi-cycle orchestration. See module docstring for the flow.
 
     `cycle_executor(clone_dir, project, run_row, cycle_n) -> dict` is the
-    per-cycle callback. When None, `scripts.cycle.execute_cycle` is used
-    (which is a Wave 4 stub — tests must inject).
+    per-cycle callback. When None, the executor is selected based on `mode`:
+      - mode='subagent' (default): uses `scripts.cycle.execute_cycle` (Wave 4
+        stub — tests must inject a real executor).
+      - mode='team': uses `scripts.team_executor.team_cycle_executor`, which
+        requires CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 in the environment.
+
+    Passing an explicit `cycle_executor` overrides `mode` selection — useful
+    for testing.
 
     Returns a dict with the state Wave 5 needs to render and open the PR:
       run_id, project_id, branch, clone_dir, experiment_dir,
       cycles_succeeded, cycles_abandoned, cycles (list of rows),
-      abandonments (list of rows), status.
+      abandonments (list of rows), status, mode.
     """
     # Local imports keep cycle.py / clone.py / etc. optional at import time.
     from scripts.abandonment import process_abandonment
@@ -197,7 +204,12 @@ def orchestrate_run(
     from scripts.seed_atelier_in_clone import seed_all
 
     if cycle_executor is None:
-        cycle_executor = default_executor
+        if mode == "team":
+            from scripts.team_executor import team_cycle_executor
+
+            cycle_executor = team_cycle_executor
+        else:
+            cycle_executor = default_executor
 
     # 1. Resolve project
     project = get_project_by_url(db_path, git_url)
@@ -318,6 +330,7 @@ def orchestrate_run(
             "abandonments": abandonment_rows,
             "status": "failed",
             "error": str(push_exc),
+            "mode": mode,
             "run": finalized,
         }
 
@@ -345,6 +358,7 @@ def orchestrate_run(
         "cycles": list_cycles(db_path, run_row["id"]),
         "abandonments": abandonment_rows,
         "status": "complete",
+        "mode": mode,
         "run": finalized,
     }
 
@@ -354,7 +368,10 @@ def orchestrate_run(
 
 def main(argv: list[str]) -> int:
     if not argv or argv[0] != "orchestrate":
-        print('Usage: run.py orchestrate <git-url> [--cycles N] [--subject "..."]', file=sys.stderr)
+        print(
+            'Usage: run.py orchestrate <git-url> [--cycles N] [--subject "..."] [--mode subagent|team]',
+            file=sys.stderr,
+        )
         return 1
 
     rest = argv[1:]
@@ -365,6 +382,7 @@ def main(argv: list[str]) -> int:
     git_url = rest[0]
     cycles = 1
     subject = None
+    mode = "subagent"
     i = 1
     while i < len(rest):
         if rest[i] == "--cycles" and i + 1 < len(rest):
@@ -372,6 +390,12 @@ def main(argv: list[str]) -> int:
             i += 2
         elif rest[i] == "--subject" and i + 1 < len(rest):
             subject = rest[i + 1]
+            i += 2
+        elif rest[i] == "--mode" and i + 1 < len(rest):
+            mode = rest[i + 1]
+            if mode not in ("subagent", "team"):
+                print(f"--mode must be 'subagent' or 'team', got: {mode!r}", file=sys.stderr)
+                return 1
             i += 2
         else:
             print(f"Unknown arg: {rest[i]!r}", file=sys.stderr)
@@ -385,6 +409,7 @@ def main(argv: list[str]) -> int:
         git_url=git_url,
         cycles_requested=cycles,
         subject=subject,
+        mode=mode,
     )
     # Path objects aren't JSON serialisable
     result = {k: (str(v) if isinstance(v, Path) else v) for k, v in result.items()}

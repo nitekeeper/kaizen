@@ -11,12 +11,29 @@ A single Kaizen improvement cycle. Mirrors atelier's `internal/self-improve/SKIL
 
 The clone already exists when this skill is invoked — `internal/clone-target/SKILL.md` set it up. The run branch is already checked out — `internal/run/SKILL.md` created it. This skill operates inside that environment.
 
+## Execution modes
+
+Kaizen supports two agent coordination modes, selected via `--mode` on `kaizen:improve`:
+
+| Mode | Mechanism | Env requirement |
+|---|---|---|
+| `subagent` (default) | Fire-and-forget `Agent` tool calls — one-shot dispatch, no shared state between agents | None |
+| `team` | Persistent named team via `TeamCreate` / `SendMessage` / `TeamDelete` — agents carry context across multiple messages within the same cycle | `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` |
+
+The mode does not change the cycle's logical structure (Phase 1–5). It only changes how agents are dispatched in Phase 2 (pre-analysis) and Phase 3 (synthesis meeting):
+
+- **subagent mode:** each Phase 2 participant is a separate `Agent` call; Phase 3 synthesis happens in the orchestrating agent's context.
+- **team mode:** `TeamCreate` opens a named team at cycle start; `SendMessage` briefs each participant; debate happens via `SendMessage` exchanges; `TeamDelete` closes the team at cycle end.
+
+When `mode='team'` and `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` is absent, `scripts/team_executor.py::team_cycle_executor` raises `TeamToolsUnavailableError` before any clone work begins.
+
 ## Inputs
 
 - `clone_dir` (Path) — the experiment clone, already on the run branch with atelier seeded.
 - `project` (dict) — the project row, including `read_paths`, `expert_roster`, `test_command`, `name`, `git_url`.
 - `run_row` (dict) — the kaizen run row, including `id`, `branch`, `subject`.
 - `cycle_n` (int) — 1-indexed cycle number within this run.
+- `mode` (str, optional) — `'subagent'` (default) or `'team'`. Passed through from the run-level orchestrator.
 
 ## Outcome (return)
 

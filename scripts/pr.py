@@ -123,8 +123,8 @@ def render_pr_body(
 ) -> tuple[str, str]:
     """Render (title, body) for the bundled PR per design §4.6."""
     n = run["cycles_requested"]
-    s = run["cycles_succeeded"]
-    a = run["cycles_abandoned"]
+    s = sum(1 for c in cycles if c["status"] == "success")
+    a = sum(1 for c in cycles if c["status"] == "abandoned")
     subject = _subject_or_pm(run.get("subject"))
     title = f"kaizen: {subject} — {n} cycles, {s} succeeded / {a} abandoned"
 

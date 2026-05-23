@@ -37,6 +37,14 @@ The dispatch templates the wrapper sends are exported from
 required-kwarg validation. Templates correspond 1:1 with the Phase 1-5c
 dispatch points in `scripts.team_executor`.
 
+The reference subclass `examples.agent_teams_wrapper_example.CallbackWrapper`
+shows the production wiring pattern: 3 callbacks passed via constructor,
+each invoking the corresponding CC tool from the orchestrating session's
+context. The end-to-end integration test
+`tests/test_end_to_end_team_mode.py` exercises the full Phase 1-5c flow
+through `orchestrate_run` with mocked callbacks — proving the Python side
+is complete.
+
 ## Inputs
 
 - `clone_dir` (Path) — the experiment clone, already on the run branch with atelier seeded.

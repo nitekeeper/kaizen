@@ -31,6 +31,8 @@ Priority order when instructions conflict:
   - `subagent` — fire-and-forget `Agent` tool calls (existing behaviour).
   - `team` — persistent named team via the Agent Teams API (`TeamCreate`, `SendMessage`, `TeamDelete`). Requires `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` in the environment. If the env var is absent, the run aborts with a clear error before any clone is created.
 
+> **Team mode wrapper plumbing.** Team mode requires a `tools_provider` to be constructed by the orchestrating agent and passed into `scripts.run.orchestrate_run`. Python cannot directly invoke CC session tools (`TeamCreate` / `SendMessage` / `TeamDelete`), so the orchestrating agent's job is to construct an `AgentTeamsWrapper` subclass (see `scripts/team_tools_wrapper.py`) per-cycle and pass it via the provider. See `internal/cycle/SKILL.md` for the wrapper pattern. If `tools_provider` is missing when `mode='team'`, `orchestrate_run` raises `ValueError` before any clone / seed / branch / run-row side effect.
+
 ## Procedure
 
 ### Step 1 — Verify hard dependencies

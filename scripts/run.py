@@ -170,6 +170,7 @@ def orchestrate_run(
     subject: str | None = None,
     cycle_executor=None,
     mode: str = "subagent",
+    tools_provider=None,
 ) -> dict:
     """Full multi-cycle orchestration. See module docstring for the flow.
 
@@ -182,6 +183,16 @@ def orchestrate_run(
 
     Passing an explicit `cycle_executor` overrides `mode` selection — useful
     for testing.
+
+    `tools_provider` is a `Callable[[Path, dict, dict, int], TeamTools] | None`
+    invoked once per cycle to build the `TeamTools` wrapper passed as the
+    `tools=` keyword arg into `team_cycle_executor`. It is REQUIRED when
+    `mode='team'` (the team executor cannot construct CC session-tool
+    wrappers itself — Python cannot directly call Claude Code session
+    tools). When `mode='subagent'` `tools_provider` is silently IGNORED for
+    minimum surprise. When `mode='team'` and `tools_provider` is None, the
+    orchestrator raises `ValueError` BEFORE any clone / seed / branch / run
+    row side effect so the failure leaves no garbage on disk or in the DB.
 
     Returns a dict with the state Wave 5 needs to render and open the PR:
       run_id, project_id, branch, clone_dir, experiment_dir,
@@ -203,6 +214,11 @@ def orchestrate_run(
     from scripts.project import get_project_by_url
     from scripts.seed_atelier_in_clone import seed_all
 
+    # Did the caller supply their own executor? Used by the bridge guard
+    # below — explicit-executor callers (tests injecting stubs) bypass the
+    # tools_provider requirement because they are wiring the cycle work
+    # themselves and may not need the real team_cycle_executor at all.
+    executor_was_injected = cycle_executor is not None
     if cycle_executor is None:
         if mode == "team":
             from scripts.team_executor import team_cycle_executor
@@ -217,6 +233,27 @@ def orchestrate_run(
         raise RuntimeError(
             f"No project registered for {git_url!r}. Register it first:\n"
             f"  python3 scripts/project.py register {git_url}"
+        )
+
+    # 1b. Bridge guard — team mode without a tools_provider would crash deep
+    # inside `team_cycle_executor`'s preflight (tools is None →
+    # TeamToolsUnavailableError) AFTER cloning, seeding atelier, branching,
+    # and creating a run row. Fire here so the failure leaves NO side
+    # effects on disk or in the DB.
+    #
+    # The guard ONLY fires when the caller did NOT inject their own
+    # `cycle_executor`. Explicit-executor callers (tests, custom drivers)
+    # are wiring the cycle themselves; for them the tools_provider is
+    # optional and the existing 4-positional-arg signature still works.
+    # This preserves backward compatibility with every existing call site
+    # that injects a stub executor for `mode='team'` to test mode plumbing.
+    if mode == "team" and tools_provider is None and not executor_was_injected:
+        raise ValueError(
+            "mode='team' requires a tools_provider callable to construct the "
+            "TeamTools wrapper for each cycle. Without it, team_cycle_executor "
+            "crashes deep inside the cycle. Pass "
+            "tools_provider=lambda clone_dir, project, run_row, cycle_n: ... "
+            "or use mode='subagent' instead."
         )
 
     # 2. Clone target
@@ -254,7 +291,16 @@ def orchestrate_run(
     try:
         for cycle_n in range(1, cycles_requested + 1):
             cycle_started = _now()
-            outcome = cycle_executor(experiment_dir, project, run_row, cycle_n)
+            # Team mode threads a per-cycle TeamTools wrapper into the
+            # executor via the `tools=` kwarg. Subagent mode preserves the
+            # 4-positional-arg call signature for backward compatibility
+            # with any existing executor callable (including the default
+            # `scripts.cycle.execute_cycle`).
+            if mode == "team" and tools_provider is not None:
+                tools = tools_provider(experiment_dir, project, run_row, cycle_n)
+                outcome = cycle_executor(experiment_dir, project, run_row, cycle_n, tools=tools)
+            else:
+                outcome = cycle_executor(experiment_dir, project, run_row, cycle_n)
 
             if outcome.get("status") == "success":
                 record_cycle_success(

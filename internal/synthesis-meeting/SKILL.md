@@ -130,6 +130,26 @@ To compute waves: perform a topological sort on the dependency graph. Assign Wav
 
 Before the meeting locks in, check all four gates. If any gate fails, return to the mesh (Step 2) to resolve.
 
+The 4 gates are mechanical — use the helper. Run it BEFORE posting the DAG to the shared task list:
+
+```python
+from scripts.dag import validate_dag, DAGValidationError
+result = validate_dag(action_items, existing_files=frozenset(<files in clone>))
+if not result.ok:
+    # Surface every error in the meeting minutes Discussion section.
+    # The PM negotiates with owners to fix; if no fix possible, the cycle
+    # may abandon as no_consensus (per Phase 3's existing abandon path).
+    for err in result.errors:
+        post_to_discussion(f"DAG validation failed: {err}")
+    if cycle_must_abandon:
+        return abandon_outcome(...)
+waves = result.waves  # use this for Phase 4 dispatch
+```
+
+The helper raises `ValueError` ONLY for malformed Action Item shapes (missing required keys) — those are agent bugs to fix in the source, not DAG-validation failures. The 4 validation gates produce `DAGValidationError` subclasses collected into `result.errors`.
+
+The per-gate prose below is the contract the helper enforces:
+
 1. **DAG is acyclic** — perform a topological sort; if a cycle is detected, identify the cycle members and ask the relevant owners to break it (typically by splitting one Action Item or reversing a `depends_on` edge).
 
 2. **No file contention within a wave** — two Action Items in the same wave may not both appear in each other's `touches` for the same file. If contention is found, push the lower-priority item to the next wave by adding a `depends_on` edge.

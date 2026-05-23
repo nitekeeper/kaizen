@@ -573,3 +573,234 @@ def test_orchestrate_run_push_failure_leaves_clone(db, project, tmp_path, monkey
     # Run row should record status='failed'.
     final = get_run(db, result["run_id"])
     assert final["status"] == "failed"
+
+
+# ── phase_reached fail-loud + CHECK-positive regression guard ─────────────
+
+
+_ALL_VALID_PHASES = ("agenda", "meeting", "implementation", "test", "review", "push")
+_ALL_VALID_REASONS = (
+    "no_consensus",
+    "destructive_rejected",
+    "tests_unrecoverable",
+    "review_unrecoverable",
+    "other",
+)
+
+
+def _assert_all_phases_in_message(msg: str) -> None:
+    """Every legal phase MUST appear in the error so the operator gets the
+    full repair menu, not a hint. Coupled to the sorted(VALID_PHASES)
+    formatting in scripts/run.py."""
+    for phase in _ALL_VALID_PHASES:
+        assert phase in msg, f"phase {phase!r} missing from error message: {msg}"
+
+
+def _assert_all_reasons_in_message(msg: str) -> None:
+    """Every legal reason MUST appear in the error so the operator gets the
+    full repair menu. Coupled to the sorted(VALID_REASONS) formatting."""
+    for reason in _ALL_VALID_REASONS:
+        assert reason in msg, f"reason {reason!r} missing from error message: {msg}"
+
+
+def test_orchestrate_run_raises_when_phase_reached_missing(db, project, tmp_path, monkeypatch):
+    """A malformed abandonment outcome (missing phase_reached) must raise
+    ValueError naming the field — NOT crash later inside record_abandonment
+    with sqlite3.IntegrityError after work was done.
+
+    The previous default of "unknown" silently violated the CHECK constraint
+    in migration 004 (which only permits agenda|meeting|implementation|test|
+    review|push). This test pins the fail-loud contract.
+    """
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+
+    def malformed_executor(clone_dir, proj, run_row, cycle_n):
+        # Intentionally omit phase_reached → triggers the orchestrator's
+        # fail-loud guard.
+        return {
+            "status": "abandoned",
+            "reason": "other",
+            "detail": "executor forgot phase_reached",
+            "participants": [],
+            "artifacts": [],
+        }
+
+    with pytest.raises(ValueError, match="phase_reached") as exc_info:
+        orchestrate_run(
+            db_path=db,
+            git_url=project["git_url"],
+            cycles_requested=1,
+            cycle_executor=malformed_executor,
+        )
+    msg = str(exc_info.value)
+    # The error message must name the cycle so the operator can locate it.
+    assert "cycle 1" in msg
+    # And must enumerate EVERY schema-allowed phase value so the fix is obvious.
+    _assert_all_phases_in_message(msg)
+
+    # H3: the orchestrator's outer try/except must still finalise the run
+    # as 'failed' even though our ValueError fired mid-loop.
+    rows = list_runs(db, project_id=project["id"])
+    assert len(rows) == 1
+    assert rows[0]["status"] == "failed"
+
+
+def test_orchestrate_run_raises_when_phase_reached_is_unknown(db, project, tmp_path, monkeypatch):
+    """The original bug class: executor returns phase_reached="unknown" (the
+    old default sentinel). Must raise ValueError at the orchestrator layer
+    BEFORE any DB write — not bypass the guard, not crash later with
+    sqlite3.IntegrityError after work was done.
+    """
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+
+    def bad_executor(clone_dir, proj, run_row, cycle_n):
+        return {
+            "status": "abandoned",
+            "phase_reached": "unknown",  # explicit invalid sentinel
+            "reason": "other",
+            "detail": "executor used legacy 'unknown' sentinel",
+            "participants": [],
+            "artifacts": [],
+        }
+
+    with pytest.raises(ValueError, match="phase_reached") as exc_info:
+        orchestrate_run(
+            db_path=db,
+            git_url=project["git_url"],
+            cycles_requested=1,
+            cycle_executor=bad_executor,
+        )
+    msg = str(exc_info.value)
+    assert "cycle 1" in msg
+    # The rejected value must appear in the message so the operator can
+    # grep their executor for it.
+    assert "'unknown'" in msg
+    _assert_all_phases_in_message(msg)
+
+
+def test_orchestrate_run_raises_when_phase_reached_is_bogus(db, project, tmp_path, monkeypatch):
+    """Any arbitrary out-of-set value (typo, freshly invented enum) must
+    fail at the orchestrator, not slip through to the DB CHECK."""
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+
+    def bad_executor(clone_dir, proj, run_row, cycle_n):
+        return {
+            "status": "abandoned",
+            "phase_reached": "not_a_phase",
+            "reason": "other",
+            "detail": "executor invented a phase value",
+            "participants": [],
+            "artifacts": [],
+        }
+
+    with pytest.raises(ValueError, match="phase_reached") as exc_info:
+        orchestrate_run(
+            db_path=db,
+            git_url=project["git_url"],
+            cycles_requested=1,
+            cycle_executor=bad_executor,
+        )
+    msg = str(exc_info.value)
+    assert "cycle 1" in msg
+    assert "'not_a_phase'" in msg
+    _assert_all_phases_in_message(msg)
+
+
+def test_orchestrate_run_raises_when_reason_is_invalid(db, project, tmp_path, monkeypatch):
+    """Symmetric guard for `reason` — the orchestrator no longer defaults
+    to 'other'; any out-of-set value must fail loud with a ValueError that
+    enumerates the legal reasons."""
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+
+    def bad_executor(clone_dir, proj, run_row, cycle_n):
+        return {
+            "status": "abandoned",
+            "phase_reached": "meeting",
+            "reason": "made_up_reason",
+            "detail": "executor invented a reason value",
+            "participants": [],
+            "artifacts": [],
+        }
+
+    with pytest.raises(ValueError, match="reason") as exc_info:
+        orchestrate_run(
+            db_path=db,
+            git_url=project["git_url"],
+            cycles_requested=1,
+            cycle_executor=bad_executor,
+        )
+    msg = str(exc_info.value)
+    assert "cycle 1" in msg
+    assert "'made_up_reason'" in msg
+    _assert_all_reasons_in_message(msg)
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["agenda", "meeting", "implementation", "test", "review", "push"],
+)
+def test_orchestrate_run_accepts_all_schema_allowed_phase_values(
+    db, project, tmp_path, monkeypatch, phase
+):
+    """CHECK-positive regression guard: every phase value the orchestrator
+    CAN emit (per the schema CHECK in migration 004) must round-trip through
+    record_abandonment and land in the abandonments table.
+
+    This is the gap that allowed the "unknown" sentinel bug to hide for so
+    long — there was no test asserting that the values the orchestrator
+    actually emits are schema-accepted. Each parametrized run uses a
+    pairing of phase + reason that is schema-valid.
+    """
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+
+    # Pair each phase with a reason the CHECK constraint accepts.
+    # The combos are not all semantically real but ALL are schema-valid,
+    # which is the only contract this test pins.
+    reason_for_phase = {
+        "agenda": "no_consensus",
+        "meeting": "no_consensus",
+        "implementation": "destructive_rejected",
+        "test": "tests_unrecoverable",
+        "review": "review_unrecoverable",
+        "push": "other",
+    }
+
+    def stub_executor(clone_dir, proj, run_row, cycle_n):
+        return {
+            "status": "abandoned",
+            "phase_reached": phase,
+            "reason": reason_for_phase[phase],
+            "detail": f"stub abandonment with phase={phase}",
+            "participants": [],
+            "artifacts": [],
+        }
+
+    result = orchestrate_run(
+        db_path=db,
+        git_url=project["git_url"],
+        cycles_requested=1,
+        cycle_executor=stub_executor,
+    )
+
+    assert result["status"] == "complete"
+    assert result["cycles_abandoned"] == 1
+    assert len(result["abandonments"]) == 1
+    ab = result["abandonments"][0]
+    assert ab["phase_reached"] == phase
+    assert ab["reason"] == reason_for_phase[phase]
+
+    # Confirm the row landed in the DB (not just the in-memory dict).
+    from scripts.db import get_connection
+
+    conn = get_connection(db)
+    try:
+        cur = conn.execute(
+            "SELECT phase_reached, reason FROM abandonments WHERE cycle_id = ?",
+            (ab["cycle_id"],),
+        )
+        db_row = cur.fetchone()
+    finally:
+        conn.close()
+    assert db_row is not None
+    assert db_row[0] == phase
+    assert db_row[1] == reason_for_phase[phase]

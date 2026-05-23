@@ -14,6 +14,22 @@ from datetime import UTC, datetime
 
 from scripts.db import ABANDONMENT_JSON_COLUMNS, get_connection, row_to_dict_with_json
 
+# ── Schema enum mirror — keep in sync with migrations/004 ─────────────────
+# These frozensets mirror the CHECK constraints declared in
+# migrations/004_phase_reached_review.sql. Co-locating them here (the closest
+# Python neighbor to the DB layer) gives upstream call sites — notably
+# scripts/run.py::orchestrate_run — a single import point so the orchestrator,
+# the DB layer, and the SQL migration cannot drift independently again. Any
+# change to the CHECK in migration 005+ MUST update these frozensets in the
+# same commit.
+
+VALID_PHASES: frozenset[str] = frozenset(
+    {"agenda", "meeting", "implementation", "test", "review", "push"}
+)
+VALID_REASONS: frozenset[str] = frozenset(
+    {"no_consensus", "destructive_rejected", "tests_unrecoverable", "review_unrecoverable", "other"}
+)
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()

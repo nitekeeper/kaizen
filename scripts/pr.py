@@ -308,7 +308,7 @@ def wait_and_report_ci(
     start = time.monotonic()
     while True:
         result = subprocess.run(
-            ["gh", "pr", "checks", pr_url, "--json", "state,conclusion,name"],
+            ["gh", "pr", "checks", pr_url, "--json", "state,bucket,name"],
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -326,22 +326,15 @@ def wait_and_report_ci(
             checks = []
 
         if checks:
-            pending = [
-                c
-                for c in checks
-                if str(c.get("state", "")).upper()
-                in ("PENDING", "IN_PROGRESS", "QUEUED", "WAITING", "REQUESTED")
-            ]
-            failed = [
-                c
-                for c in checks
-                if str(c.get("conclusion", "")).upper() not in ("SUCCESS", "SKIPPED", "")
-                and str(c.get("state", "")).upper()
-                not in ("PENDING", "IN_PROGRESS", "QUEUED", "WAITING", "REQUESTED")
-            ]
+            # `bucket` is the authoritative classifier used by `gh pr checks`
+            # (values: "pass", "fail", "pending"). `conclusion` is NOT a valid
+            # gh JSON field — using it causes gh to exit 1 with "Unknown JSON
+            # field: conclusion", silently emptying `checks` every poll.
+            pending = [c for c in checks if c.get("bucket") == "pending"]
+            failed = [c for c in checks if c.get("bucket") == "fail"]
             if not pending and not failed:
                 return f"✓ CI green on {pr_url} ({len(checks)} checks passed in {elapsed}s)"
-            if failed and not pending:
+            if failed:
                 names = ", ".join(c.get("name", "?") for c in failed)
                 return (
                     f"✗ CI failing on {pr_url} "

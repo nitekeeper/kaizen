@@ -309,6 +309,55 @@ class TestFmtTs:
         assert _fmt_ts("2026-05-16T14:23:00Z") == "2026-05-16 14:23 UTC"
 
 
+def test_render_pr_body_counts_from_cycles_when_run_counters_still_zero(db, project):
+    """Regression: render_pr_body must compute succeeded/abandoned from the cycles list,
+    not from runs.cycles_succeeded / cycles_abandoned. In the production order
+    (internal/run/SKILL.md), open-PR runs BEFORE finalize_run, so the run row's
+    counters are still 0 when render_pr_body is called.
+    """
+    from scripts.cycle import record_cycle_abandoned, record_cycle_success
+    from scripts.run import create_run
+
+    run = create_run(
+        db, project_id=project["id"], branch="kaizen/test", cycles_requested=3, subject=None
+    )
+    # 2 successes, 1 abandoned — but do NOT call finalize_run.
+    record_cycle_success(
+        db,
+        run_id=run["id"],
+        cycle_n=1,
+        subject=None,
+        commit_sha="abc1234",
+        minutes_memex_slug=None,
+        started_at="2026-05-23T00:00:00+00:00",
+    )
+    record_cycle_success(
+        db,
+        run_id=run["id"],
+        cycle_n=2,
+        subject=None,
+        commit_sha="def5678",
+        minutes_memex_slug=None,
+        started_at="2026-05-23T00:01:00+00:00",
+    )
+    record_cycle_abandoned(
+        db, run_id=run["id"], cycle_n=3, subject=None, started_at="2026-05-23T00:02:00+00:00"
+    )
+
+    run_row, project_row, cycles, abandonments = load_run_context(db, run["id"])
+    # Confirm the precondition: run-row counters are still zero.
+    assert run_row["cycles_succeeded"] == 0
+    assert run_row["cycles_abandoned"] == 0
+
+    title, body = render_pr_body(run_row, project_row, cycles, abandonments)
+
+    # The title and Summary table must reflect the truth (computed from cycles), not the
+    # stale run-row counters.
+    assert "2 succeeded / 1 abandoned" in title
+    assert "| Succeeded | 2 |" in body
+    assert "| Abandoned | 1 |" in body
+
+
 # ── open_pr (subprocess mocked) ────────────────────────────────────────────
 
 

@@ -105,11 +105,44 @@ If outcome is `abandon`:
 
 Otherwise continue with the Action Items DAG produced by the meeting. Phase 4 will use the `wave` and `depends_on` fields to coordinate parallel implementation.
 
-### Phase 4 — Implementation
+### Phase 4 — Implementation (wave-based parallel dispatch)
 
-Each agent listed in an Action Item's "Assigned to" column applies their changes directly to `clone_dir`. Agents may use any tooling appropriate — the only constraint is that the changes must land in the clone's working tree.
+The synthesis meeting (Phase 3) handed off a DAG of Action Items with `depends_on` set per task. Phase 4 consumes that DAG via the Agent Teams shared task list — execution is driven by the dependency graph, not an explicit wave loop.
 
-Coordinate to avoid stomping on the same file in incompatible ways. If a conflict surfaces mid-implementation, escalate to a mini-synthesis (one item) before proceeding — do not abandon the whole cycle for a per-file disagreement that can be resolved.
+#### Procedure
+
+1. **Lead posts the DAG to the shared task list.** Each Action Item becomes a task with the columns from Phase 3 (`Touches`, `Reads`, `Owner`, `Depends on`). Tasks start in `pending` state.
+
+2. **Teammates self-claim unblocked tasks.** A task is unblocked when all its `Depends on` predecessors are in `completed` state. File-locked claim semantics (per Agent Teams docs) prevent races when multiple teammates compete for the same task.
+
+3. **Owner-driven implementation.** Each Action Item's `Owner` (assigned in Phase 3) is the teammate that claims and implements it. The agent who proposed the change is the agent applying it — skin in the game across phases.
+
+4. **Tests run at wave boundaries.** After all tasks at topological level N complete (i.e. the "wave" closes), the lead runs:
+   ```
+   from pathlib import Path
+   from scripts.ci_runner import run_ci_checks
+   all_passed, results = run_ci_checks(Path(r'<clone_dir>'), '<project["test_command"]>')
+   ```
+   If `all_passed=False`: dispatch the wave's owners (and any test-focused experts in the roster) to fix the failing checks BEFORE wave N+1's tasks unblock. In-cycle fix iteration applies (max 3 fix rounds; abandon as `tests_unrecoverable` if not recovered).
+   If `all_passed=True`: wave N+1's tasks (which depend on wave N) automatically unblock; teammates self-claim and continue.
+
+5. **Mini-synthesis on mid-implementation conflicts.** If two teammates' work surfaces a conflict that wasn't caught in Phase 3 (e.g. an unforeseen ripple effect), they `SendMessage` each other to resolve. Lead intervenes if no resolution within 2 exchanges. Do not abandon the cycle for a resolvable per-file disagreement.
+
+6. **Wave completion = all tasks claimed and completed.** No mid-wave commits; tasks land in the clone working tree but are not committed until Phase 5c. The cycle's tests run continuously at wave boundaries to catch regressions.
+
+#### Failure modes
+
+- **A task fails repeatedly** (test failures, claimed but completion stalled): the owner abandons it back to the task list with `status=pending` and a failure note. Lead reassigns or escalates.
+- **DAG deadlock** (a task's `Depends on` references something that itself failed): break by either (a) marking the failed predecessor as `acceptable` per PM ruling, or (b) abandoning the cycle as `tests_unrecoverable`.
+
+#### What changed from the pre-redesign Phase 4
+
+| Before | After |
+|---|---|
+| Single implementer subagent ran all Action Items sequentially | Multiple teammates self-claim from shared task list with deps |
+| Mid-cycle conflict escalated to "mini-synthesis (one item)" | Mid-cycle conflict resolved via teammate-to-teammate SendMessage |
+| Test run once at end of cycle | Tests run at every wave boundary |
+| Owner = same implementer for everything | Owner = the agent who proposed it in Phase 3 (skin in the game) |
 
 ### Phase 5a — Destructive check
 

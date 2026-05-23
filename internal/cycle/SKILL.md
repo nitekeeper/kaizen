@@ -228,6 +228,20 @@ After Phase 5b's tests pass, the cycle does not yet commit. A new independent-re
 
 1. **Spawn independent reviewer teammates** (different from the Phase 2/4 implementers; drawn from the same `expert_roster` but a participant CANNOT review their own work). Different lenses: security, prompt-clarity, architecture, etc. Typically 2-4 reviewers per cycle.
 
+   Pick the reviewer roster via the helper (enforces disjointness from Phase 4 implementers):
+
+   ```python
+   from scripts.reviewers import select_reviewers
+   reviewers = select_reviewers(
+       roster=project["expert_roster"],
+       implementers=[<agent role ids that owned Phase 4 tasks>],
+       n=3,
+       preferred_lenses=["security", "architect", "prompt", "safety"],
+   )
+   ```
+
+   If the helper raises `InsufficientRosterError`, escalate to the PM (the roster is too small for safe review — either expand the roster or abandon the cycle).
+
 2. **Parallel reviews.** Each reviewer examines the post-Phase-4 diff (use `git diff HEAD~N..HEAD` or `git diff` against the cycle's starting commit) and produces a structured findings block:
    - **Issue** — what's wrong, with file:line
    - **Severity** — blocker / major / minor / nit

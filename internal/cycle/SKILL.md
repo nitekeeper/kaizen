@@ -38,7 +38,7 @@ Return a dict:
   "subject": "<cycle subject or None>",
   "participants": ["<agent_name>", ...],
   "phase_reached": "agenda" | "meeting" | "implementation" | "test",
-  "reason": "no_consensus" | "destructive_rejected" | "tests_unrecoverable" | "other",
+  "reason": "no_consensus" | "destructive_rejected" | "tests_unrecoverable" | "review_unrecoverable" | "other",
   "detail": "<free-text describing what was attempted and what blocked it>",
   "artifacts": ["<memex slug or path>", ...],
 }
@@ -203,6 +203,57 @@ for name, (ok, output) in results.items():
 
   When abandoning at this phase, also revert the working tree (`git reset --hard HEAD`) so the next cycle starts clean.
 
+### Phase 5b' — Independent Reviewers (parallel reviews + meeting + fix loop)
+
+After Phase 5b's tests pass, the cycle does not yet commit. A new independent-reviewer phase runs to surface bugs, design issues, and false positives the implementers may have missed. Same shape as Phase 2 → Phase 3 but scoped to review.
+
+#### Procedure
+
+1. **Spawn independent reviewer teammates** (different from the Phase 2/4 implementers; drawn from the same `expert_roster` but a participant CANNOT review their own work). Different lenses: security, prompt-clarity, architecture, etc. Typically 2-4 reviewers per cycle.
+
+2. **Parallel reviews.** Each reviewer examines the post-Phase-4 diff (use `git diff HEAD~N..HEAD` or `git diff` against the cycle's starting commit) and produces a structured findings block:
+   - **Issue** — what's wrong, with file:line
+   - **Severity** — blocker / major / minor / nit
+   - **Recommended fix** — concrete change
+   - **Confidence** — high / medium / low (how sure they are the issue is real)
+
+3. **Reviewer meeting (Star → Mesh → Star).** Mirrors Phase 3 but scoped to validating findings:
+   - **Open (Star):** Lead `SendMessage`s each reviewer the consolidated raw findings + everyone else's findings.
+   - **Debate (Mesh):** Reviewers `SendMessage` each other to validate each other's claims, weed out false positives (cross-confirmation: a finding survives only if another reviewer can confirm or it withstands challenge), calibrate severity, surface ripple effects between findings.
+   - **Convergence:** Max 3 mesh exchanges per reviewer OR explicit "agreed" signals to lead.
+   - **Close (Star):** Lead writes the **consolidated review report** — only peer-validated findings + agreed severity + recommended fixes.
+
+4. **Fix loop.** The consolidated report drives a closed review-fix-review iteration:
+   - Implementers (Owner from Phase 3 carries forward) fix all blocker + major issues; minor/nit may be deferred per PM ruling.
+   - Reviewers re-examine the new diff.
+   - New consolidated report produced.
+   - If the new report has zero unresolved issues OR PM rules remaining issues acceptable → exit loop; proceed to Phase 5c.
+   - Otherwise: another fix iteration.
+   - **MAX 5 iterations.** If the loop exhausts with unresolved issues, abandon the cycle with `reason=review_unrecoverable`.
+
+5. **Mini-synthesis for conflicting reviewers.** When two reviewers disagree on the same file (e.g. Security says "parameterize the SQL", Prompt Engineer says "remove the embedded SQL entirely"), they `SendMessage` each other directly to reconcile. Lead intervenes only if 3+ exchanges fail to resolve.
+
+#### Abandonment (review_unrecoverable)
+
+If the fix loop exhausts all 5 iterations with unresolved issues, abandon:
+
+```python
+{ "status": "abandoned", "phase_reached": "test",
+  "reason": "review_unrecoverable",
+  "detail": "<summary: iteration count, final unresolved issues, why fix loop couldn't converge>",
+  "participants": <resolved>, "artifacts": [<minutes slug if captured>],
+  "subject": run_row["subject"] }
+```
+
+The abandonment report MUST include:
+- Iteration count actually run (e.g. 5)
+- Final consolidated review report verbatim with all unresolved issues + severity
+- Which reviewer flagged each issue
+- Summary of why the fix loop couldn't converge (e.g. "issue X re-flagged in rounds 2/3/4 — implementer's fix didn't satisfy reviewer")
+- Suggested next-session approach: pick up surgically, change approach, or accept partial work
+
+When abandoning, also revert the working tree (`git reset --hard HEAD`) so the next cycle starts clean.
+
 ### Phase 5c — Commit
 
 Compile the decisions and participants into the inputs the commit helper expects, then:
@@ -249,7 +300,7 @@ Return the success dict described under "Outcome (return)" with the slug, commit
 ## Hard rules
 
 - **In-cycle test fix iteration is mandatory.** Do not escalate a test failure to "next cycle" until the agents have actually attempted to repair it (typically up to 3 rounds).
-- **Abandonment is structured.** Always return a dict with a `reason` from the four named codes (`no_consensus`, `destructive_rejected`, `tests_unrecoverable`, `other`). The orchestrator depends on this for the abandonment report.
+- **Abandonment is structured.** Always return a dict with a `reason` from the five named codes (`no_consensus`, `destructive_rejected`, `tests_unrecoverable`, `review_unrecoverable`, `other`). The orchestrator depends on this for the abandonment report.
 - **Working tree must be clean at cycle end** — committed (success path) or reset (abandon path). The next cycle inherits the same clone; an unclean tree leaks state.
 - **Unanimous consensus is required** (synthesis meeting). Anything less drops the item; if every item drops, the cycle abandons.
 - **Destructive changes require explicit user approval** — never bypass the destructive check, even when the user has pre-authorized other parts of the flow.

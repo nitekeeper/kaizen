@@ -17,7 +17,7 @@ Backed entirely by `scripts/abandonment.py` (which exposes `format_report`, `rec
 - `subject` (str | None)
 - `participants` (list[str]) — agent names.
 - `phase_reached` (str) — one of `agenda`, `meeting`, `implementation`, `test`, `push`.
-- `reason` (str) — one of `no_consensus`, `destructive_rejected`, `tests_unrecoverable`, `other`.
+- `reason` (str) — one of `no_consensus`, `destructive_rejected`, `tests_unrecoverable`, `review_unrecoverable`, `other`. Use `review_unrecoverable` when the Phase 5b' independent-reviewer fix loop exhausts its maximum 5 iterations with unresolved issues.
 - `detail` (str) — free-text. What was attempted, what blocked it, what the next session should reconsider.
 - `artifacts` (list[str]) — slugs or paths of partial proposals, test logs, etc.
 

@@ -156,7 +156,15 @@ def render_pr_body(
         parts.append(f"- Subject: {_subject_or_pm(cycle.get('subject'))}")
         if status == "success":
             sha = cycle.get("commit_sha") or ""
-            short = sha[:7] if sha else "—"
+            # Special case: team-mode cycle 4 skeleton commits the sentinel
+            # "(skeleton)" instead of a real SHA. Slicing it to "(skelet"
+            # would be silently confusing in a public PR body — render a
+            # human-readable note instead so reviewers know to consult the
+            # minutes rather than hunt for a missing commit.
+            if sha == "(skeleton)":
+                short = "(skeleton — no real commit, see cycle minutes)"
+            else:
+                short = sha[:7] if sha else "—"
             parts.append(f"- Commit: `{short}`")
             minutes_slug = cycle.get("minutes_memex_slug")
             if minutes_slug:

@@ -132,7 +132,16 @@ Step 6.  Python P (separate OS process) runs orchestrate_run with
          bridge_requests using that same run_id; the queue is never
          partitioned by mismatched ids.
 
-Step 7.  Cycle end: team_cycle_executor's finally enqueues team_delete.
+Step 7.  Cycle end: team_cycle_executor's finally first sends one
+         shutdown_request per active teammate via send_message_many
+         (Phase 5d — GAP-7 shutdown handshake; see "Phase 5d teammate
+         shutdown" below), THEN enqueues team_delete. Per CC's
+         TeamCreate contract, teammates must be gracefully terminated
+         before TeamDelete; the shutdown batch satisfies that
+         requirement. shutdown_request bodies are STRUCTURED JSON
+         protocol messages (NOT prose) — see scripts/dispatch_templates.py
+         ::phase_5d_shutdown. send_message_many failures are logged via
+         WARNING and team_delete still fires (best-effort cleanup).
          On the LAST cycle, run_bridged.py writes a 'cycle_done' row,
          finalizes runs.status in .ai/memex.db, exits cleanly.
 
@@ -602,11 +611,24 @@ Rev 2 conflated "Python crashed" with "Python is slow." Rev 3 separates them via
 
 For `aborted` (MINOR-AB fix), the **`args_json.team_ids_at_risk` field is the authoritative source of truth**. Python (or the next-run sweep) is the producer; S1's handler does NOT re-derive via SQL (the bad SQL pattern flagged in Rev 2 MINOR-ORPHAN). The orphan-team SQL is the responsibility of `scripts/sweep_leaked_teams.py` (see "Leaked-team recovery"), which populates `team_ids_at_risk` correctly using SQLite JSON1.
 
-### Leaked-team recovery (Rev 3)
+### Leaked-team recovery (Rev 3, GAP-7 addendum 2026-05-24)
 
-Three layers, unchanged in structure from Rev 2 but with corrected SQL:
+Four layers — Layer 0 added 2026-05-24 (GAP-7); Layers 1-3 unchanged in
+structure from Rev 2 but with corrected SQL:
 
-- **Layer 1 — `finally`:** `team_cycle_executor`'s finally enqueues `team_delete`.
+- **Layer 0 — Phase 5d shutdown handshake (GAP-7):** `team_cycle_executor`'s
+  finally FIRST calls `tools.send_message_many(shutdown_request × N)` against
+  every member captured at `team_create` time. Per CC's TeamCreate tool
+  contract, teammates must be gracefully terminated before TeamDelete;
+  approving the shutdown_request terminates the teammate CC process so the
+  subsequent team_delete succeeds without orphan members. The handshake is
+  best-effort: a `send_message_many` exception is logged via WARNING and the
+  executor proceeds to Layer 1 — orphans then fall to Layer 3's next-run
+  sweep. The shutdown_request body is STRUCTURED JSON
+  (`{"type":"shutdown_request","request_id":"<uuid4>"}`), NOT a prose
+  template; teammates parse it as a protocol message per the SHUTDOWN_BEHAVIOR
+  clause appended to `TEAMMATE_REPLY_RULE` at spawn-prompt time.
+- **Layer 1 — `finally`:** `team_cycle_executor`'s finally enqueues `team_delete` (after Layer 0).
 - **Layer 2 — cleanup timeout:** if `team_delete` request times out (`CLEANUP_TIMEOUT_S=20s`, bumped from Rev 2's 15s), Python appends `{run_id, team_id, leaked_at}` to `.ai/leaked_teams.json` and exits.
 - **Layer 3 — next-run sweep (`scripts/sweep_leaked_teams.py`):** invoked from `skills/improve/SKILL.md` Step 3b.3 (team-mode runs only; subagent mode does not use `TeamCreate` and so cannot leak teams). Uses SQLite JSON1 to find orphan team_ids correctly (MINOR-ORPHAN fix):
 
@@ -1021,5 +1043,15 @@ Audited against the Rev 2 checklist PLUS round-2's new checks:
 - MINOR-CREATE-RUN-ONLY-AUTOREGISTER — FIXED. Fail-loudly decision pinned as **D3**.
 
 **Round-3 MINORs (carried forward, all FIXED):** MINOR-SLP, MINOR-AB, MINOR-SEL, MINOR-ORPHAN — unchanged.
+
+**Closed gaps from production smokes (run 21–24):**
+
+- GAP-1 (heartbeat 60→300, per-call 180→600) — FIXED via constant bumps in `cc_tool_bridge.py`; see run-21 smoke.
+- GAP-2 (TEAMMATE_REPLY_RULE missing → silent abandons) — FIXED via run-21 reply-rule constant appended to every teammate-bound template.
+- GAP-3 (PYTHONPATH export missing from `run_bridged.py`) — FIXED in run-21 cycle.
+- GAP-4 (sequential per-row dispatch bottleneck) — FIXED via `send_message_many` batch wrapper (`QueueBridgeWrapper._insert_many` + `_poll_many`) wired into Phase 2 fan-out, Phase 3 Star-open/Mesh-debate, and Phase 5b' parallel reviewer dispatch.
+- GAP-5 (cleanup deadline race) — FIXED via `CLEANUP_TIMEOUT_S` bump 20→120s.
+- GAP-6 (sweep_leaked_teams not invoked) — DEFERRED; safety reviewer to wire the call into `skills/improve/SKILL.md` Step 1 in a follow-up.
+- **GAP-7 (teammate shutdown handshake missing → orphan members on TeamDelete) — FIXED 2026-05-24.** Per CC's TeamCreate tool contract ("Gracefully terminate teammates first, then call TeamDelete"), `team_cycle_executor`'s finally now sends one `shutdown_request` JSON protocol message per active teammate via `send_message_many` BEFORE invoking `team_delete`. Approving the request terminates each teammate's CC process so TeamDelete then succeeds without orphan members. `phase_5d_shutdown(request_id=None)` in `scripts/dispatch_templates.py` formats the structured JSON body (default request_id = fresh uuid4); a new SHUTDOWN_BEHAVIOR clause appended to `TEAMMATE_REPLY_RULE` tells every spawned teammate how to parse and respond. The handshake is best-effort: a `send_message_many` exception is logged via WARNING ("GAP-7 shutdown send_message_many failed for team …") and `team_delete` still fires (cleanup invariant preserved). Active members are tracked via a local `team_members` variable set immediately before the `team_create` call (NOT threaded through 8 function frames), so the finally block has direct access. Tests: 2 in `tests/test_dispatch_templates.py` + 4 in `tests/test_team_executor.py::TestGap7ShutdownHandshake` covering happy path, zero-members fallback, approve=false fire-and-proceed semantics, and send_message_many-raises-but-team_delete-still-fires.
 
 No findings remain unaddressed. `[CANNOT FIX]` markers: one (Open Q #1, Anthropic-side team_id scoping); three alternative recovery strategies listed inline with pros/cons. Three decisions pinned (D1: parallel-tool-call upgrade trigger; D2: bridge-DB ownership; D3: fail-loudly).

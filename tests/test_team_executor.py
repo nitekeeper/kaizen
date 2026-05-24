@@ -1239,3 +1239,318 @@ def test_find_owner_for_finding_does_not_warn_when_file_owned(caplog):
     assert not any(rec.levelno == logging.WARNING for rec in caplog.records), (
         "no warning should fire when the file IS owned"
     )
+
+
+# ── GAP-7 — Phase 5d teammate shutdown handshake ──────────────────────────
+
+
+class TestGap7ShutdownHandshake:
+    """The finally block must gracefully shut down teammates BEFORE
+    team_delete fires — per CC's TeamCreate tool contract. The shutdown
+    step is ADDITIVE; team_delete's always-fires invariant is preserved."""
+
+    def _three_member_happy_setup(self, monkeypatch):
+        """Wire `_patch_ci_green` + `_patch_phase5c` and return scripted
+        responses + roster for a clean 3-member success cycle."""
+        _patch_ci_green(monkeypatch)
+        _patch_phase5c(monkeypatch)
+        roster = ["pm-1", "be-1", "security-engineer-1"]
+        ai_json = (
+            "ok\n```json\n["
+            '{"id": "A", "touches": ["a.py"], "reads": [], "depends_on": [], '
+            '"wave": 1, "owner": "be-1"}'
+            "]\n```"
+        )
+        scripted = {
+            "Phase 1": "do x",
+            "Phase 2": "proposal",
+            "Phase 3 close": ai_json,
+            "Phase 4 wave": "applied",
+            "Phase 5b'": "NO ISSUES",
+        }
+        return roster, scripted
+
+    def test_team_executor_finally_sends_shutdown_before_delete(self, tmp_path, monkeypatch):
+        """Test (b) — tightened per MAJOR-5 of fix-loop iteration 2:
+        assert against the LAST `send_message_many` BATCH directly,
+        not against adjacency of N anonymous send_message calls.
+
+        The mock records the shutdown batch as a single
+        `("send_message_many", (), {"messages": [...]})` entry so we can
+        inspect every message dict in the batch (recipient + body)
+        without relying on slice indexing. team_delete must be the very
+        next recorded call after the shutdown batch.
+        """
+        roster, scripted = self._three_member_happy_setup(monkeypatch)
+
+        class BatchRecordingMock(MockTeamTools):
+            """Records `send_message_many` calls whose bodies are ALL
+            shutdown_request JSON as a single batch entry (so the test
+            can inspect the batch contents). Other `send_message_many`
+            calls fall through to the parent's per-message routing.
+            """
+
+            def send_message_many(self_inner, messages):
+                if messages and all(
+                    m["message"].startswith('{"type": "shutdown_request"')
+                    or m["message"].startswith('{"type":"shutdown_request"')
+                    for m in messages
+                ):
+                    self_inner.calls.append(
+                        (
+                            "send_message_many",
+                            (),
+                            {
+                                "kind": "shutdown_batch",
+                                "messages": [dict(m) for m in messages],
+                            },
+                        )
+                    )
+                    # Return a list of dummy responses (executor ignores them
+                    # per the fire-and-proceed contract).
+                    return ["{}" for _ in messages]
+                return super().send_message_many(messages)
+
+        tools = BatchRecordingMock(scripted=scripted)
+        with patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}):
+            outcome = team_cycle_executor(
+                clone_dir=tmp_path,
+                project=_project(roster=roster),
+                run_row=_run_row(),
+                cycle_n=1,
+                tools=tools,
+            )
+        assert outcome["status"] == "success", f"unexpected: {outcome}"
+
+        names = [c[0] for c in tools.calls]
+        # team_delete is the very last call.
+        assert names[-1] == "team_delete", f"team_delete must be last; got: {names}"
+        # The IMMEDIATELY-PRECEDING call is a single send_message_many
+        # (the shutdown batch) — not N adjacent send_message calls.
+        assert names[-2] == "send_message_many", (
+            f"the call immediately before team_delete must be the shutdown "
+            f"send_message_many batch; got: {names[-2:]}"
+        )
+        batch = tools.calls[-2][2]
+        assert batch["kind"] == "shutdown_batch", (
+            f"the preceding send_message_many must be the shutdown batch; got: {batch}"
+        )
+        batch_messages = batch["messages"]
+        assert len(batch_messages) == len(roster), (
+            f"shutdown batch size must equal team size; "
+            f"got {len(batch_messages)} vs roster size {len(roster)}"
+        )
+        # Each message in the batch is a valid shutdown_request JSON body.
+        import json as _json
+
+        for m in batch_messages:
+            parsed = _json.loads(m["message"])
+            assert parsed["type"] == "shutdown_request", (
+                f"every batch entry must be a shutdown_request; got: {parsed!r}"
+            )
+            assert isinstance(parsed.get("request_id"), str) and parsed["request_id"], (
+                f"every shutdown_request must carry a non-empty request_id; got: {parsed!r}"
+            )
+        # Every member appears exactly once as a recipient.
+        batch_recipients = [m["to"] for m in batch_messages]
+        assert sorted(batch_recipients) == sorted(roster), (
+            f"shutdown recipients must equal the team roster; got {batch_recipients} vs {roster}"
+        )
+        # request_ids are unique across the batch (fresh uuid4 per call).
+        request_ids = [_json.loads(m["message"])["request_id"] for m in batch_messages]
+        assert len(set(request_ids)) == len(request_ids), (
+            f"every shutdown_request must have a UNIQUE request_id (fresh uuid4 per call); "
+            f"got duplicates: {request_ids}"
+        )
+
+    def test_shutdown_with_zero_members_skips_to_delete(self, tmp_path):
+        """Test (d) — `active_members` is populated LAZILY by the proxy
+        (MAJOR-4 fix-loop iteration 2): only roles that actually received
+        a successful send_message / send_message_many appear in the
+        shutdown set.
+
+        Sub-case 1 (this test below): roster=[] → pm-fallback path; the
+        Phase 1 send_message to pm SUCCEEDS (PM returns ABANDON: skip),
+        so active_members = {pm} and exactly one shutdown_request fires.
+
+        Sub-case 2: team_create raises BEFORE any send_message fires →
+        no active_members populated → finally has nothing to shut down.
+        That branch is covered structurally by the
+        `if active_members:` guard in the executor; we exercise it
+        directly in `test_shutdown_truly_empty_active_members_skips_batch`
+        below.
+        """
+        # Single-pm-fallback path: roster is empty so the executor uses
+        # `[pm]` as the team. Abandon at agenda to keep this short.
+        tools = MockTeamTools(scripted={"Phase 1": "ABANDON: skip"})
+        with patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}):
+            team_cycle_executor(
+                clone_dir=tmp_path,
+                project=_project(roster=[]),
+                run_row=_run_row(),
+                cycle_n=1,
+                tools=tools,
+            )
+        names = [c[0] for c in tools.calls]
+        assert names[-1] == "team_delete", f"team_delete must be last; got: {names}"
+        # Exactly one shutdown_request (for the pm whose Phase-1 send
+        # succeeded — the only active recipient), right before team_delete.
+        last_send = tools.calls[-2]
+        assert last_send[0] == "send_message"
+        body = last_send[2]["message"]
+        assert "shutdown_request" in body, (
+            f"single-active-member path must still emit one shutdown_request; got: {body!r}"
+        )
+
+    def test_shutdown_truly_empty_active_members_skips_batch(self, tmp_path):
+        """Sub-case for test (d): when Phase 1 raises BEFORE any
+        SendMessage to a teammate completes, `active_members` stays
+        empty, the `if active_members:` guard short-circuits the shutdown
+        batch entirely, and the executor proceeds straight to team_delete.
+
+        We trigger this by raising on the FIRST send_message call (which
+        is Phase 1's PM agenda). The proxy's send_message wrapper records
+        `active_members.add(to)` ONLY after a successful return, so the
+        exception means PM is never marked active and active_members
+        remains empty.
+        """
+        tools = MockTeamTools(raise_on_send_call_n=1)
+        with (
+            patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}),
+            pytest.raises(RuntimeError, match="injected send_message failure"),
+        ):
+            team_cycle_executor(
+                clone_dir=tmp_path,
+                project=_project(),
+                run_row=_run_row(),
+                cycle_n=1,
+                tools=tools,
+            )
+        # The finally still ran (team_delete must fire). And NO
+        # send_message-with-shutdown call appears between the failing
+        # Phase-1 send_message and the final team_delete.
+        names = [c[0] for c in tools.calls]
+        assert names[-1] == "team_delete", f"team_delete must be last; got: {names}"
+        # The only send_message call is the one that raised (Phase 1 to
+        # PM) — no shutdown send_message_many / send_message landed.
+        shutdown_calls = [
+            c
+            for c in tools.calls
+            if c[0] in ("send_message", "send_message_many")
+            and "shutdown_request" in str(c[2].get("message", c[2]))
+        ]
+        assert shutdown_calls == [], (
+            f"active_members was empty (no successful send fired) — the shutdown "
+            f"batch must be skipped entirely; got: {shutdown_calls}"
+        )
+
+    def test_shutdown_response_approve_false_proceeds_to_delete_with_no_block(
+        self, tmp_path, monkeypatch
+    ):
+        """Test (e): even when a teammate's mocked response indicates
+        approve=false (or anything else), the executor MUST NOT read the
+        response — it just fires send_message_many and proceeds to
+        team_delete. This proves the simplified "fire-and-proceed" design.
+
+        We assert by injecting a send_message_many that returns
+        approve=false responses; team_delete must still fire (no
+        exception, no skip).
+        """
+        roster, scripted = self._three_member_happy_setup(monkeypatch)
+
+        class ApproveFalseMock(MockTeamTools):
+            def send_message_many(self_inner, messages):
+                # If this batch is the shutdown batch (all bodies contain
+                # 'shutdown_request'), return approve=false responses
+                # WITHOUT routing through self.send_message so we don't
+                # double-record. Otherwise, fall through to the parent
+                # batch implementation.
+                if messages and all(
+                    m["message"].startswith('{"type": "shutdown_request"')
+                    or m["message"].startswith('{"type":"shutdown_request"')
+                    for m in messages
+                ):
+                    # Record the batch as one send_message_many entry so
+                    # the lifecycle assertion below can find it.
+                    self_inner.calls.append(
+                        (
+                            "send_message_many",
+                            (),
+                            {"n": len(messages), "kind": "shutdown_batch"},
+                        )
+                    )
+                    return [
+                        '{"type":"shutdown_response","request_id":"x","approve":false}'
+                        for _ in messages
+                    ]
+                # Non-shutdown batch — delegate to the parent (which
+                # routes each through send_message and records calls).
+                return super().send_message_many(messages)
+
+        tools = ApproveFalseMock(scripted=scripted)
+        with patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}):
+            outcome = team_cycle_executor(
+                clone_dir=tmp_path,
+                project=_project(roster=roster),
+                run_row=_run_row(),
+                cycle_n=1,
+                tools=tools,
+            )
+        assert outcome["status"] == "success", f"unexpected: {outcome}"
+        # team_delete still fires last.
+        names = [c[0] for c in tools.calls]
+        assert names[-1] == "team_delete"
+        # And the shutdown batch is recorded directly above team_delete.
+        assert names[-2] == "send_message_many"
+        assert tools.calls[-2][2]["kind"] == "shutdown_batch"
+        assert tools.calls[-2][2]["n"] == len(roster)
+
+    def test_shutdown_timeout_proceeds_to_delete(self, tmp_path, monkeypatch, caplog):
+        """Test (f): if send_message_many raises (e.g. BridgeRemoteError /
+        BridgeTimeoutError), the executor logs a warning and proceeds to
+        team_delete. The team_delete-always-fires invariant is preserved.
+        """
+        import logging as _logging
+
+        roster, scripted = self._three_member_happy_setup(monkeypatch)
+
+        class ShutdownFailMock(MockTeamTools):
+            def send_message_many(self_inner, messages):
+                # Trigger ONLY on the shutdown batch — let Phase 2/3/5b'
+                # batch dispatch (which use real prose) succeed via
+                # parent's send_message routing.
+                if messages and all(
+                    m["message"].startswith('{"type": "shutdown_request"')
+                    or m["message"].startswith('{"type":"shutdown_request"')
+                    for m in messages
+                ):
+                    raise RuntimeError("simulated bridge failure on shutdown")
+                return super().send_message_many(messages)
+
+        tools = ShutdownFailMock(scripted=scripted)
+        with (
+            patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}),
+            caplog.at_level(_logging.WARNING, logger="scripts.team_executor"),
+        ):
+            outcome = team_cycle_executor(
+                clone_dir=tmp_path,
+                project=_project(roster=roster),
+                run_row=_run_row(),
+                cycle_n=1,
+                tools=tools,
+            )
+        # The cycle still succeeded — shutdown failure is best-effort.
+        assert outcome["status"] == "success", f"unexpected: {outcome}"
+        # team_delete still fired last.
+        names = [c[0] for c in tools.calls]
+        assert names[-1] == "team_delete", (
+            f"team_delete must fire even when shutdown send_message_many raises; got: {names}"
+        )
+        # And a warning naming GAP-7 was logged.
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == _logging.WARNING]
+        assert any("GAP-7" in w and "shutdown" in w for w in warnings), (
+            f"expected a GAP-7 shutdown warning; got: {warnings}"
+        )
+        assert any("simulated bridge failure" in w for w in warnings), (
+            f"warning must surface the underlying exception text; got: {warnings}"
+        )

@@ -27,6 +27,8 @@ The mode does not change the cycle's logical structure (Phase 1–5). It only ch
 
 When `mode='team'` and `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` is absent, `scripts/team_executor.py::team_cycle_executor` raises `TeamToolsUnavailableError` before any clone work begins.
 
+For the production wrapper — `scripts.cc_tool_bridge.QueueBridgeWrapper` and the SQLite-queue protocol the orchestrating session implements — see the "Team mode bridge protocol" section in `skills/improve/SKILL.md`.
+
 For `mode='team'`, the orchestrating agent provides a `TeamTools` wrapper
 by subclassing `scripts.team_tools_wrapper.AgentTeamsWrapper` and
 overriding `team_create` / `send_message` / `team_delete` to invoke the

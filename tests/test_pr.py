@@ -667,3 +667,74 @@ def test_wait_and_report_ci_returns_timeout_when_a_check_is_pending(monkeypatch)
     assert "⌛" in result
     assert "CI did not complete" in result
     assert "https://github.com/x/y/pull/1" in result
+
+
+# ── render_pr_body refusal path (MAJOR-NEW-PR-SIGNATURE) ─────────────────
+
+
+@pytest.mark.parametrize("bad_branch", [None, "", "<pending>", "<failed>"])
+def test_render_pr_body_refuses_original_four_sentinel_values(bad_branch):
+    """MAJOR-NEW-PR-SIGNATURE: the original 4 sentinel values
+    (None, '', '<pending>', '<failed>') must continue to refuse —
+    pinned by the design doc and never removed by widening (m2)."""
+    run = {"id": 17, "branch": bad_branch, "cycles_requested": 1, "subject": "x"}
+    project = {"git_url": "https://e.com/o/r", "name": "r"}
+    with pytest.raises(ValueError) as exc_info:
+        render_pr_body(run, project, [], [])
+    msg = str(exc_info.value)
+    assert "17" in msg
+    assert "branch=" in msg
+
+
+@pytest.mark.parametrize(
+    "bad_branch,reason_hint",
+    [
+        # m2 (review round 1) — broader refusal categories.
+        ("   ", "whitespace-only"),
+        ("\t\n", "whitespace-only"),
+        ("has space", "contains whitespace"),
+        ("has\ttab", "contains whitespace"),
+        ("has\nnewline", "contains whitespace"),
+        ("../../../etc/passwd", "'..'"),
+        ("foo/..bar", "'..'"),
+        ("-D", "starts with '-'"),
+        ("--upload-pack=evil", "starts with '-'"),
+    ],
+)
+def test_render_pr_body_refuses_unsafe_branch_names(bad_branch, reason_hint):
+    """m2: branches that would be unsafe to pass to `gh pr create --head`
+    must refuse — whitespace splits arg lists, `..` is a refspec, leading
+    `-` is parsed as a flag."""
+    run = {"id": 42, "branch": bad_branch, "cycles_requested": 1, "subject": "x"}
+    project = {"git_url": "u", "name": "n"}
+    with pytest.raises(ValueError) as exc_info:
+        render_pr_body(run, project, [], [])
+    msg = str(exc_info.value)
+    assert "42" in msg
+    assert "branch=" in msg
+    assert reason_hint in msg, f"refusal message should mention {reason_hint!r}; got: {msg}"
+
+
+def test_render_pr_body_accepts_real_branch_name():
+    """A real kaizen branch name must NOT raise after the m2 widening."""
+    run = {
+        "id": 1,
+        "branch": "kaizen/x-2026-05-23-2342",
+        "cycles_requested": 1,
+        "subject": None,
+        "started_at": None,
+        "ended_at": None,
+    }
+    render_pr_body(run, {"git_url": "u", "name": "n", "base_branch": "main"}, [], [])
+
+
+def test_render_pr_body_signature_unchanged():
+    """The signature is (run, project, cycles, abandonments) -> tuple[str, str].
+    DO NOT change this signature without updating every caller."""
+    import inspect
+
+    sig = inspect.signature(render_pr_body)
+    params = list(sig.parameters.keys())
+    assert params == ["run", "project", "cycles", "abandonments"], (
+        f"render_pr_body signature changed: got params={params}"
+    )

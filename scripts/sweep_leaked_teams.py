@@ -10,6 +10,18 @@ no matching `TeamDelete` from a previous run (e.g. because that run
 crashed before `team_cycle_executor`'s finally could enqueue the
 delete).
 
+SCOPE — addresses Layer 3 (config) of the teammate-cleanup TRIFECTA
+ONLY. A spawned teammate is three resources: OS process, tmux pane,
+and team config dir. This script enqueues `TeamDelete` calls, which
+remove only the config dir.
+
+Process termination depends on the GAP-7 `shutdown_request` handshake
+fired by `team_cycle_executor` at end-of-cycle (happy path), and pane
+closure follows process exit. Orphan processes/panes from pre-GAP-7
+runs require manual `pkill -f '\\-\\-agent-id .*@...'` + `tmux
+kill-pane`. Full recovery recipe lives in
+`docs/runbooks/orphan-teammate-cleanup.md`.
+
 The query joins `json_extract(args_json, '$.team_id')` for `team_delete`
 rows against `json_extract(response_json, '$.team_id')` for
 `team_create` rows — the canonical team_id post-creation is in the

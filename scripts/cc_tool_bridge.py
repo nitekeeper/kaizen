@@ -40,9 +40,23 @@ from scripts.bridge_db import bootstrap
 from scripts.team_tools_wrapper import AgentTeamsWrapper
 
 # Per the design's "Code-level API sketch (Rev 4)" section.
-PER_CALL_TIMEOUT_S: float = 180.0
+#
+# Run-21 bump (2026-05-24): HEARTBEAT_STALL_S raised 60→300 and
+# PER_CALL_TIMEOUT_S raised 180→600 in response to GAP-1 from
+# docs/kaizen/2026-05-24-bridge-smoke.md. The Rev-4 design assumed
+# the per-row heartbeat poke (Appendix A step 2a) would bound the
+# heartbeat gap to one Bash latency — true for the synchronous
+# TeamCreate / TeamDelete tools, FALSE for CC team-mode SendMessage,
+# which is fundamentally async: the orchestrating Claude (S1) is idle
+# while waiting for the teammate's reply notification, so no Bash
+# heartbeat fires for the full 30-60+s round-trip the smoke observed.
+# Bumping the threshold trades a longer "real crash invisible" window
+# (300s) for elimination of spurious abandonment on legitimate replies.
+# Acceptable for the personal-use single-machine deployment context.
+# Trade-off pinned in the smoke report's GAP-1 follow-up note.
+PER_CALL_TIMEOUT_S: float = 600.0
 CLEANUP_TIMEOUT_S: float = 20.0
-HEARTBEAT_STALL_S: float = 60.0
+HEARTBEAT_STALL_S: float = 300.0
 POLL_INTERVAL_S: float = 0.2
 STALE_ROW_S: float = 900.0
 
@@ -222,6 +236,11 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
     ) -> dict:
         """Enqueue + poll one bridge_requests row. Returns the decoded
         `response_json` dict (or raises one of the Bridge*Error)."""
+        # TODO(follow-up): per-cycle outer deadline — see review round-1
+        # architect finding. Worst case today is PER_CALL_TIMEOUT_S * (number
+        # of dispatches per cycle), so a 50-call cycle could in principle
+        # block 8h+ before any single-call timeout fires. A `CYCLE_WALL_S`
+        # bound (≈3600s) would cap that. Out of scope for run 21; defer.
         timeout_s = self.PER_CALL_TIMEOUT_S if timeout_s is None else timeout_s
         row_id = self._insert(kind, args)
         deadline = time.monotonic() + timeout_s

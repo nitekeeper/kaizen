@@ -29,6 +29,44 @@ from typing import Any
 
 from scripts.fix_loop import Finding
 
+# Run-21 GAP-2 fix (see docs/kaizen/2026-05-24-bridge-smoke.md).
+#
+# In CC team mode, `Agent(team_name=..., name=..., prompt=...)`-spawned
+# teammates do NOT auto-relay their spawn-prompt output back to team-lead.
+# Recipients must explicitly `SendMessage` their response, or their work
+# silently dies (the smoke saw the architect process the brief, go idle,
+# and never send anything back — team-lead had to explicitly poke
+# "please reply" before any output arrived). Every Phase 1-5c dispatch
+# template appends this hard-rule reminder to its body so the requirement
+# is impossible for a teammate to miss.
+#
+# Appended (not prepended) so the agenda content reads naturally — the
+# rule is a contract reminder, not the lead-in.
+# Wording notes (fix-loop iteration 1):
+#   MAJOR-1: the `to=` argument names the literal string "team-lead" — every
+#            team has a registered team-lead agent (the implicit
+#            lead_agent_id emitted by TeamCreate). Spelling this out as a
+#            copy-pasteable example prevents a literal-minded teammate from
+#            guessing a wrong recipient and silently dropping the reply.
+#   MAJOR-2: ABANDON-and-stay-silent is a trap — the smoke saw cycles die
+#            because a teammate believed `ABANDON: ...` was an exit-without-
+#            reply protocol. The rule now states explicitly that abandons
+#            ALSO travel via SendMessage with an `ABANDON:` prefixed body.
+TEAMMATE_REPLY_RULE = (
+    "\n\nIMPORTANT — Reply contract: When you complete your task, "
+    "you MUST send your response back via "
+    'SendMessage(to="team-lead", message=<your reply>). '
+    'The `to` value is literally the string "team-lead" — every team '
+    "has a registered team-lead agent (the implicit lead_agent_id "
+    "emitted by TeamCreate). Do NOT just go idle — in CC team mode, "
+    "spawn-prompt output is not auto-relayed, so silent completion means "
+    "team-lead never sees your output. Even a brief 'No issues to report' "
+    "SendMessage is required to advance the cycle. "
+    "Abandon signals also go via SendMessage — start the body with "
+    "'ABANDON: <one-line reason>'. Do not skip the SendMessage even "
+    "when abandoning."
+)
+
 
 def _require(name: str, value: Any, type_: type) -> None:
     """Validate a required kwarg is present, well-typed, and non-empty.
@@ -63,7 +101,7 @@ def phase_1_agenda(*, subject: str | None, cycle_n: int) -> str:
         f"Subject: {subject or 'PM-directed'}. "
         "Propose 1-5 agenda items, one per line. Prefix 'ABANDON:' if you "
         "cannot in good faith produce any useful agenda for this cycle."
-    )
+    ) + TEAMMATE_REPLY_RULE
 
 
 def phase_2_preanalysis(*, agenda_items: list[str], participant: str) -> str:
@@ -76,7 +114,7 @@ def phase_2_preanalysis(*, agenda_items: list[str], participant: str) -> str:
         f"Agenda from PM:\n{bullets}\n\n"
         "Produce a short proposal touching each item from your domain lens. "
         "Prefix 'ABANDON:' to opt out."
-    )
+    ) + TEAMMATE_REPLY_RULE
 
 
 def phase_3_open(*, proposals: list[dict]) -> str:
@@ -87,7 +125,7 @@ def phase_3_open(*, proposals: list[dict]) -> str:
     return (
         "Phase 3 open (Synthesis meeting — Star). All Phase-2 proposals "
         f"below; read them and prepare your debate position:\n{body}"
-    )
+    ) + TEAMMATE_REPLY_RULE
 
 
 def phase_3_debate() -> str:
@@ -96,7 +134,7 @@ def phase_3_debate() -> str:
         "Phase 3 debate (Mesh). State your remaining concerns and your "
         "agreed scope for this cycle. Prefix 'ABANDON:' if no consensus "
         "is reachable from your seat."
-    )
+    ) + TEAMMATE_REPLY_RULE
 
 
 def phase_3_close(*, proposals: list[dict], agreements: list[dict]) -> str:
@@ -112,7 +150,7 @@ def phase_3_close(*, proposals: list[dict], agreements: list[dict]) -> str:
         "(list[str]), reads (list[str]), depends_on (list[str]), "
         "wave (int), owner (str role id). "
         "Prefix 'ABANDON:' if no DAG can be agreed."
-    )
+    ) + TEAMMATE_REPLY_RULE
 
 
 def phase_4_implementer(*, item: dict, wave_n: int) -> str:
@@ -125,7 +163,7 @@ def phase_4_implementer(*, item: dict, wave_n: int) -> str:
         f"reads: {item.get('reads')}. Apply the change to disk in the "
         "clone and reply with a one-line summary of what you did. "
         "Prefix 'ABANDON:' if the change cannot be applied."
-    )
+    ) + TEAMMATE_REPLY_RULE
 
 
 def phase_5b_ci_failure(*, wave_n: int, failed_checks: list[str]) -> str:
@@ -171,7 +209,7 @@ def phase_5b_prime_reviewer(
         "(severity ∈ blocker|major|minor|nit)."
     )
     if not prior_findings:
-        return base
+        return base + TEAMMATE_REPLY_RULE
     # Render the carry-forward block so iteration 2+ reviewers can do
     # incremental review against the previous round's surviving findings.
     prior_lines = [
@@ -182,7 +220,7 @@ def phase_5b_prime_reviewer(
     return (
         f"{base}\n\nPreviously unresolved findings (iteration {iter_n - 1}); "
         f"verify whether the implementer's fix attempts resolved each:\n{prior_block}"
-    )
+    ) + TEAMMATE_REPLY_RULE
 
 
 def phase_5b_prime_fix(*, finding: Finding) -> str:
@@ -193,7 +231,7 @@ def phase_5b_prime_fix(*, finding: Finding) -> str:
         f"({finding.severity}) at {finding.file_line}: {finding.finding}. "
         "Apply the fix and reply with a one-line confirmation. Prefix "
         "'ABANDON:' if the fix cannot be applied."
-    )
+    ) + TEAMMATE_REPLY_RULE
 
 
 def phase_5b_prime_pm_acceptance(*, findings: list[Finding], iter_n: int) -> str:
@@ -223,4 +261,4 @@ def phase_5b_prime_pm_acceptance(*, findings: list[Finding], iter_n: int) -> str
         "As PM, do you accept them as out-of-scope for THIS cycle (we will "
         "log them for follow-up), or do we keep iterating? Reply starting "
         "with ACCEPT or REJECT, followed by a one-line rationale."
-    )
+    ) + TEAMMATE_REPLY_RULE

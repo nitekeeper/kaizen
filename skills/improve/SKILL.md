@@ -87,11 +87,14 @@ This sequence implements the canonical launch sequence from `docs/design/python-
    ```
    Every `<placeholder>` above is single-quoted (HARD RULE). The command prints ONLY the run_id on stdout. Capture it into a shell variable `RUN_ID`. If the project is not registered, the command exits non-zero with a registration hint — surface it to the user and abort. The command ALSO rejects URLs containing shell metacharacters (`;`, `|`, `&`, `$`, backtick, etc.) via `scripts.run.validate_git_url` as a defence-in-depth layer.
 
+   > **Inline `VAR=val python3 ...` is OK in Step 2 only — Step 3 must use `export`.** Step 2 invokes Python directly (no `&` detach), so the Bash-inline assignment of `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` and `PYTHONPATH=.` propagates into the immediate `python3` process's environment correctly. Step 3 (the detached spawn) wraps `nohup ... &` inside a subshell — inline assignments do NOT propagate into the detached job, so Step 3 MUST use `export VAR=val` inside the subshell. Do NOT copy the inline form from Step 2 into Step 3 — that's the exact GAP-3 trap from run 20.
+
 3. **Spawn the detached Python orchestrator.** A single Bash call, with `&` so Bash returns immediately. `run_bridged.py` uses flagged arguments. The whole invocation is wrapped in a subshell `( umask 077 && ... )` so the `>` redirect creates the log file with mode 0600 (owner-only) instead of the typical shell-default 0644 (mfix-UMASK):
    ```bash
    cd "$KAIZEN_ROOT" && \
    ( umask 077 && \
-     CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \
+     export PYTHONPATH=. && \
+     export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 && \
      nohup python3 -m scripts.run_bridged \
          --db .ai/memex.db --bridge-db .ai/bridge.db \
          --url '<git_url>' --cycles '<cycles>' --subject '<subject>' \
@@ -100,6 +103,8 @@ This sequence implements the canonical launch sequence from `docs/design/python-
    echo $!
    ```
    Every `<placeholder>` is single-quoted (HARD RULE). `$RUN_ID` is double-quoted because it is YOUR shell variable, captured from Step 2's stdout (an integer, never agent-authored prose). The `cd "$KAIZEN_ROOT"` is REQUIRED so Python and your session resolve `.ai/bridge.db` to the same file. `echo $!` records the child PID into your tool output for diagnostics. The detached Python calls `scripts.bridge_db.bootstrap()` itself as defence-in-depth.
+
+   **Why `export` (not inline `VAR=val python3 ...`) for `PYTHONPATH` and `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`?** CC Bash inline assignment only exports the variable to the immediate command's environment. When the command is wrapped in `( ... & )` (a subshell that detaches via `nohup ... &`), the inline assignment does NOT propagate to the detached job — empirically confirmed by run 20: the first spawn attempt used `PYTHONPATH=. nohup python3 ...` and `scripts.run_bridged`'s env-validation rejected with `missing required env vars: PYTHONPATH`. Using `export VAR=val` inside the subshell (BEFORE the `nohup` invocation) sets the variable in the subshell's environment so the detached Python inherits it. See `docs/kaizen/2026-05-24-bridge-smoke.md` GAP-3 for the smoke citation.
 
    **Two-layer log permission protection (mfix-UMASK):**
    - Layer 1 (this Bash subshell): `( umask 077 && ... > "/tmp/..." )` tightens the umask BEFORE the `>` redirect, so the log file at `/tmp/kaizen-bridged-${RUN_ID}.log` is created mode 0600. The redirect happens in the *parent shell* before Python starts, so the Python-side umask cannot retroactively protect this file — only the subshell umask can.

@@ -58,8 +58,8 @@ First real `/kaizen:improve --mode team` dogfood. Subject: trivial single-file d
 ## Open question status
 
 - **Q1 (Anthropic-side team_id cross-session scoping):** **Not yet empirically answered.** The cycle abandoned before producing a leaked team_id we could attempt to delete from a different session. Carry to next smoke.
-- **Q2 (CC Bash env precedence):** **EMPIRICALLY ANSWERED** — see GAP-3 above.
-- **Q4 (heartbeat threshold):** **EMPIRICALLY ANSWERED** — 60s is too short; see GAP-1.
+- **Q2 (CC Bash env precedence):** **EMPIRICALLY ANSWERED** — see GAP-3 above. → **RESOLVED in run 21** (see "Fixes applied 2026-05-24 (run 21)" below).
+- **Q4 (heartbeat threshold):** **EMPIRICALLY ANSWERED** — 60s is too short; see GAP-1. → **RESOLVED in run 21** (see "Fixes applied 2026-05-24 (run 21)" below).
 
 ## Bridge DB final state (post-cleanup)
 
@@ -95,3 +95,29 @@ ended_at=2026-05-24T00:47:16Z
 **Bridge semantics: 2 MAJOR gaps surfaced that block a real multi-turn cycle.** GAP-1 (heartbeat-stall during async teammate-reply wait) and GAP-2 (teammates don't auto-relay spawn-prompt output) are both fixable but require a follow-up design + implementation cycle. Neither was anticipated correctly by the design's 4 review rounds — they're genuinely new findings from real-world exercise. This is exactly what a smoke is for.
 
 **Recommended next cycle subject:** *"Fix HEARTBEAT_STALL_S handling for async CC team-mode SendMessage (option (b): orchestrator pokes heartbeat while waiting for incoming teammate messages), AND add 'always SendMessage back to team-lead' hard rule to every teammate's spawn prompt (or to SKILL prose telling S1 to inject it). NON-DESTRUCTIVE. Validates against a second smoke run."*
+
+## Fixes applied 2026-05-24 (run 21)
+
+All three GAPs were addressed in this cycle. NON-DESTRUCTIVE — no public-function deletions, no schema migrations, no test deletions (only updates to existing tests + new tests added).
+
+### GAP-1 — Fixed in run 21 via option (a) — constant bumps; trade-off acceptable for personal use.
+
+- `scripts/cc_tool_bridge.py`: `HEARTBEAT_STALL_S` 60 → 300, `PER_CALL_TIMEOUT_S` 180 → 600. Inline comment documents the trade-off (5-minute crash-invisibility window in exchange for elimination of spurious abandonment on legitimate CC team-mode async-SendMessage round-trips).
+- Tests:
+  - `tests/test_cc_tool_bridge.py::test_bridge_stall_raises_when_s1_heartbeat_old` — updated offset 120 → 600 so the test still trips the stall under the new threshold.
+  - `tests/test_cc_tool_bridge.py::test_heartbeat_stall_constants_match_run21_values` — NEW; pins both constants to 300/600 so a future drift back to 60/180 fails loudly.
+  - `tests/test_cc_tool_bridge.py::test_long_sendmessage_does_not_trip_stall_at_old_threshold` — NEW; simulates a 90s SendMessage with NO interleaved S1 heartbeat pokes (the exact run-20 failure mode) and asserts NO BridgeStallError under the new 300s threshold.
+- `docs/design/python-cc-tool-bridge-design.md`: code-sketch + prose references to `HEARTBEAT_STALL_S=60s` / `PER_CALL_TIMEOUT_S=180s` updated to `HEARTBEAT_STALL_S=300s` / `PER_CALL_TIMEOUT_S=600s` so design + code stay in sync.
+
+### GAP-2 — Fixed in run 21 via option (a) hard-rule append to every teammate-dispatch template.
+
+- `scripts/dispatch_templates.py`: new module-level constant `TEAMMATE_REPLY_RULE` appended to the return value of every teammate-bound template (`phase_1_agenda`, `phase_2_preanalysis`, `phase_3_open`, `phase_3_debate`, `phase_3_close`, `phase_4_implementer`, `phase_5b_prime_reviewer`, `phase_5b_prime_fix`, `phase_5b_prime_pm_acceptance`). The rule instructs the recipient to explicitly `SendMessage` its response back to team-lead — silent spawn-prompt completion no longer kills the cycle. `phase_5b_ci_failure` is EXCLUDED on purpose: it formats an abandonment-outcome detail string, not a teammate message body.
+- Tests:
+  - `tests/test_dispatch_templates.py::test_every_template_appends_teammate_reply_rule` — NEW parametrized test iterating every teammate-dispatch template with its minimum-valid kwargs and asserting (1) the rule appears in the body and (2) the body ENDS with the rule (so it is appended, not prepended).
+  - `tests/test_dispatch_templates.py::test_phase_5b_ci_failure_does_NOT_append_teammate_reply_rule` — NEW boundary test: pins the abandonment-detail formatter as the explicit exception.
+  - `tests/test_dispatch_templates_byte_identity.py` — every teammate-dispatch template's golden updated to include the rule suffix (`+ _RULE`); `phase_5b_ci_failure_golden` left untouched.
+
+### GAP-3 — Fixed in run 21 by switching to `export` inside the subshell.
+
+- `skills/improve/SKILL.md` Step 3b.3: spawn-line now uses `export PYTHONPATH=.` and `export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` inside the `( umask 077 && ... )` subshell rather than Bash inline `VAR=val command` prefixes that don't propagate to nohup-detached subshells. Inline prose documents the empirical run-20 rationale and back-links to this smoke report's GAP-3 section.
+- Tests: none — this is a SKILL prose fix. A regression smoke (run 21+) will validate the spawn-line empirically.

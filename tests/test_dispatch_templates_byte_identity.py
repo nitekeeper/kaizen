@@ -18,6 +18,7 @@ string. One test per template for clear failure messages.
 from __future__ import annotations
 
 from scripts.dispatch_templates import (
+    TEAMMATE_REPLY_RULE,
     phase_1_agenda,
     phase_2_preanalysis,
     phase_3_close,
@@ -30,6 +31,13 @@ from scripts.dispatch_templates import (
     phase_5b_prime_reviewer,
 )
 from scripts.fix_loop import Finding
+
+# Run-21 GAP-2 fix: every teammate-bound dispatch template now appends
+# TEAMMATE_REPLY_RULE so the recipient knows it MUST SendMessage its reply
+# back to team-lead. Each golden below ends with this constant (except
+# phase_5b_ci_failure, which is an abandonment-detail formatter, not a
+# teammate dispatch).
+_RULE = TEAMMATE_REPLY_RULE
 
 
 def _canonical_finding() -> Finding:
@@ -48,7 +56,7 @@ def test_phase_1_agenda_golden():
     assert out == (
         "Kaizen cycle 1 — Phase 1 (Agenda). Subject: Test subject. "
         "Propose 1-5 agenda items, one per line. Prefix 'ABANDON:' "
-        "if you cannot in good faith produce any useful agenda for this cycle."
+        "if you cannot in good faith produce any useful agenda for this cycle." + _RULE
     )
 
 
@@ -60,7 +68,7 @@ def test_phase_2_preanalysis_golden():
         "- Item B\n"
         "\n"
         "Produce a short proposal touching each item from your domain lens. "
-        "Prefix 'ABANDON:' to opt out."
+        "Prefix 'ABANDON:' to opt out." + _RULE
     )
 
 
@@ -69,7 +77,7 @@ def test_phase_3_open_golden():
     assert out == (
         "Phase 3 open (Synthesis meeting — Star). All Phase-2 proposals "
         "below; read them and prepare your debate position:\n"
-        "- be-1: proposal text"
+        "- be-1: proposal text" + _RULE
     )
 
 
@@ -78,7 +86,7 @@ def test_phase_3_debate_golden():
     assert out == (
         "Phase 3 debate (Mesh). State your remaining concerns and your "
         "agreed scope for this cycle. Prefix 'ABANDON:' if no consensus "
-        "is reachable from your seat."
+        "is reachable from your seat." + _RULE
     )
 
 
@@ -94,7 +102,7 @@ def test_phase_3_close_golden():
         "Action Item dicts. Each dict must have keys: id (str), touches "
         "(list[str]), reads (list[str]), depends_on (list[str]), "
         "wave (int), owner (str role id). "
-        "Prefix 'ABANDON:' if no DAG can be agreed."
+        "Prefix 'ABANDON:' if no DAG can be agreed." + _RULE
     )
 
 
@@ -106,11 +114,13 @@ def test_phase_4_implementer_golden():
         "You own this item. Touches: ['foo.py']; "
         "reads: ['bar.py']. Apply the change to disk in the "
         "clone and reply with a one-line summary of what you did. "
-        "Prefix 'ABANDON:' if the change cannot be applied."
+        "Prefix 'ABANDON:' if the change cannot be applied." + _RULE
     )
 
 
 def test_phase_5b_ci_failure_golden():
+    # NOT a teammate-dispatch template — used as the abandonment-outcome
+    # `detail` string when CI fails mid-cycle. No reply-rule suffix.
     out = phase_5b_ci_failure(wave_n=1, failed_checks=["tests"])
     assert out == "CI failed after wave 1: ['tests']"
 
@@ -122,7 +132,7 @@ def test_phase_5b_prime_reviewer_golden():
         "Review the implemented Action Items: ['AI-1']. Reply with either "
         "'NO ISSUES' (case-insensitive) OR one finding per line in the "
         "format: [severity] file:line — text  "
-        "(severity ∈ blocker|major|minor|nit)."
+        "(severity ∈ blocker|major|minor|nit)." + _RULE
     )
 
 
@@ -131,7 +141,7 @@ def test_phase_5b_prime_fix_golden():
     assert out == (
         "Phase 5b' fix — address finding R1-1 (blocker) at foo.py:1: "
         "issue text. Apply the fix and reply with a one-line confirmation. "
-        "Prefix 'ABANDON:' if the fix cannot be applied."
+        "Prefix 'ABANDON:' if the fix cannot be applied." + _RULE
     )
 
 
@@ -144,5 +154,5 @@ def test_phase_5b_prime_pm_acceptance_golden():
         "\n"
         "As PM, do you accept them as out-of-scope for THIS cycle (we will "
         "log them for follow-up), or do we keep iterating? Reply starting "
-        "with ACCEPT or REJECT, followed by a one-line rationale."
+        "with ACCEPT or REJECT, followed by a one-line rationale." + _RULE
     )

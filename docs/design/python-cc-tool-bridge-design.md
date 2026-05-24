@@ -608,7 +608,7 @@ Three layers, unchanged in structure from Rev 2 but with corrected SQL:
 
 - **Layer 1 — `finally`:** `team_cycle_executor`'s finally enqueues `team_delete`.
 - **Layer 2 — cleanup timeout:** if `team_delete` request times out (`CLEANUP_TIMEOUT_S=20s`, bumped from Rev 2's 15s), Python appends `{run_id, team_id, leaked_at}` to `.ai/leaked_teams.json` and exits.
-- **Layer 3 — next-run sweep (`scripts/sweep_leaked_teams.py`):** invoked from `skills/improve/SKILL.md` Step 1. Uses SQLite JSON1 to find orphan team_ids correctly (MINOR-ORPHAN fix):
+- **Layer 3 — next-run sweep (`scripts/sweep_leaked_teams.py`):** invoked from `skills/improve/SKILL.md` Step 3b.3 (team-mode runs only; subagent mode does not use `TeamCreate` and so cannot leak teams). Uses SQLite JSON1 to find orphan team_ids correctly (MINOR-ORPHAN fix):
 
 ```sql
 -- Find team_ids that were created in any past run but never deleted.

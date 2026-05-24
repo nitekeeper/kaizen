@@ -87,9 +87,19 @@ This sequence implements the canonical launch sequence from `docs/design/python-
    ```
    Every `<placeholder>` above is single-quoted (HARD RULE). The command prints ONLY the run_id on stdout. Capture it into a shell variable `RUN_ID`. If the project is not registered, the command exits non-zero with a registration hint — surface it to the user and abort. The command ALSO rejects URLs containing shell metacharacters (`;`, `|`, `&`, `$`, backtick, etc.) via `scripts.run.validate_git_url` as a defence-in-depth layer.
 
-   > **Inline `VAR=val python3 ...` is OK in Step 2 only — Step 3 must use `export`.** Step 2 invokes Python directly (no `&` detach), so the Bash-inline assignment of `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` and `PYTHONPATH=.` propagates into the immediate `python3` process's environment correctly. Step 3 (the detached spawn) wraps `nohup ... &` inside a subshell — inline assignments do NOT propagate into the detached job, so Step 3 MUST use `export VAR=val` inside the subshell. Do NOT copy the inline form from Step 2 into Step 3 — that's the exact GAP-3 trap from run 20.
+   > **Inline `VAR=val python3 ...` is OK in Step 2 only — Step 4 must use `export`.** Step 2 invokes Python directly (no `&` detach), so the Bash-inline assignment of `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` and `PYTHONPATH=.` propagates into the immediate `python3` process's environment correctly. Step 4 (the detached spawn) wraps `nohup ... &` inside a subshell — inline assignments do NOT propagate into the detached job, so Step 4 MUST use `export VAR=val` inside the subshell. Do NOT copy the inline form from Step 2 into Step 4 — that's the exact GAP-3 trap from run 20.
 
-3. **Spawn the detached Python orchestrator.** A single Bash call, with `&` so Bash returns immediately. `run_bridged.py` uses flagged arguments. The whole invocation is wrapped in a subshell `( umask 077 && ... )` so the `>` redirect creates the log file with mode 0600 (owner-only) instead of the typical shell-default 0644 (mfix-UMASK):
+3. **Sweep prior-cycle orphan teams (same-session only).** After capturing `RUN_ID` in Step 2 and BEFORE the detached spawn in Step 4, invoke the orphan-team sweep against the bridge DB, scoped to the current run. The canonical step id is **Step 3b.3** (referenced by `scripts/sweep_leaked_teams.py`'s top-of-file comment and by `docs/design/python-cc-tool-bridge-design.md`'s Layer 3 cross-ref):
+
+   ```bash
+   cd "$KAIZEN_ROOT" && PYTHONPATH=. python3 -m scripts.sweep_leaked_teams --run-id "$RUN_ID"
+   ```
+
+   This wires in Layer 3 of the leaked-team recovery design (`docs/design/python-cc-tool-bridge-design.md`, section "Leaked-team recovery"). The sweep queries `bridge_requests` history for `team_create` rows that lack a matching `team_delete` and enqueues a single `aborted` row into the NEW run's bridge queue with `args_json.team_ids_at_risk` populated. The orchestrating Claude session services that row naturally during the normal poll loop (per the "Team mode bridge protocol" section's `aborted` handler), which is equivalent to calling `TeamDelete` on each orphan id.
+
+   **CRITICAL limitation caveat.** This sweep only recovers orphans whose teams are still in the CURRENT Claude session's context (e.g., same-session multi-cycle runs where Python died between cycles). **Orphans from a different prior Claude session require manual `rm -rf ~/.claude/teams/<name>/`** — TeamDelete is per-session by design (see `feedback-cc-teamdelete-per-session.md`). The sweep will still DETECT cross-session orphans (the JSON1 query is session-agnostic), but the resulting `TeamDelete` invocations will be no-ops because the dead session's team context cannot be loaded by the live session. Filesystem cleanup remains a manual step until a `TeamAttach`/`TeamLoad` primitive exists.
+
+4. **Spawn the detached Python orchestrator.** A single Bash call, with `&` so Bash returns immediately. `run_bridged.py` uses flagged arguments. The whole invocation is wrapped in a subshell `( umask 077 && ... )` so the `>` redirect creates the log file with mode 0600 (owner-only) instead of the typical shell-default 0644 (mfix-UMASK):
    ```bash
    cd "$KAIZEN_ROOT" && \
    ( umask 077 && \
@@ -110,9 +120,9 @@ This sequence implements the canonical launch sequence from `docs/design/python-
    - Layer 1 (this Bash subshell): `( umask 077 && ... > "/tmp/..." )` tightens the umask BEFORE the `>` redirect, so the log file at `/tmp/kaizen-bridged-${RUN_ID}.log` is created mode 0600. The redirect happens in the *parent shell* before Python starts, so the Python-side umask cannot retroactively protect this file — only the subshell umask can.
    - Layer 2 (Python-side): `scripts.run_bridged.main()` also calls `os.umask(0o077)` at startup, as belt-and-braces for any subsequent files Python opens itself (e.g. `.ai/leaked_teams.json`).
 
-4. **Enter the bridge poll loop.** Follow the "Team mode bridge protocol" section at the end of this file VERBATIM — its single-iteration body is the canonical poll/dispatch/write-back contract. The poll loop's exit condition is `runs.status NOT IN ('running',)`; once it exits, proceed to the PR open step below.
+5. **Enter the bridge poll loop.** Follow the "Team mode bridge protocol" section at the end of this file VERBATIM — its single-iteration body is the canonical poll/dispatch/write-back contract. The poll loop's exit condition is `runs.status NOT IN ('running',)`; once it exits, proceed to the PR open step below.
 
-5. **Open the PR.** When the poll loop exits, invoke the PR-open helper directly — do NOT route to `internal/run/SKILL.md` (team mode bypasses that flow per Step 3 above). Call `scripts.pr.open_pr_for_run(db_path, run_id, clone_dir)`; equivalently:
+6. **Open the PR.** When the poll loop exits, invoke the PR-open helper directly — do NOT route to `internal/run/SKILL.md` (team mode bypasses that flow per the section-level "Step 3 — Route by mode" above). Call `scripts.pr.open_pr_for_run(db_path, run_id, clone_dir)`; equivalently:
    ```bash
    cd "$KAIZEN_ROOT" && PYTHONPATH=. python3 -m scripts.pr "$RUN_ID" \
        "experiment/<owner>-<repo>"
@@ -121,7 +131,7 @@ This sequence implements the canonical launch sequence from `docs/design/python-
 
    If `render_pr_body` raises `ValueError` (the run failed before `push_branch`, or the branch column holds an unsafe value), surface that to the user as "PR refused — run did not complete branch creation." and abort the PR open step. The error is informational; the run row is already finalized as `status='failed'`.
 
-6. **Teardown.** Delete `experiment/<owner>-<repo>/` via `scripts.run.cleanup_after_pr` regardless of success/failure outcome.
+7. **Teardown.** Delete `experiment/<owner>-<repo>/` via `scripts.run.cleanup_after_pr` regardless of success/failure outcome.
 
 ### Step 4 — Print the final summary
 

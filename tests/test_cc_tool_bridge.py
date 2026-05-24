@@ -408,3 +408,230 @@ def test_send_message_rejects_missing_response_in_response(bridge_path):
     with pytest.raises(BridgeRemoteError):
         wrapper.send_message("t", "to", "msg")
     t.join(timeout=5)
+
+
+# ── send_message_many (GAP-4 fix) ─────────────────────────────────────────
+
+
+def _all_pending_rows(bridge_path, run_id) -> list[int]:
+    con = _con(bridge_path)
+    try:
+        cur = con.execute(
+            "SELECT id FROM bridge_requests WHERE run_id=? AND status='pending' ORDER BY id",
+            (run_id,),
+        )
+        return [int(r[0]) for r in cur.fetchall()]
+    finally:
+        con.close()
+
+
+def _count_rows(bridge_path, run_id) -> int:
+    con = _con(bridge_path)
+    try:
+        cur = con.execute(
+            "SELECT COUNT(*) FROM bridge_requests WHERE run_id=?",
+            (run_id,),
+        )
+        return int(cur.fetchone()[0])
+    finally:
+        con.close()
+
+
+def test_send_message_many_dispatches_in_parallel(bridge_path):
+    """GAP-4 (docs/kaizen/2026-05-24-bridge-smoke-2.md): batch dispatch.
+
+    Asserts:
+      * Three messages enqueued in ONE batch → exactly 3 rows appear
+        before any response is written (proves single-transaction enqueue,
+        not interleaved-with-poll one-by-one).
+      * Responses come back in INPUT order even when the fake S1 marks
+        them ready in a SCRAMBLED order (m2 first, m1 second, m3 last).
+    """
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=100)
+    _tick_bridge_heartbeat(bridge_path, run_id=100, at_offset_seconds=0)
+
+    started_event = threading.Event()
+    row_count_when_started: list[int] = []
+
+    def fake_s1():
+        # Wait until all 3 rows are visible before marking any ready —
+        # this is the single-transaction invariant under test.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            pending = _all_pending_rows(bridge_path, run_id=100)
+            if len(pending) >= 3:
+                row_count_when_started.append(_count_rows(bridge_path, run_id=100))
+                started_event.set()
+                # Mark in scrambled order: m2 → m1 → m3 to prove input-order
+                # preservation of the wrapper's return.
+                _mark_row_ready(bridge_path, pending[1], {"response": "resp2"})
+                _mark_row_ready(bridge_path, pending[0], {"response": "resp1"})
+                _mark_row_ready(bridge_path, pending[2], {"response": "resp3"})
+                return
+            time.sleep(0.01)
+        raise AssertionError("never saw 3 pending rows")
+
+    t = threading.Thread(target=fake_s1, daemon=True)
+    t.start()
+    out = wrapper.send_message_many(
+        [
+            {"team_id": "t1", "to": "a", "message": "msg1"},
+            {"team_id": "t1", "to": "b", "message": "msg2"},
+            {"team_id": "t1", "to": "c", "message": "msg3"},
+        ]
+    )
+    t.join(timeout=5)
+
+    assert started_event.is_set(), "fake_s1 never saw 3 pending rows"
+    # Single-batch INSERT: exactly 3 rows when the marker fired.
+    assert row_count_when_started == [3], (
+        f"expected exactly 3 rows at the parallel-dispatch instant, got {row_count_when_started}"
+    )
+    # Input-order preservation despite scrambled mark-ready order.
+    assert out == ["resp1", "resp2", "resp3"], (
+        f"send_message_many must return responses in input order; got {out}"
+    )
+
+
+def test_send_message_many_propagates_errors(bridge_path):
+    """GAP-4: if any row in the batch errors, BridgeRemoteError names the
+    input index AND the failing recipient."""
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=101)
+    _tick_bridge_heartbeat(bridge_path, run_id=101, at_offset_seconds=0)
+
+    def fake_s1():
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            pending = _all_pending_rows(bridge_path, run_id=101)
+            if len(pending) >= 3:
+                # m2 (input index 1) errors.
+                _mark_row_error(bridge_path, pending[1], "boom")
+                return
+            time.sleep(0.01)
+        raise AssertionError("never saw 3 pending rows")
+
+    t = threading.Thread(target=fake_s1, daemon=True)
+    t.start()
+    with pytest.raises(BridgeRemoteError) as exc_info:
+        wrapper.send_message_many(
+            [
+                {"team_id": "t1", "to": "a", "message": "msg1"},
+                {"team_id": "t1", "to": "b", "message": "msg2"},
+                {"team_id": "t1", "to": "c", "message": "msg3"},
+            ]
+        )
+    t.join(timeout=5)
+    msg = str(exc_info.value)
+    # Names the input INDEX (1) and the failing RECIPIENT ('b').
+    assert "messages[1]" in msg, f"error must name input index 1; got {msg}"
+    assert "'b'" in msg, f"error must name failing recipient 'b'; got {msg}"
+    assert "boom" in msg, f"error must include the error_text; got {msg}"
+
+
+def test_send_message_many_rejects_missing_response_in_response(bridge_path):
+    """If a row comes back ready but its response_json lacks 'response',
+    surface BridgeRemoteError naming the offending input index."""
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=102)
+    _tick_bridge_heartbeat(bridge_path, run_id=102, at_offset_seconds=0)
+
+    def fake_s1():
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            pending = _all_pending_rows(bridge_path, run_id=102)
+            if len(pending) >= 2:
+                _mark_row_ready(bridge_path, pending[0], {"response": "ok"})
+                # row 2 ready but missing the 'response' key entirely.
+                _mark_row_ready(bridge_path, pending[1], {"wrong_key": "x"})
+                return
+            time.sleep(0.01)
+        raise AssertionError("never saw 2 pending rows")
+
+    t = threading.Thread(target=fake_s1, daemon=True)
+    t.start()
+    with pytest.raises(BridgeRemoteError) as exc_info:
+        wrapper.send_message_many(
+            [
+                {"team_id": "t1", "to": "a", "message": "m1"},
+                {"team_id": "t1", "to": "b", "message": "m2"},
+            ]
+        )
+    t.join(timeout=5)
+    msg = str(exc_info.value)
+    assert "messages[1]" in msg
+    assert "'b'" in msg
+
+
+def test_send_message_many_empty_returns_empty(bridge_path):
+    """Empty input → empty output, no rows enqueued. Defensive guard."""
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=103)
+    # No heartbeat needed — never polls.
+    out = wrapper.send_message_many([])
+    assert out == []
+    assert _count_rows(bridge_path, run_id=103) == 0
+
+
+def test_send_message_many_validates_input_shape(bridge_path):
+    """Shape errors raise BEFORE anything is enqueued (atomicity-of-validation)."""
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=104)
+    with pytest.raises(ValueError, match="missing required key"):
+        wrapper.send_message_many([{"team_id": "t", "to": "a"}])  # message missing
+    with pytest.raises(TypeError, match="must be str"):
+        wrapper.send_message_many([{"team_id": "t", "to": "a", "message": 123}])
+    with pytest.raises(TypeError, match="must be a list"):
+        wrapper.send_message_many("not a list")  # type: ignore[arg-type]
+    # No rows were enqueued by any failed call.
+    assert _count_rows(bridge_path, run_id=104) == 0
+
+
+# ── GAP-5: CLEANUP_TIMEOUT_S bump (20 → 120) ──────────────────────────────
+
+
+def test_team_delete_cleanup_deadline_is_120s():
+    """GAP-5 (docs/kaizen/2026-05-24-bridge-smoke-2.md): the team_delete
+    cleanup deadline is 120s, bumped from the original 20s. Pin both the
+    module-level constant and the class-level mirror so any future drift
+    fails loudly here rather than silently re-introducing run-22's false-
+    failed-marker bug."""
+    assert bridge_mod.CLEANUP_TIMEOUT_S == 120.0
+    assert QueueBridgeWrapper.CLEANUP_TIMEOUT_S == 120.0
+
+
+def test_team_delete_does_not_trip_timeout_at_60s_under_new_deadline(bridge_path, monkeypatch):
+    """GAP-5 regression: a team_delete row taking ~60s to ready must NOT
+    raise BridgeTimeoutError under the new 120s deadline. Under the old
+    20s deadline this would have raised (the precise run-22 symptom).
+
+    Mirrors the time-mocking pattern from
+    test_long_sendmessage_does_not_trip_stall_at_old_threshold: we
+    compress wall clock via a monkeypatched time.monotonic so the test
+    finishes fast, but the deadline check (which uses time.monotonic)
+    observes a 60s elapse.
+    """
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=200)
+    _tick_bridge_heartbeat(bridge_path, run_id=200, at_offset_seconds=0)
+
+    state = {"sim_elapsed": 0.0}
+    real_monotonic = time.monotonic
+
+    def fake_monotonic():
+        return real_monotonic() + state["sim_elapsed"]
+
+    monkeypatch.setattr(bridge_mod.time, "monotonic", fake_monotonic)
+
+    def fake_s1():
+        row_id = _wait_for_pending_row(bridge_path, run_id=200)
+        # Refresh heartbeat so the stall predicate doesn't trip — this
+        # test is specifically about the per-call deadline, not stall.
+        _tick_bridge_heartbeat(bridge_path, run_id=200, at_offset_seconds=0)
+        # Advance simulated monotonic to 60s — well past the old 20s
+        # deadline, well under the new 120s deadline.
+        state["sim_elapsed"] = 60.0
+        _mark_row_ready(bridge_path, row_id, {})
+
+    t = threading.Thread(target=fake_s1, daemon=True)
+    t.start()
+    # Must NOT raise BridgeTimeoutError.
+    wrapper.team_delete("team-xyz")
+    t.join(timeout=10)
+    # Sanity: actually elapsed past the old deadline.
+    assert state["sim_elapsed"] >= 60.0

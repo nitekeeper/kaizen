@@ -24,6 +24,7 @@ This lets a test or recovery flow inspect the clone before teardown.
 
 from __future__ import annotations
 
+import argparse
 import re
 import sys
 from datetime import UTC, datetime
@@ -66,6 +67,45 @@ def create_run(
     finally:
         conn.close()
     return get_run(db_path, new_id)
+
+
+def update_run_branch(
+    db_path: str,
+    run_id: int,
+    branch: str | None,
+) -> None:
+    """Update `runs.branch` for `run_id`.
+
+    Used by the team-mode bridge entry path:
+
+      * After `create_branch(...)` succeeds in `orchestrate_run`, this
+        is called with the real branch name to transition from the
+        `'<pending>'` placeholder seeded by `create-run-only`.
+      * In the run-loop's outer `except Exception` block, this is
+        called with `branch=None`. The schema column is `TEXT NOT NULL`
+        (migration 001 line 18), so passing `None` cannot land as SQL
+        NULL — instead the sentinel string `'<failed>'` is persisted
+        (MAJOR-NEW-BRANCH-NOT-NULL). `scripts.pr.render_pr_body`
+        refuses to render against either placeholder.
+
+    Raises ValueError if `run_id` does not exist.
+    """
+    # The schema declares `branch TEXT NOT NULL` (migrations/001 line 18),
+    # which is exactly the constraint the `'<failed>'` sentinel
+    # accommodates. Do NOT modify the migration — the sentinel IS the
+    # fix.
+    persisted = "<failed>" if branch is None else branch
+    conn = get_connection(db_path)
+    try:
+        cur = conn.execute(
+            "UPDATE runs SET branch = ? WHERE id = ?",
+            (persisted, run_id),
+        )
+        if cur.rowcount == 0:
+            raise ValueError(f"run_id={run_id} not found")
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def finalize_run(
@@ -140,6 +180,50 @@ def parse_owner_repo(git_url: str) -> tuple[str, str]:
     raise ValueError(f"Could not parse owner/repo from git URL: {git_url!r}")
 
 
+# B-INJ-1 (review round 2): shell-metacharacter denylist for git URLs.
+# Defence in depth — the SKILL prose now single-quotes every <placeholder>,
+# but if a user ever pastes a malicious URL into a context that strips
+# the quotes (e.g. an integration that builds the command via `subprocess`
+# with `shell=True`), `_cmd_create_run_only` will reject it here BEFORE
+# touching the projects table.
+#
+# Characters explicitly forbidden in git URLs we accept:
+#   ; | & $ ` ( ) < > newline carriage-return tab " ' \ space
+# Plus any control character (< 0x20) and any backslash-escaped form.
+# This is intentionally restrictive — legitimate https/ssh URLs to
+# GitHub/GitLab/Bitbucket cannot contain any of these.
+_URL_SHELL_METACHARS = frozenset(";|&$`()<>\n\r\t \"'\\")
+
+
+def validate_git_url(git_url: str) -> None:
+    """Reject git URLs that contain shell metacharacters or control chars.
+
+    Belt-and-braces against shell injection in the SKILL-prose launch
+    sequence (B-INJ-1). Single-quoted shell substitution already
+    neutralises every metacharacter EXCEPT a literal single quote (and
+    SQL/SKILL prose accepting agent-authored URLs is harder to audit),
+    so this gate refuses ALL shell metacharacters up front.
+
+    Raises ValueError. Caller is responsible for converting to whatever
+    exit/error contract their entry point uses.
+    """
+    if not isinstance(git_url, str) or not git_url:
+        raise ValueError(f"git_url must be a non-empty string; got {git_url!r}")
+    # Reject any control character (\x00-\x1F) and DEL.
+    for ch in git_url:
+        if ord(ch) < 0x20 or ch == "\x7f":
+            raise ValueError(f"git_url contains control character {ch!r}; rejected")
+        if ch in _URL_SHELL_METACHARS:
+            raise ValueError(
+                f"git_url contains shell metacharacter {ch!r}; rejected "
+                "(allowed forms: https://host/owner/repo[.git] or "
+                "git@host:owner/repo[.git])"
+            )
+    # Final sanity: must parse into owner/repo via the same patterns the
+    # rest of the codebase uses. This catches well-formed-but-bogus URLs.
+    parse_owner_repo(git_url)
+
+
 def experiment_dir_for(kaizen_root: Path, git_url: str) -> Path:
     owner, repo = parse_owner_repo(git_url)
     return kaizen_root / "experiment" / f"{owner}-{repo}"
@@ -172,6 +256,7 @@ def orchestrate_run(
     mode: str = "subagent",
     *,
     tools_provider=None,
+    run_id: int | None = None,
 ) -> dict:
     """Full multi-cycle orchestration. See module docstring for the flow.
 
@@ -257,39 +342,76 @@ def orchestrate_run(
             "or use mode='subagent' instead."
         )
 
+    # M1 (review round 1): Bridge entry path's `run_id` existence guard
+    # MUST fire BEFORE any clone/seed/branch side effect. A bad run_id
+    # used to escape past clone_repo + seed_all + create_branch, leaving
+    # a populated `experiment/` directory on disk.
+    #
+    # m-DEAD (review round 2): we deliberately discard the fetched row
+    # here. The row is re-fetched inside the outer-try block AFTER
+    # `update_run_branch(...)` has transitioned `branch` from
+    # `'<pending>'` to the real name — at THAT point downstream code
+    # needs the updated row, not the stale pre-update snapshot. Holding
+    # the prefetched row and using it later would let agents observe
+    # the stale `branch='<pending>'` value. Existence-check only.
+    if run_id is not None and get_run(db_path, run_id) is None:
+        raise ValueError(f"run_id={run_id} not found in {db_path}")
+
     # 2. Clone target
     experiment_dir = experiment_dir_for(kaizen_root(), git_url)
     # H2: drop stale clone from a prior crashed run before re-cloning.
     cleanup_experiment(experiment_dir)
-    clone_repo(git_url, experiment_dir, project["base_branch"])
-
-    # 3. Seed atelier
-    # M1: tear down half-initialized clone before re-raising.
-    try:
-        seed_all(experiment_dir)
-    except Exception:
-        cleanup_experiment(experiment_dir)
-        raise
-
-    # 4. Branch
-    branch = create_branch(experiment_dir, subject)
-
-    # 5. Run row
-    run_row = create_run(
-        db_path=db_path,
-        project_id=project["id"],
-        branch=branch,
-        cycles_requested=cycles_requested,
-        subject=subject,
-    )
 
     # 6. Cycle loop — skip-and-continue on abandonment
     cycles_succeeded = 0
     cycles_abandoned = 0
     abandonment_rows: list[dict] = []
+    run_row: dict | None = None
+    branch: str | None = None
 
-    # H3: finalize the run as failed so the row never sticks at status='running'.
+    # M2 (review round 1): the outer try MUST cover clone/seed/branch,
+    # not just the cycle loop. Otherwise a failure in any of those
+    # leaves `runs.branch='<pending>'` and `runs.status='running'`
+    # permanently — the exact hazard the `<failed>` sentinel was meant
+    # to prevent.
     try:
+        clone_repo(git_url, experiment_dir, project["base_branch"])
+
+        # 3. Seed atelier
+        # M1 (original): tear down half-initialized clone before re-raising.
+        try:
+            seed_all(experiment_dir)
+        except Exception:
+            cleanup_experiment(experiment_dir)
+            raise
+
+        # 4. Branch
+        branch = create_branch(experiment_dir, subject)
+
+        # 5. Run row.
+        #
+        # Bridge entry path: when `run_id` is supplied, the row was already
+        # created by `scripts/run.py create-run-only` with the placeholder
+        # `branch='<pending>'`. Transition the branch column to the real
+        # name we just created. The placeholder is observable for at most
+        # the time between `create-run-only` returning and this line;
+        # `scripts/pr.py::render_pr_body` refuses to render against
+        # `'<pending>'`, `'<failed>'`, `None`, or `''`.
+        if run_id is None:
+            run_row = create_run(
+                db_path=db_path,
+                project_id=project["id"],
+                branch=branch,
+                cycles_requested=cycles_requested,
+                subject=subject,
+            )
+        else:
+            # Persist the real branch immediately; refresh the local row
+            # so downstream code sees the updated value.
+            update_run_branch(db_path, run_id, branch)
+            run_row = get_run(db_path, run_id)
+
+        # H3: finalize the run as failed so the row never sticks at status='running'.
         for cycle_n in range(1, cycles_requested + 1):
             cycle_started = _now()
             # Team mode threads a per-cycle TeamTools wrapper into the
@@ -372,20 +494,64 @@ def orchestrate_run(
                     f"cycle_executor for cycle {cycle_n} returned unrecognised status: {outcome!r}"
                 )
     except Exception:
-        finalize_run(
-            db_path=db_path,
-            run_id=run_row["id"],
-            cycles_succeeded=cycles_succeeded,
-            cycles_abandoned=cycles_abandoned,
-            pr_url=None,
-            status="failed",
-        )
+        # Bridge entry path (M2/M3 fix): blank out the branch column so
+        # a later manual `pr.py` invocation cannot accidentally try to
+        # render a PR against this aborted run.
+        # `update_run_branch(branch=None)` writes the `'<failed>'`
+        # sentinel (the schema NOT NULL constraint forbids a literal
+        # NULL). Best-effort — never mask the original cycle exception.
+        #
+        # This block now covers ALL pre-push failures (clone, seed,
+        # branch, cycle loop) — M2 fix.
+        import contextlib
+
+        if run_id is not None:
+            with contextlib.suppress(Exception):
+                update_run_branch(db_path, run_id, None)
+        # `run_row` may be None if the failure happened in clone/seed/
+        # branch — those run BEFORE the run row is established. In
+        # that case finalize_run has nothing to update (no row to
+        # finalize for the legacy entry path; the bridge entry path
+        # already has its row, which run_id covers).
+        if run_row is not None:
+            with contextlib.suppress(Exception):
+                finalize_run(
+                    db_path=db_path,
+                    run_id=run_row["id"],
+                    cycles_succeeded=cycles_succeeded,
+                    cycles_abandoned=cycles_abandoned,
+                    pr_url=None,
+                    status="failed",
+                )
+        elif run_id is not None:
+            # Bridge entry path: the run row exists (created by
+            # create-run-only) even when our local run_row is None
+            # because the failure happened before we re-fetched it.
+            with contextlib.suppress(Exception):
+                finalize_run(
+                    db_path=db_path,
+                    run_id=run_id,
+                    cycles_succeeded=cycles_succeeded,
+                    cycles_abandoned=cycles_abandoned,
+                    pr_url=None,
+                    status="failed",
+                )
         raise
 
     # 7. Push the branch. If push fails, leave clone in place.
     try:
         push_branch(experiment_dir, branch)
     except Exception as push_exc:
+        # M3 (review round 1): bridge entry path must blank the branch
+        # column too — a later manual `pr.py` invocation against this
+        # run would otherwise try to render against a branch name that
+        # may not exist on the remote. The `<failed>` sentinel makes
+        # render_pr_body refuse before it calls `gh`.
+        if run_id is not None:
+            import contextlib
+
+            with contextlib.suppress(Exception):
+                update_run_branch(db_path, run_id, None)
         finalized = finalize_run(
             db_path=db_path,
             run_id=run_row["id"],
@@ -442,50 +608,95 @@ def orchestrate_run(
 # ── CLI (dev-test only; real entry is `kaizen:improve` in Wave 7) ──────────
 
 
-def main(argv: list[str]) -> int:
-    if not argv or argv[0] != "orchestrate":
+def _cmd_create_run_only(argv: list[str], db_path: str = ".ai/memex.db") -> int:
+    """`create-run-only <git_url> <cycles> <subject>` — bridge entry helper.
+
+    The orchestrating Claude session calls this BEFORE spawning the
+    detached Python (`scripts/run_bridged.py`). It looks up the project
+    by URL — **fails loudly** with a registration hint when no project
+    matches (Decision D3: fail loudly, do NOT auto-register) — then
+    creates a `runs` row with the placeholder `branch='<pending>'`.
+
+    On success: prints ONLY the new run_id on stdout (no other text),
+    exits 0. `scripts/run_bridged.py` reads this single line into a
+    shell variable.
+    """
+    from scripts.project import get_project_by_url
+
+    ap = argparse.ArgumentParser(prog="run.py create-run-only", add_help=False)
+    ap.add_argument("git_url")
+    ap.add_argument("cycles", type=int)
+    ap.add_argument("subject", nargs="?", default=None)
+    args = ap.parse_args(argv)
+    git_url = args.git_url
+    cycles = args.cycles
+    subject = args.subject
+
+    # B-INJ-1 (review round 2): refuse URLs with shell metacharacters
+    # BEFORE any DB lookup. Defence in depth — the SKILL prose
+    # single-quotes substitutions, but a misconfigured caller (e.g.
+    # subprocess with shell=True) could still feed us a malicious URL.
+    try:
+        validate_git_url(git_url)
+    except ValueError as e:
+        print(f"create-run-only: invalid git_url: {e}", file=sys.stderr)
+        return 1
+
+    project = get_project_by_url(db_path, git_url)
+    if project is None:
+        # MINOR-CREATE-RUN-ONLY-AUTOREGISTER → Decision D3: fail loudly.
+        # Auto-registration would mask URL typos (a misspelled URL would
+        # silently create a phantom projects row, clone the wrong
+        # target, and abandon-loop forever).
         print(
-            'Usage: run.py orchestrate <git-url> [--cycles N] [--subject "..."] [--mode subagent|team]',
+            f"No project registered for {git_url!r}.\n"
+            f"  Register it first: python3 scripts/project.py register {git_url}",
             file=sys.stderr,
         )
         return 1
 
-    rest = argv[1:]
-    if not rest:
-        print("Missing <git-url>", file=sys.stderr)
+    run_row = create_run(
+        db_path=db_path,
+        project_id=project["id"],
+        branch="<pending>",
+        cycles_requested=cycles,
+        subject=subject,
+    )
+    # stdout MUST contain only the run_id on a single line — the
+    # detached spawner uses `RUN_ID=$(... create-run-only ...)`.
+    print(run_row["id"])
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if argv and argv[0] == "create-run-only":
+        return _cmd_create_run_only(argv[1:])
+
+    if not argv or argv[0] != "orchestrate":
+        print(
+            "Usage:\n"
+            '  run.py orchestrate <git-url> [--cycles N] [--subject "..."] [--mode subagent|team]\n'
+            "  run.py create-run-only <git-url> <cycles> [<subject>]",
+            file=sys.stderr,
+        )
         return 1
 
-    git_url = rest[0]
-    cycles = 1
-    subject = None
-    mode = "subagent"
-    i = 1
-    while i < len(rest):
-        if rest[i] == "--cycles" and i + 1 < len(rest):
-            cycles = int(rest[i + 1])
-            i += 2
-        elif rest[i] == "--subject" and i + 1 < len(rest):
-            subject = rest[i + 1]
-            i += 2
-        elif rest[i] == "--mode" and i + 1 < len(rest):
-            mode = rest[i + 1]
-            if mode not in ("subagent", "team"):
-                print(f"--mode must be 'subagent' or 'team', got: {mode!r}", file=sys.stderr)
-                return 1
-            i += 2
-        else:
-            print(f"Unknown arg: {rest[i]!r}", file=sys.stderr)
-            return 1
+    parser = argparse.ArgumentParser(prog="run.py orchestrate")
+    parser.add_argument("git_url")
+    parser.add_argument("--cycles", type=int, default=1)
+    parser.add_argument("--subject", default=None)
+    parser.add_argument("--mode", choices=("subagent", "team"), default="subagent")
+    ns = parser.parse_args(argv[1:])
 
     db_path = ".ai/memex.db"
     import json
 
     result = orchestrate_run(
         db_path=db_path,
-        git_url=git_url,
-        cycles_requested=cycles,
-        subject=subject,
-        mode=mode,
+        git_url=ns.git_url,
+        cycles_requested=ns.cycles,
+        subject=ns.subject,
+        mode=ns.mode,
     )
     # Path objects aren't JSON serialisable
     result = {k: (str(v) if isinstance(v, Path) else v) for k, v in result.items()}

@@ -80,22 +80,37 @@ Step 2.  S1 verifies the env-inheritance preconditions are
          satisfied — see "Env inheritance contract" below. If any
          required var is absent, abort BEFORE step 3.
 
-Step 3.  S1 creates the run row via:
+Step 3.  S1 creates the run row via (rev-2 fix m-CLI: create-run-only
+         takes POSITIONAL args, not flags — aligned with the code at
+         scripts/run.py::_cmd_create_run_only; every placeholder MUST
+         be single-quoted per the SKILL HARD RULE on shell quoting):
             Bash:  cd "$KAIZEN_ROOT" && \\
                    CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \\
                    python3 -m scripts.run create-run-only \\
-                       --url <url> --cycles N --subject "<...>"
+                       '<url>' '<N>' '<subject>'
          create-run-only PRINTS the run_id as a single line on stdout.
-         S1 captures it into a local variable RUN_ID.
+         S1 captures it into a local variable RUN_ID. The command also
+         validates the URL via scripts.run.validate_git_url, refusing
+         any shell metacharacter (defence in depth — B-INJ-1).
 
-Step 4.  S1 spawns Python as a DETACHED subprocess via one Bash call:
+Step 4.  S1 spawns Python as a DETACHED subprocess via one Bash call.
+         Log path is /tmp/kaizen-bridged-${RUN_ID}.log (rev-2 fix
+         m-LOGPATH). The invocation is wrapped in a subshell
+         `( umask 077 && ... )` so the `>` redirect creates the log
+         mode 0600 — owner-only (rev-3 fix mfix-UMASK). The redirect
+         runs in the PARENT shell BEFORE Python starts, so Python's
+         own os.umask(0o077) cannot retroactively protect this initial
+         file; only the subshell umask can. Python's umask remains as
+         belt-and-braces for subsequent files (e.g.
+         .ai/leaked_teams.json):
             Bash:  cd "$KAIZEN_ROOT" && \\
-                   CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \\
-                   nohup python3 -m scripts.run_bridged \\
-                       --db .ai/memex.db --bridge-db .ai/bridge.db \\
-                       --url <url> --cycles N --subject "<...>" \\
-                       --run-id <RUN_ID> \\
-                       >/tmp/kaizen-run-<RUN_ID>.log 2>&1 &
+                   ( umask 077 && \\
+                     CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 \\
+                     nohup python3 -m scripts.run_bridged \\
+                         --db .ai/memex.db --bridge-db .ai/bridge.db \\
+                         --url '<url>' --cycles '<N>' --subject '<subject>' \\
+                         --run-id "$RUN_ID" \\
+                         >"/tmp/kaizen-bridged-${RUN_ID}.log" 2>&1 & )
                    echo $!
          The `&` causes Bash to return immediately with the child PID.
          The `cd "$KAIZEN_ROOT"` is REQUIRED (MAJOR-WD fix): Python and

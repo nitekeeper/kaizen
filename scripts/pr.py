@@ -125,7 +125,57 @@ def render_pr_body(
     cycles: list[dict],
     abandonments: list[dict],
 ) -> tuple[str, str]:
-    """Render (title, body) for the bundled PR per design §4.6."""
+    """Render (title, body) for the bundled PR per design §4.6.
+
+    Refusal guard (MAJOR-NEW-PR-SIGNATURE + m2 review round 1): refuses
+    any branch value that is unsafe to hand to `gh pr create --head`.
+    The signature `(run, project, cycles, abandonments) -> tuple[str, str]`
+    is unchanged.
+
+    Refusal categories:
+
+      * Sentinel placeholders set by the bridge entry path:
+        `'<pending>'` (from `create-run-only`) and `'<failed>'` (from
+        `update_run_branch(None)`).
+      * Empty / None / whitespace-only branch names.
+      * Branch names containing whitespace (space / tab / newline) —
+        `gh` would split them as separate flags.
+      * Branch names containing `..` — git refspec / path-traversal.
+      * Branch names starting with `-` — would be parsed as a flag by
+        `gh` / `git push`.
+
+    m-PR-DOC (review round 2): this refusal set is the LAST line of
+    defence on the branch column — NOT a shell-escape gate. The actual
+    `gh pr create` invocation in `scripts.pr.open_pr` uses
+    `subprocess.run([list], check=False)` with NO `shell=True`, so
+    shell metacharacters in the branch name (e.g. `$(rm -rf .)`,
+    backticks) physically CANNOT undergo shell expansion — they are
+    passed to gh as opaque argv elements. If a future refactor
+    introduces `shell=True` (or builds a command string for any other
+    shell-evaluating callable), this refusal set MUST be widened to
+    cover shell metacharacters before that refactor lands.
+    """
+    branch = run.get("branch")
+    refusal_reason: str | None = None
+    if branch is None or branch == "":
+        refusal_reason = "empty or None"
+    elif not isinstance(branch, str):
+        refusal_reason = "not a string"
+    elif branch in ("<pending>", "<failed>"):
+        refusal_reason = "bridge sentinel placeholder"
+    elif not branch.strip():
+        refusal_reason = "whitespace-only"
+    elif any(c in branch for c in (" ", "\n", "\t")):
+        refusal_reason = "contains whitespace"
+    elif ".." in branch:
+        refusal_reason = "contains '..' (refspec / path traversal)"
+    elif branch.startswith("-"):
+        refusal_reason = "starts with '-' (flag injection)"
+    if refusal_reason is not None:
+        raise ValueError(
+            f"render_pr_body refused: run {run.get('id')} has unrecoverable "
+            f"branch={branch!r} ({refusal_reason})"
+        )
     n = run["cycles_requested"]
     s = sum(1 for c in cycles if c["status"] == "success")
     a = sum(1 for c in cycles if c["status"] == "abandoned")

@@ -279,9 +279,13 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
             self._tick_python_heartbeat()
             con = _connect(self._db_path)
             try:
+                # nosec B608 — `placeholders` is built only from literal "?" chars
+                # (line 276); row_id values are passed via parameter binding as the
+                # `tuple(row_ids)` second arg. Same defensive pattern as scripts/pr.py:80,
+                # scripts/bridge_write.py:100, scripts/project.py:155.
                 cur = con.execute(
                     f"SELECT id, status, response_json, error_text "
-                    f"FROM bridge_requests WHERE id IN ({placeholders}) ORDER BY id",
+                    f"FROM bridge_requests WHERE id IN ({placeholders}) ORDER BY id",  # nosec B608
                     tuple(row_ids),
                 )
                 rows = cur.fetchall()

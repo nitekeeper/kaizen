@@ -204,12 +204,90 @@ def test_python_heartbeat_written_every_poll_tick(bridge_path):
 
 def test_bridge_stall_raises_when_s1_heartbeat_old(bridge_path):
     wrapper = QueueBridgeWrapper(str(bridge_path), run_id=5)
-    # Pretend S1's last poll was 120s ago — past HEARTBEAT_STALL_S=60s.
-    _tick_bridge_heartbeat(bridge_path, run_id=5, at_offset_seconds=120)
+    # Pretend S1's last poll was 600s ago — past HEARTBEAT_STALL_S=300s
+    # (bumped in run-21 from the original 60s; see scripts/cc_tool_bridge.py
+    # module-level comment).
+    _tick_bridge_heartbeat(bridge_path, run_id=5, at_offset_seconds=600)
 
     with pytest.raises(BridgeStallError) as exc_info:
         wrapper.team_create(name="x", members=[])
     assert "stall" in str(exc_info.value).lower()
+
+
+def test_heartbeat_stall_constants_match_run21_values():
+    """Run-21 GAP-1 fix pin: HEARTBEAT_STALL_S=300 and PER_CALL_TIMEOUT_S=600.
+
+    Locks both constants so a future drift back to the Rev-4 values
+    (60 / 180) — which empirically spuriously-abandoned run 20 — fails
+    loudly. See docs/kaizen/2026-05-24-bridge-smoke.md GAP-1.
+    """
+    assert bridge_mod.HEARTBEAT_STALL_S == 300.0
+    assert bridge_mod.PER_CALL_TIMEOUT_S == 600.0
+    # The class-level mirrors must also match (constructor binds these).
+    assert QueueBridgeWrapper.HEARTBEAT_STALL_S == 300.0
+    assert QueueBridgeWrapper.PER_CALL_TIMEOUT_S == 600.0
+
+
+def test_long_sendmessage_does_not_trip_stall_at_old_threshold(bridge_path, monkeypatch):
+    """Run-21 GAP-1 regression guard — the case run 20 hit empirically.
+
+    A SendMessage round-trip taking ~90 seconds with NO interleaved S1
+    heartbeat pokes (i.e. S1 is idle waiting for a `<teammate-message>`
+    notification in CC team mode) must NOT trip `BridgeStallError` under
+    the new HEARTBEAT_STALL_S=300 threshold. Run 20 saw 60.2s elapse →
+    BridgeStallError under the old 60s threshold; this test reproduces
+    that scenario and asserts the new threshold tolerates it.
+
+    Compared to test_long_sendmessage_does_not_stall_when_s1_heartbeats_per_row:
+    that test simulated the design's step-2a per-row heartbeat poke firing
+    every few seconds. THIS test simulates the actual CC team-mode failure
+    mode — S1 is idle for the entire 90s, NO heartbeat fires, and the only
+    thing that saves the cycle is the bumped threshold itself.
+    """
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=20)
+    # Initial heartbeat: S1 polled once at t=0.
+    _tick_bridge_heartbeat(bridge_path, run_id=20, at_offset_seconds=0)
+
+    # Compress wall clock for the deadline check; keep the real DB clock
+    # honest by simulating S1's heartbeat as "90s old" right before the row
+    # is marked ready. The stall predicate compares julianday('now')
+    # against last_polled_at — both real DB calls — so we set the DB
+    # heartbeat to a fixed "90s ago" value once, mid-call.
+    state = {"sim_elapsed": 0.0}
+    real_monotonic = time.monotonic
+
+    def fake_monotonic():
+        return real_monotonic() + state["sim_elapsed"]
+
+    # TODO(cosmetic): unused monkeypatch — stall predicate reads SQLite
+    # julianday('now') against bridge_heartbeat.last_polled_at, NOT
+    # Python's time.monotonic. The fake_monotonic above only fast-forwards
+    # the per-call deadline counter, which is fine but not load-bearing
+    # for the stall assertion this test makes. Reviewer noted but DEFER:
+    # leaving the monkeypatch documents the intent (compress wall clock
+    # so PER_CALL_TIMEOUT_S=600 isn't actually waited out) even though
+    # the 90s simulated gap finishes well under the real deadline.
+    monkeypatch.setattr(bridge_mod.time, "monotonic", fake_monotonic)
+
+    def fake_s1():
+        row_id = _wait_for_pending_row(bridge_path, run_id=20)
+        # S1 does NOT heartbeat during the wait — this is the CC team-mode
+        # async-SendMessage failure mode. Re-stamp the heartbeat row once
+        # to "90s ago" so Python's julianday() check observes a 90s gap
+        # (the empirical run-20 number, well past the old 60s threshold
+        # but well under the new 300s threshold).
+        _tick_bridge_heartbeat(bridge_path, run_id=20, at_offset_seconds=90)
+        # Advance simulated monotonic so the per-call deadline budget is
+        # accounted for; 90s is well under the new PER_CALL_TIMEOUT_S=600.
+        state["sim_elapsed"] = 90.0
+        _mark_row_ready(bridge_path, row_id, {"response": "finally back"})
+
+    t = threading.Thread(target=fake_s1, daemon=True)
+    t.start()
+    # Must NOT raise BridgeStallError or BridgeTimeoutError.
+    out = wrapper.send_message(team_id="t", to="agent", message="async-reply-test")
+    t.join(timeout=10)
+    assert out == "finally back"
 
 
 def test_bridge_remote_error_on_status_error(bridge_path):

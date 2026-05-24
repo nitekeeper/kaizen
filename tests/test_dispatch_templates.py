@@ -16,6 +16,7 @@ from __future__ import annotations
 import pytest
 
 from scripts.dispatch_templates import (
+    TEAMMATE_REPLY_RULE,
     phase_1_agenda,
     phase_2_preanalysis,
     phase_3_close,
@@ -302,3 +303,139 @@ def test_require_rejects_empty_set():
     msg = str(exc.value)
     assert "x" in msg
     assert "empty" in msg
+
+
+# ── Run-21 GAP-2: every teammate-dispatch template appends TEAMMATE_REPLY_RULE ─
+
+
+# Minimum-valid-kwargs builders for each teammate-dispatch template.
+# phase_5b_ci_failure is intentionally excluded — it formats an
+# abandonment-outcome detail string, NOT a teammate-bound SendMessage body.
+_TEAMMATE_DISPATCH_TEMPLATES = [
+    ("phase_1_agenda", lambda: phase_1_agenda(subject="x", cycle_n=1)),
+    (
+        "phase_2_preanalysis",
+        lambda: phase_2_preanalysis(agenda_items=["a"], participant="p"),
+    ),
+    ("phase_3_open", lambda: phase_3_open(proposals=[{"agent": "a", "raw": "x"}])),
+    ("phase_3_debate", lambda: phase_3_debate()),
+    (
+        "phase_3_close",
+        lambda: phase_3_close(
+            proposals=[{"agent": "a", "raw": "x"}],
+            agreements=[{"agent": "a", "raw": "y"}],
+        ),
+    ),
+    (
+        "phase_4_implementer",
+        lambda: phase_4_implementer(
+            item={"id": "A", "touches": ["f.py"], "reads": []},
+            wave_n=1,
+        ),
+    ),
+    (
+        "phase_5b_prime_reviewer",
+        lambda: phase_5b_prime_reviewer(
+            iter_n=1,
+            action_items=[{"id": "A"}],
+            prior_findings=None,
+        ),
+    ),
+    (
+        "phase_5b_prime_reviewer_iter2",
+        lambda: phase_5b_prime_reviewer(
+            iter_n=2,
+            action_items=[{"id": "A"}],
+            prior_findings=[
+                Finding(
+                    finding_id="R1-1",
+                    reviewer="r",
+                    severity="blocker",
+                    finding="x",
+                    file_line="a.py:1",
+                )
+            ],
+        ),
+    ),
+    (
+        "phase_5b_prime_fix",
+        lambda: phase_5b_prime_fix(
+            finding=Finding(
+                finding_id="R1-1",
+                reviewer="r",
+                severity="blocker",
+                finding="x",
+                file_line="a.py:1",
+            )
+        ),
+    ),
+    (
+        "phase_5b_prime_pm_acceptance",
+        lambda: phase_5b_prime_pm_acceptance(
+            findings=[
+                Finding(
+                    finding_id="R1-1",
+                    reviewer="r",
+                    severity="blocker",
+                    finding="x",
+                    file_line="a.py:1",
+                )
+            ],
+            iter_n=1,
+        ),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "name,builder", _TEAMMATE_DISPATCH_TEMPLATES, ids=[n for n, _ in _TEAMMATE_DISPATCH_TEMPLATES]
+)
+def test_every_template_appends_teammate_reply_rule(name, builder):
+    """Run-21 GAP-2 (+ fix-loop iteration 1): every teammate-bound dispatch
+    template MUST append TEAMMATE_REPLY_RULE to its message body.
+
+    The rule is appended (not prepended) so the agenda content reads
+    naturally — the reminder lives at the end. We assert:
+      1. `TEAMMATE_REPLY_RULE.strip()` appears in the rendered body
+         (the rule is present at all)
+      2. The body ENDS with TEAMMATE_REPLY_RULE (appended, not prepended
+         or interleaved)
+      3. The literal `to="team-lead"` recipient example appears in the
+         appended rule (MAJOR-1: prevents teammates from guessing a wrong
+         relational recipient like "team-lead@<team-name>" or "pm-1")
+      4. The ABANDON clause appears in the appended rule (MAJOR-2:
+         teammates that abandon must STILL SendMessage with an
+         `ABANDON:`-prefixed body — silent-abandonment was the GAP-2
+         failure mode the smoke surfaced)
+    """
+    msg = builder()
+    assert TEAMMATE_REPLY_RULE.strip() in msg, (
+        f"{name}: TEAMMATE_REPLY_RULE.strip() not found in rendered body"
+    )
+    assert msg.endswith(TEAMMATE_REPLY_RULE), (
+        f"{name}: rendered body must END with TEAMMATE_REPLY_RULE "
+        "(append, not prepend) — last 200 chars: " + repr(msg[-200:])
+    )
+    # MAJOR-1: literal copy-pasteable `to="team-lead"` recipient example.
+    assert 'to="team-lead"' in msg, (
+        f'{name}: appended rule must include literal `to="team-lead"` '
+        "recipient example (MAJOR-1 of fix-loop iteration 1)"
+    )
+    # MAJOR-2: ABANDON-also-via-SendMessage clause.
+    assert "ABANDON" in msg and "SendMessage" in msg, (
+        f"{name}: appended rule must mention ABANDON + SendMessage so "
+        "teammates know abandons travel through SendMessage with an "
+        "ABANDON:-prefixed body, not silent exit (MAJOR-2)"
+    )
+
+
+def test_phase_5b_ci_failure_does_NOT_append_teammate_reply_rule():
+    """Run-21 GAP-2 boundary: `phase_5b_ci_failure` is the one template
+    in this module that is NOT a teammate-bound SendMessage body — it
+    formats the abandonment-outcome `detail` string when CI fails. It
+    must NOT carry the reply rule (the abandonment row would otherwise
+    contain misleading "send your reply" prose in its detail field).
+    """
+    msg = phase_5b_ci_failure(wave_n=1, failed_checks=["tests"])
+    assert TEAMMATE_REPLY_RULE.strip() not in msg
+    assert msg == "CI failed after wave 1: ['tests']"

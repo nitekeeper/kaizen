@@ -1,8 +1,12 @@
+# Orphan-team cleanup utility — design Layer 3 of "Leaked-team recovery"
+# (docs/design/python-cc-tool-bridge-design.md). Invoked from
+# skills/improve/SKILL.md Step 3b.3 (team-mode runs only).
+
 """JSON1 orphan-team finder + `aborted` enqueuer for the next-run sweep.
 
 Layer 3 of the leaked-team recovery design. Invoked from
-`skills/improve/SKILL.md` Step 1 to catch any `TeamCreate` that has no
-matching `TeamDelete` from a previous run (e.g. because that run
+`skills/improve/SKILL.md` Step 3b.3 to catch any `TeamCreate` that has
+no matching `TeamDelete` from a previous run (e.g. because that run
 crashed before `team_cycle_executor`'s finally could enqueue the
 delete).
 
@@ -13,10 +17,13 @@ RESPONSE, not the request (`args_json` of `team_create` carries only
 `name` + `members`). MINOR-JSON1-PATH inline comment below documents
 the `status='ready'` contract assumption.
 
-CLI: `python3 -m scripts.sweep_leaked_teams [--bridge-db PATH] [--enqueue-into-run RUN_ID]`.
-Without `--enqueue-into-run`, prints the orphan list to stdout (one
-`run_id\tteam_id` per line). With it, INSERTs a single `aborted` row
-into that run's queue with `team_ids_at_risk` populated.
+CLI: `python3 -m scripts.sweep_leaked_teams [--bridge-db PATH] [--run-id RUN_ID | --enqueue-into-run RUN_ID]`.
+Without a run-id, prints the orphan list to stdout (one
+`run_id\tteam_id` per line). With one, INSERTs a single `aborted` row
+into that run's queue with `team_ids_at_risk` populated. `--run-id` is
+the canonical flag (used by SKILL.md Step 3b.3); `--enqueue-into-run`
+is preserved as a backward-compatible alias for any pre-existing
+callers.
 """
 
 from __future__ import annotations
@@ -117,7 +124,13 @@ def enqueue_aborted_row(
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="sweep_leaked_teams")
     ap.add_argument("--bridge-db", default=".ai/bridge.db", dest="bridge_db")
+    # Canonical flag (per SKILL.md Step 3b.3) is `--run-id`. The legacy
+    # `--enqueue-into-run` name is preserved as an alias for backward
+    # compatibility with any pre-existing callers. Both map to the same
+    # destination so existing code that reads `args.enqueue_into_run`
+    # continues to work unchanged.
     ap.add_argument(
+        "--run-id",
         "--enqueue-into-run",
         type=int,
         default=None,

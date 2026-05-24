@@ -67,6 +67,16 @@ class MockTeamTools:
                 return resp
         return self.default
 
+    def send_message_many(self, messages):
+        """Batch wrapper for tests — record each as a send_message call so
+        existing assertions ("recipient is in this list", "wave order is
+        [A,B,C]") keep working unchanged. Each individual call also goes
+        through the call counter so `raise_on_send_call_n` still works."""
+        out = []
+        for m in messages:
+            out.append(self.send_message(m["team_id"], m["to"], m["message"]))
+        return out
+
     def team_delete(self, team_id):
         self.calls.append(("team_delete", (team_id,), {}))
 

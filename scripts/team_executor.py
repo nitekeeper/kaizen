@@ -158,6 +158,16 @@ class TeamTools(Protocol):
         """Send a message; returns the recipient's response synchronously."""
         ...
 
+    def send_message_many(self, messages: list[dict]) -> list[str]:
+        """Batch dispatch — enqueue N messages in parallel; return their
+        responses in input order. Each dict has ``team_id``, ``to``,
+        ``message``. Used by Phase 2 fan-out, Phase 3 Star-open broadcast,
+        and Phase 5b' parallel reviewer dispatch — see
+        docs/kaizen/2026-05-24-bridge-smoke-2.md GAP-4 for the motivation
+        (sequential send_message is the wall-clock bottleneck of a cycle).
+        """
+        ...
+
     def team_delete(self, team_id: str) -> None:
         """Tear down the team."""
         ...
@@ -458,7 +468,7 @@ def team_cycle_executor(
     # so passing e.g. object() would blow up mid-cycle (AFTER team_create)
     # with an opaque AttributeError. Failing here guarantees we never
     # leave a half-formed team behind because the injection was malformed.
-    for method_name in ("team_create", "send_message", "team_delete"):
+    for method_name in ("team_create", "send_message", "send_message_many", "team_delete"):
         if not callable(getattr(tools, method_name, None)):
             raise TeamToolsUnavailableError(
                 f"tools is missing required method: {method_name!r}. "
@@ -507,62 +517,84 @@ def team_cycle_executor(
                 )
 
         # ── Phase 2 — Parallel pre-analysis ───────────────────────────────
-        # NOTE: tools.send_message is synchronous from the executor's view
-        # per the wrapper contract. Serial dispatch here is a deliberate
-        # simplification; the wrapper could parallelise internally.
+        # GAP-4 (docs/kaizen/2026-05-24-bridge-smoke-2.md): batch-dispatch
+        # via send_message_many so the N pre-analysis briefs go out in one
+        # transaction and the S1 wrapper services them in parallel rather
+        # than serially round-tripping each. Order is preserved (input
+        # roster order == output response order).
         proposals: list[dict] = []
         if not outcome_acc.abandoned:
-            for participant in roster:
-                if participant == pm:
-                    continue
-                resp = tools.send_message(
-                    team_id,
-                    to=participant,
-                    message=phase_2_preanalysis(agenda_items=agenda_items, participant=participant),
-                )
-                if _is_abandon(resp):
-                    _abandon(
-                        outcome_acc,
-                        phase_reached="meeting",
-                        reason="other",
-                        detail=(
-                            f"{participant} abandoned at pre-analysis: {_abandon_reason(resp)}"
+            phase_2_recipients = [p for p in roster if p != pm]
+            if phase_2_recipients:
+                phase_2_messages = [
+                    {
+                        "team_id": team_id,
+                        "to": participant,
+                        "message": phase_2_preanalysis(
+                            agenda_items=agenda_items, participant=participant
                         ),
-                    )
-                    break
-                proposals.append({"agent": participant, "raw": resp or ""})
+                    }
+                    for participant in phase_2_recipients
+                ]
+                phase_2_responses = tools.send_message_many(phase_2_messages)
+                for participant, resp in zip(phase_2_recipients, phase_2_responses, strict=True):
+                    if _is_abandon(resp):
+                        _abandon(
+                            outcome_acc,
+                            phase_reached="meeting",
+                            reason="other",
+                            detail=(
+                                f"{participant} abandoned at pre-analysis: {_abandon_reason(resp)}"
+                            ),
+                        )
+                        break
+                    proposals.append({"agent": participant, "raw": resp or ""})
 
         # ── Phase 3 — Synthesis meeting (Star → Mesh → Star) ──────────────
         action_items: list[dict] = []
         waves: tuple[tuple[str, ...], ...] = ()
         if not outcome_acc.abandoned:
             # Star open: brief every roster member with the proposals
-            for participant in roster:
-                tools.send_message(
-                    team_id,
-                    to=participant,
-                    message=phase_3_open(proposals=proposals),
+            # GAP-4: batch-dispatch — one transaction, N parallel briefs.
+            if roster:
+                tools.send_message_many(
+                    [
+                        {
+                            "team_id": team_id,
+                            "to": participant,
+                            "message": phase_3_open(proposals=proposals),
+                        }
+                        for participant in roster
+                    ]
                 )
 
-            # Mesh (simplified): each participant signals consensus
+            # Mesh (simplified): each participant signals consensus.
+            # GAP-4: batch-dispatch as well — same all-to-all fan-out shape
+            # as Star-open; serialising it was the same Phase 2 bottleneck.
             agreements: list[dict] = []
-            for participant in roster:
-                resp = tools.send_message(
-                    team_id,
-                    to=participant,
-                    message=phase_3_debate(),
+            if roster:
+                debate_responses = tools.send_message_many(
+                    [
+                        {
+                            "team_id": team_id,
+                            "to": participant,
+                            "message": phase_3_debate(),
+                        }
+                        for participant in roster
+                    ]
                 )
-                if _is_abandon(resp):
-                    _abandon(
-                        outcome_acc,
-                        phase_reached="meeting",
-                        reason="no_consensus",
-                        detail=(
-                            f"{participant} could not reach consensus: {_abandon_reason(resp)}"
-                        ),
-                    )
-                    break
-                agreements.append({"agent": participant, "raw": resp or ""})
+                for participant, resp in zip(roster, debate_responses, strict=True):
+                    if _is_abandon(resp):
+                        _abandon(
+                            outcome_acc,
+                            phase_reached="meeting",
+                            reason="no_consensus",
+                            detail=(
+                                f"{participant} could not reach consensus: {_abandon_reason(resp)}"
+                            ),
+                        )
+                        break
+                    agreements.append({"agent": participant, "raw": resp or ""})
 
         if not outcome_acc.abandoned:
             # Star close: PM consolidates into Action Items DAG
@@ -712,16 +744,23 @@ def team_cycle_executor(
                         # rather than a fresh scan (Major 3).
                         prior = state.history[-1] if state.history else None
                         findings: list[Finding] = []
-                        for reviewer in reviewers:
-                            resp = tools.send_message(
-                                team_id,
-                                to=reviewer,
-                                message=phase_5b_prime_reviewer(
+                        # GAP-4: batch-dispatch reviewer briefs in parallel
+                        # (was sequential; with 3 reviewers and ~60s/reply
+                        # this was ~3x the necessary wall-clock per round).
+                        reviewer_messages = [
+                            {
+                                "team_id": team_id,
+                                "to": reviewer,
+                                "message": phase_5b_prime_reviewer(
                                     iter_n=iter_n,
                                     action_items=action_items,
                                     prior_findings=prior,
                                 ),
-                            )
+                            }
+                            for reviewer in reviewers
+                        ]
+                        reviewer_responses = tools.send_message_many(reviewer_messages)
+                        for reviewer, resp in zip(reviewers, reviewer_responses, strict=True):
                             findings.extend(
                                 _parse_reviewer_response(resp or "", reviewer, prefix=f"R{iter_n}")
                             )

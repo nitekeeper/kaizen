@@ -55,7 +55,12 @@ from scripts.team_tools_wrapper import AgentTeamsWrapper
 # Acceptable for the personal-use single-machine deployment context.
 # Trade-off pinned in the smoke report's GAP-1 follow-up note.
 PER_CALL_TIMEOUT_S: float = 600.0
-CLEANUP_TIMEOUT_S: float = 20.0
+# Cleanup is best-effort. Longer is safer than racing the orchestrator's
+# turn-cycle latency (Bash heartbeat + TeamDelete tool call + bridge_write
+# spans multiple Claude turns; each turn is ~5-10s). Run 22 smoke saw the
+# 20s default trip BridgeTimeoutError even though the team was successfully
+# cleaned up — Python just didn't observe in time. See docs/kaizen/2026-05-24-bridge-smoke-2.md GAP-5.
+CLEANUP_TIMEOUT_S: float = 120.0
 HEARTBEAT_STALL_S: float = 300.0
 POLL_INTERVAL_S: float = 0.2
 STALE_ROW_S: float = 900.0
@@ -130,9 +135,75 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
             raise BridgeRemoteError(f"send_message response missing 'response' string: {resp!r}")
         return out
 
+    def send_message_many(self, messages: list[dict]) -> list[str]:
+        """Batch variant of send_message — enqueue N rows in one transaction
+        and wait for ALL to reach status='ready' before returning the
+        responses in INPUT ORDER.
+
+        Each dict in ``messages`` must have keys ``team_id`` (str), ``to``
+        (str), ``message`` (str). Returns a list[str] of
+        ``response_json["response"]`` strings, in the same order as input
+        ``messages``.
+
+        Raises:
+          * BridgeRemoteError — if any row reaches status='error' OR if any
+            row's response is missing the 'response' string. The error
+            message names the failing input index and recipient.
+          * BridgeStallError — if S1's heartbeat goes older than
+            HEARTBEAT_STALL_S at any point during the batch wait.
+          * BridgeTimeoutError — if the whole batch fails to complete
+            within PER_CALL_TIMEOUT_S (applied to the slowest row).
+
+        See ``send_message`` for the singular dispatch; this method is the
+        Phase 2 / Phase 3 Star-open / Phase 5b' fan-out optimisation that
+        GAP-4 of docs/kaizen/2026-05-24-bridge-smoke-2.md surfaced — N
+        parallel dispatches in one Python-side blocking call rather than
+        N sequential round-trips.
+        """
+        if not isinstance(messages, list):
+            raise TypeError(
+                f"send_message_many: 'messages' must be a list, got {type(messages).__name__}"
+            )
+        if not messages:
+            return []
+        # Validate shape up-front so we never enqueue a half-bad batch.
+        for idx, m in enumerate(messages):
+            if not isinstance(m, dict):
+                raise TypeError(
+                    f"send_message_many: messages[{idx}] must be a dict, got {type(m).__name__}"
+                )
+            for key in ("team_id", "to", "message"):
+                if key not in m:
+                    raise ValueError(
+                        f"send_message_many: messages[{idx}] missing required key {key!r}"
+                    )
+                if not isinstance(m[key], str):
+                    raise TypeError(
+                        f"send_message_many: messages[{idx}][{key!r}] must be str, "
+                        f"got {type(m[key]).__name__}"
+                    )
+
+        row_ids = self._insert_many("send_message", messages)
+        responses = self._poll_many(row_ids, kind="send_message", messages=messages)
+        # `responses` is keyed by row_id in our input order; unwrap to
+        # response strings and validate each.
+        out: list[str] = []
+        for idx, resp in enumerate(responses):
+            response_str = resp.get("response") if isinstance(resp, dict) else None
+            if not isinstance(response_str, str):
+                recipient = messages[idx]["to"]
+                raise BridgeRemoteError(
+                    f"send_message_many: messages[{idx}] (to={recipient!r}) "
+                    f"response missing 'response' string: {resp!r}"
+                )
+            out.append(response_str)
+        return out
+
     def team_delete(self, team_id: str) -> None:
-        # team_delete's response_json is `{}`. Tighter cleanup timeout
-        # per design (CLEANUP_TIMEOUT_S=20s).
+        # team_delete's response_json is `{}`. Cleanup deadline is the
+        # bumped CLEANUP_TIMEOUT_S=120s (see the GAP-5 rationale comment
+        # above the module-level constant) — best-effort, larger than the
+        # orchestrator's turn-cycle latency.
         self._request(
             "team_delete",
             {"team_id": team_id},
@@ -154,6 +225,130 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
             return int(cur.lastrowid)
         finally:
             con.close()
+
+    def _insert_many(self, kind: str, items: list[dict]) -> list[int]:
+        """INSERT N pending bridge_requests rows in a single transaction.
+        Returns row ids in input order. The single-transaction property is
+        load-bearing — partial-batch enqueue would corrupt ordering and
+        violate the all-or-nothing batch contract."""
+        con = _connect(self._db_path)
+        try:
+            con.execute("BEGIN")
+            row_ids: list[int] = []
+            for args in items:
+                cur = con.execute(
+                    "INSERT INTO bridge_requests (run_id, kind, args_json, status) "
+                    "VALUES (?, ?, ?, 'pending')",
+                    (self._run_id, kind, json.dumps(args)),
+                )
+                row_ids.append(int(cur.lastrowid))
+            con.commit()
+            return row_ids
+        except Exception:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+    def _poll_many(
+        self,
+        row_ids: list[int],
+        *,
+        kind: str,
+        messages: list[dict],
+    ) -> list[dict]:
+        """Poll N bridge_requests rows in lock-step. Returns the decoded
+        ``response_json`` dicts in INPUT ORDER (aligned to ``row_ids``).
+
+        Per-batch deadline budget = ``PER_CALL_TIMEOUT_S`` (applied to the
+        SLOWEST row — same semantics as ``_request`` but scoped to the
+        whole batch). Per-batch stall budget = ``HEARTBEAT_STALL_S``.
+
+        Mirrors the single-row poll loop (``_request``) — same stall and
+        timeout invariants, just SELECT'ing N rows at once.
+        """
+        # Map row_id → (input_index, recipient) for error attribution
+        id_to_index = {rid: i for i, rid in enumerate(row_ids)}
+        id_to_recipient = {rid: messages[i].get("to", "?") for i, rid in enumerate(row_ids)}
+        # Placeholder list ordered by input index.
+        results: list[dict | None] = [None] * len(row_ids)
+        completed: set[int] = set()
+        placeholders = ",".join("?" for _ in row_ids)
+        deadline = time.monotonic() + self.PER_CALL_TIMEOUT_S
+        while True:
+            self._tick_python_heartbeat()
+            con = _connect(self._db_path)
+            try:
+                cur = con.execute(
+                    f"SELECT id, status, response_json, error_text "
+                    f"FROM bridge_requests WHERE id IN ({placeholders}) ORDER BY id",
+                    tuple(row_ids),
+                )
+                rows = cur.fetchall()
+            finally:
+                con.close()
+            seen_ids = {row[0] for row in rows}
+            # Any disappeared row → treat as error attributed to that input.
+            for rid in row_ids:
+                if rid not in seen_ids and rid not in completed:
+                    idx = id_to_index[rid]
+                    recipient = id_to_recipient[rid]
+                    raise BridgeRemoteError(
+                        f"send_message_many: messages[{idx}] (to={recipient!r}) "
+                        f"row {rid} disappeared from queue"
+                    )
+            for rid, status, response_json, error_text in rows:
+                if rid in completed:
+                    continue
+                if status == "ready":
+                    idx = id_to_index[rid]
+                    if not response_json:
+                        results[idx] = {}
+                    else:
+                        try:
+                            results[idx] = json.loads(response_json)
+                        except json.JSONDecodeError as e:
+                            recipient = id_to_recipient[rid]
+                            raise BridgeRemoteError(
+                                f"send_message_many: messages[{idx}] (to={recipient!r}) "
+                                f"row {rid} ({kind}) response_json is not valid JSON: {e}"
+                            ) from e
+                    completed.add(rid)
+                elif status == "error":
+                    idx = id_to_index[rid]
+                    recipient = id_to_recipient[rid]
+                    raise BridgeRemoteError(
+                        f"send_message_many: messages[{idx}] (to={recipient!r}) "
+                        f"row {rid} ({kind}) failed: {error_text or '(no error_text)'}"
+                    )
+                # else status == 'pending' — keep waiting
+
+            if len(completed) == len(row_ids):
+                # All done — results list is fully populated.
+                return [r if r is not None else {} for r in results]
+
+            # Stall + deadline checks — same shape as _request, just batch-scoped.
+            stall = self._s1_seconds_since_last_poll()
+            if stall is not None and stall > self.HEARTBEAT_STALL_S:
+                pending_ids = [rid for rid in row_ids if rid not in completed]
+                raise BridgeStallError(
+                    f"S1 heartbeat stalled during send_message_many batch: "
+                    f"last_polled_at is {stall:.1f}s old "
+                    f"(> HEARTBEAT_STALL_S={self.HEARTBEAT_STALL_S}s); "
+                    f"{len(pending_ids)} of {len(row_ids)} rows still pending "
+                    f"(rows={pending_ids})"
+                )
+
+            if time.monotonic() >= deadline:
+                pending_ids = [rid for rid in row_ids if rid not in completed]
+                raise BridgeTimeoutError(
+                    f"send_message_many: {len(pending_ids)} of {len(row_ids)} rows "
+                    f"timed out after {self.PER_CALL_TIMEOUT_S}s "
+                    f"(S1 heartbeat alive, but rows never reached 'ready'); "
+                    f"pending rows={pending_ids}"
+                )
+
+            time.sleep(self.POLL_INTERVAL_S)
 
     def _poll(self, row_id: int) -> tuple[str, str | None, str | None]:
         """Return (status, response_json, error_text) for the row."""

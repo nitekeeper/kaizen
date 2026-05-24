@@ -27,6 +27,7 @@ from scripts.dispatch_templates import (
     phase_5b_prime_fix,
     phase_5b_prime_pm_acceptance,
     phase_5b_prime_reviewer,
+    phase_5d_shutdown,
 )
 from scripts.fix_loop import Finding
 
@@ -439,3 +440,118 @@ def test_phase_5b_ci_failure_does_NOT_append_teammate_reply_rule():
     msg = phase_5b_ci_failure(wave_n=1, failed_checks=["tests"])
     assert TEAMMATE_REPLY_RULE.strip() not in msg
     assert msg == "CI failed after wave 1: ['tests']"
+
+
+# ── GAP-7 — Phase 5d shutdown handshake ───────────────────────────────────
+
+
+def test_phase_5d_shutdown_returns_valid_json_protocol():
+    """GAP-7 (docs/kaizen/2026-05-24-bridge-smoke-3.md): the shutdown
+    request body is a STRUCTURED JSON protocol message. Calling with an
+    explicit request_id must round-trip exactly via json.loads; calling
+    with no arg must default to a valid uuid4 string.
+    """
+    import json as _json
+    import uuid as _uuid
+
+    # Explicit request_id round-trips byte-exact through json.loads.
+    out = phase_5d_shutdown("test-uuid-123")
+    parsed = _json.loads(out)
+    assert parsed == {"type": "shutdown_request", "request_id": "test-uuid-123"}
+
+    # Default request_id is a valid uuid4 string (parses + matches the
+    # version-4 nibble pattern). The protocol doesn't strictly require
+    # uuid4, but the implementation contract does (so request_ids are
+    # cryptographically unique across concurrent cycles).
+    out_default = phase_5d_shutdown()
+    parsed_default = _json.loads(out_default)
+    assert parsed_default["type"] == "shutdown_request"
+    rid = parsed_default["request_id"]
+    assert isinstance(rid, str) and rid
+    # Will raise ValueError if rid is not a valid uuid; .version checks v4.
+    u = _uuid.UUID(rid)
+    assert u.version == 4
+
+    # And the rule that explicitly does NOT apply: TEAMMATE_REPLY_RULE
+    # must NOT be appended — this is a protocol payload, not a prose
+    # template.
+    assert TEAMMATE_REPLY_RULE.strip() not in out
+    assert TEAMMATE_REPLY_RULE.strip() not in out_default
+
+
+def test_shutdown_rule_appended_to_teammate_spawn_prompt():
+    """GAP-7: the SHUTDOWN_BEHAVIOR clause must ride in every teammate-bound
+    dispatch via the existing TEAMMATE_REPLY_RULE append path, so every
+    spawned teammate has the contract in-message.
+
+    Asserts a sample teammate template (phase_1_agenda) carries the
+    literal "shutdown_response" instruction substring after rendering.
+    The other 9 teammate templates inherit the same clause via
+    `+ TEAMMATE_REPLY_RULE` — the parametrised
+    `test_every_template_appends_teammate_reply_rule` test above already
+    proves every template ends with TEAMMATE_REPLY_RULE.
+    """
+    msg = phase_1_agenda(subject="x", cycle_n=1)
+    assert "shutdown_response" in msg, (
+        "phase_1_agenda's appended TEAMMATE_REPLY_RULE must include the "
+        "GAP-7 SHUTDOWN_BEHAVIOR clause (literal 'shutdown_response' "
+        "instruction) so spawned teammates know how to answer a "
+        "shutdown_request protocol message."
+    )
+    # And the constant itself must carry the clause, so all 10 templates
+    # propagate it without per-template wiring.
+    assert "shutdown_response" in TEAMMATE_REPLY_RULE
+    assert "shutdown_request" in TEAMMATE_REPLY_RULE
+
+
+def test_phase_5d_shutdown_does_NOT_carry_reply_rule():
+    """MINOR-1 (fix-loop iteration 2) regression test: mirror of
+    `test_phase_5b_ci_failure_does_NOT_append_teammate_reply_rule`.
+
+    `phase_5d_shutdown` is a STRUCTURED-JSON protocol body, not a
+    teammate-readable prose template — appending TEAMMATE_REPLY_RULE
+    would corrupt the JSON (the rule starts with a newline and contains
+    free-form prose), making the message un-parseable on the teammate
+    side. This test pins that property byte-exact.
+    """
+    out_explicit = phase_5d_shutdown("fixed-uuid-for-test")
+    assert TEAMMATE_REPLY_RULE not in out_explicit
+    assert TEAMMATE_REPLY_RULE.strip() not in out_explicit
+    assert out_explicit == '{"type": "shutdown_request", "request_id": "fixed-uuid-for-test"}'
+
+    # Default request_id form: still no reply rule appended.
+    out_default = phase_5d_shutdown()
+    assert TEAMMATE_REPLY_RULE not in out_default
+    assert TEAMMATE_REPLY_RULE.strip() not in out_default
+    # And the body is still valid JSON (no trailing whitespace, no rule).
+    import json as _json
+
+    parsed = _json.loads(out_default)
+    assert set(parsed.keys()) == {"type", "request_id"}
+
+
+def test_teammate_reply_rule_split_into_subconstants():
+    """MINOR-2 (fix-loop iteration 2): TEAMMATE_REPLY_RULE is composed
+    from `_REPLY_RULE + _SHUTDOWN_RULE`. Each sub-constant must contain
+    its own contract verbatim, and the public constant must equal their
+    concatenation. Byte-identity goldens reference the public constant
+    so they auto-track.
+    """
+    from scripts.dispatch_templates import _REPLY_RULE, _SHUTDOWN_RULE
+
+    # _REPLY_RULE carries the GAP-2 reply contract only.
+    assert "Reply contract" in _REPLY_RULE
+    assert 'to="team-lead"' in _REPLY_RULE
+    assert "ABANDON" in _REPLY_RULE
+    # _REPLY_RULE does NOT leak shutdown-contract prose.
+    assert "shutdown_request" not in _REPLY_RULE
+    assert "shutdown_response" not in _REPLY_RULE
+
+    # _SHUTDOWN_RULE carries the GAP-7 shutdown contract only.
+    assert "shutdown_request" in _SHUTDOWN_RULE
+    assert "shutdown_response" in _SHUTDOWN_RULE
+    # _SHUTDOWN_RULE does NOT redundantly include the GAP-2 reply prose.
+    assert "Reply contract" not in _SHUTDOWN_RULE
+
+    # The public constant is the concatenation.
+    assert TEAMMATE_REPLY_RULE == _REPLY_RULE + _SHUTDOWN_RULE

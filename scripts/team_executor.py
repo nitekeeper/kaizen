@@ -115,6 +115,7 @@ from scripts.dispatch_templates import (
     phase_5b_prime_fix,
     phase_5b_prime_pm_acceptance,
     phase_5b_prime_reviewer,
+    phase_5d_shutdown,
 )
 from scripts.fix_loop import (
     _BLOCKING_SEVERITIES,
@@ -490,7 +491,62 @@ def team_cycle_executor(
     outcome_acc = TeamCycleOutcome(participants=list(roster) if roster else [pm])
 
     commit_sha: str | None = None
-    team_id = tools.team_create(team_name, members=roster if roster else [pm])
+    # GAP-7 — eager `team_members` capture was wrong (MAJOR-4 of fix-loop
+    # iteration 2): CC's Agent spawn is LAZY on first SendMessage, so
+    # capturing the team_create members list at the top would dispatch
+    # ghost shutdowns to never-spawned roles when a Phase 1 abandon
+    # happens immediately after team_create.
+    #
+    # Instead, track `active_members` as a SET, populated lazily — append
+    # a recipient only after `tools.send_message` / `send_message_many`
+    # returns successfully. We wrap the injected `tools` in a lightweight
+    # local proxy (`TrackedTools`) that does the recording; the rest of
+    # the executor uses `tools` (the proxy) unchanged. The finally block
+    # iterates the lazy set, so a cycle that abandoned before any
+    # SendMessage fired produces an empty `active_members` and the
+    # shutdown step is skipped entirely. Test (d) covers the empty case.
+    active_members: set[str] = set()
+
+    class _TrackedTools:
+        """Local proxy: forwards every method to the injected `tools`
+        wrapper. `send_message` and `send_message_many` additionally
+        record the recipient(s) in the enclosing-scope `active_members`
+        set AFTER a successful return — exceptions on the underlying
+        call do NOT mark the recipient active (no spawn happened).
+
+        Per-method delegation is intentional: a `__getattr__` proxy would
+        bypass the Protocol-shape preflight that ran on the ORIGINAL
+        `tools` above.
+        """
+
+        def __init__(self, inner) -> None:
+            self._inner = inner
+
+        def team_create(self, name: str, members: list[str]) -> str:
+            return self._inner.team_create(name, members)
+
+        def send_message(self, team_id: str, to: str, message: str) -> str:
+            resp = self._inner.send_message(team_id, to, message)
+            active_members.add(to)
+            return resp
+
+        def send_message_many(self, messages: list[dict]) -> list[str]:
+            resps = self._inner.send_message_many(messages)
+            # Record every recipient whose call did not raise. The batch
+            # is all-or-nothing on the wrapper side (a single exception
+            # aborts the whole batch), so on a successful return every
+            # `to` in the batch is active.
+            for m in messages:
+                active_members.add(m["to"])
+            return resps
+
+        def team_delete(self, team_id: str) -> None:
+            self._inner.team_delete(team_id)
+
+    raw_tools = tools
+    tools = _TrackedTools(raw_tools)
+
+    team_id = tools.team_create(team_name, members=list(roster) if roster else [pm])
 
     try:
         # ── Phase 1 — Agenda (PM) ─────────────────────────────────────────
@@ -855,6 +911,52 @@ def team_cycle_executor(
             )
             commit_sha = rev.stdout.strip()
     finally:
+        # GAP-7 (docs/kaizen/2026-05-24-bridge-smoke-3.md) — graceful
+        # teammate shutdown BEFORE team_delete. Per CC's TeamCreate docs:
+        # "Gracefully terminate teammates first, then call TeamDelete after
+        # all teammates have shut down." Each spawned teammate must approve
+        # a shutdown_request → its CC process terminates → TeamDelete
+        # succeeds without orphan members.
+        #
+        # Fire-and-proceed semantics (architect-approved trade-off, fix-loop
+        # iteration 2): we do NOT parse `send_message_many`'s return values.
+        # If a teammate replied approve=false or didn't reply at all, we
+        # still call team_delete below — CC will either succeed (most cases)
+        # or fail with active-members; the latter falls through to the
+        # existing leaked-team sweep path on next run. The simplicity of
+        # fire-and-proceed is worth more than a couple of extra orphan rows
+        # to inspect manually.
+        #
+        # `active_members` is populated lazily by the `_TrackedTools` proxy
+        # above (MAJOR-4 fix): only roles that actually received a
+        # successful send_message / send_message_many appear here. A cycle
+        # that abandoned before any SendMessage fired has an empty set, so
+        # the shutdown step is skipped and we go straight to team_delete.
+        if active_members:
+            try:
+                # Iterate in stable sorted order so test assertions
+                # (and any future debug logs) are deterministic; the
+                # underlying set is unordered.
+                shutdown_messages = [
+                    {
+                        "team_id": team_id,
+                        "to": member,
+                        # Fresh uuid per call (default arg) — each
+                        # request_id is unique so a teammate cannot
+                        # confuse two concurrent requests.
+                        "message": phase_5d_shutdown(),
+                    }
+                    for member in sorted(active_members)
+                ]
+                tools.send_message_many(shutdown_messages)
+            except Exception as exc:
+                # Don't block team_delete on shutdown failure. Log + proceed.
+                _log.warning(
+                    "GAP-7 shutdown send_message_many failed for team %s: %s. "
+                    "Proceeding with team_delete; orphans may need next-run sweep.",
+                    team_id,
+                    exc,
+                )
         # CRITICAL INVARIANT: team_delete ALWAYS fires — even on exception
         # or abandonment — so the user's Claude Code session does not leak
         # named teams across cycles.

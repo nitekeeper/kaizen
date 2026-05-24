@@ -25,6 +25,8 @@ The 10 templates:
 
 from __future__ import annotations
 
+import json
+import uuid
 from typing import Any
 
 from scripts.fix_loop import Finding
@@ -42,6 +44,13 @@ from scripts.fix_loop import Finding
 #
 # Appended (not prepended) so the agenda content reads naturally — the
 # rule is a contract reminder, not the lead-in.
+#
+# MINOR-2 (fix-loop iteration 2): split into two private sub-constants
+# so future edits to the GAP-2 reply contract OR the GAP-7 shutdown
+# contract don't risk breaking the other. Public `TEAMMATE_REPLY_RULE` is
+# their concatenation; byte-identity goldens still pass because they
+# reference the public constant.
+#
 # Wording notes (fix-loop iteration 1):
 #   MAJOR-1: the `to=` argument names the literal string "team-lead" — every
 #            team has a registered team-lead agent (the implicit
@@ -52,7 +61,7 @@ from scripts.fix_loop import Finding
 #            because a teammate believed `ABANDON: ...` was an exit-without-
 #            reply protocol. The rule now states explicitly that abandons
 #            ALSO travel via SendMessage with an `ABANDON:` prefixed body.
-TEAMMATE_REPLY_RULE = (
+_REPLY_RULE = (
     "\n\nIMPORTANT — Reply contract: When you complete your task, "
     "you MUST send your response back via "
     'SendMessage(to="team-lead", message=<your reply>). '
@@ -66,6 +75,52 @@ TEAMMATE_REPLY_RULE = (
     "'ABANDON: <one-line reason>'. Do not skip the SendMessage even "
     "when abandoning."
 )
+
+# GAP-7 (2026-05-24, docs/kaizen/2026-05-24-bridge-smoke-3.md) — shutdown
+# handshake. CC's TeamCreate tool docs require teammates to be gracefully
+# terminated before TeamDelete. The team-lead enqueues a JSON
+# `shutdown_request` body to each teammate at cycle end; the teammate
+# parses it as a PROTOCOL message and SendMessages back a
+# `shutdown_response` body (no prose).
+#
+# Wording notes (fix-loop iteration 2):
+#   MAJOR-1: `message=JSON(...)` was a teammate-confusing pseudo-call —
+#            JSON() is not a function in any tool-call syntax. Replaced
+#            with a literal JSON STRING in single quotes so a literal-
+#            minded LLM can copy-paste it verbatim.
+#   MAJOR-2: `<echo from request>` placeholder would have been passed
+#            verbatim by a literal-minded teammate. Replaced with explicit
+#            "EXACT uuid string from the incoming request's request_id
+#            field — copy it verbatim, do NOT alter or wrap it".
+#   MAJOR-3: "actively mid-task" was undefined and could deadlock
+#            TeamDelete (a teammate that already SendMessaged its phase
+#            reply might consider itself still mid-task and approve=false).
+#            Now explicitly defined: mid-task = in-flight tool call OTHER
+#            than this SendMessage. Having already replied does NOT count;
+#            approve=true is the default.
+_SHUTDOWN_RULE = (
+    " ALSO: if you receive a JSON message body whose first non-whitespace "
+    'characters are `{"type":"shutdown_request"`, this is a PROTOCOL '
+    "message (NOT a conversational one). Parse it as JSON, extract its "
+    "`request_id` field, and respond via SendMessage with a JSON STRING "
+    "literal body: "
+    'SendMessage(to="team-lead", message=\'{"type":"shutdown_response",'
+    '"request_id":"<paste-the-exact-uuid-here>","approve":true}\'). '
+    "Set the `request_id` value to the EXACT uuid string from the "
+    "incoming request's `request_id` field — copy it verbatim, do NOT "
+    "alter, truncate, or wrap it in any other structure. The `message=` "
+    "value MUST be a STRING (single-quoted JSON literal as shown), NOT a "
+    "dict and NOT a JSON() function call (no such function exists in the "
+    "tool-call syntax). Set `approve` to true by default; only set "
+    "`approve` to false (with a one-line reason appended to the JSON) if "
+    "you are mid-task — where mid-task is DEFINED as: you currently have "
+    "an in-flight tool call OTHER than this SendMessage. Having already "
+    "replied to your phase prompt does NOT count as mid-task; approve=true "
+    "is the default. Approving terminates your process per CC tool "
+    "contract. Do NOT respond to a shutdown_request with prose."
+)
+
+TEAMMATE_REPLY_RULE = _REPLY_RULE + _SHUTDOWN_RULE
 
 
 def _require(name: str, value: Any, type_: type) -> None:
@@ -262,3 +317,32 @@ def phase_5b_prime_pm_acceptance(*, findings: list[Finding], iter_n: int) -> str
         "log them for follow-up), or do we keep iterating? Reply starting "
         "with ACCEPT or REJECT, followed by a one-line rationale."
     ) + TEAMMATE_REPLY_RULE
+
+
+def phase_5d_shutdown(request_id: str | None = None) -> str:
+    """Return the JSON-encoded shutdown_request body for the CC SendMessage protocol.
+
+    GAP-7 (2026-05-24, docs/kaizen/2026-05-24-bridge-smoke-3.md) — per the
+    CC TeamCreate tool contract, teammates MUST be gracefully terminated
+    BEFORE TeamDelete is called. The team-lead enqueues one
+    shutdown_request per active teammate; each teammate parses the JSON
+    body and responds with a shutdown_response (approve=true unless
+    actively mid-task). Approving terminates the teammate process per
+    CC's tool contract, so TeamDelete then succeeds without orphan
+    members.
+
+    This is a STRUCTURED-JSON message body, NOT a teammate-readable prose
+    template. TEAMMATE_REPLY_RULE is NOT appended — the JSON is the
+    entire body. The receiving teammate must parse it as a protocol
+    message per the SHUTDOWN_BEHAVIOR clause appended to
+    TEAMMATE_REPLY_RULE at spawn-prompt time.
+
+    Args:
+        request_id: optional UUID; defaults to a fresh uuid4 string.
+
+    Returns:
+        JSON string: '{"type":"shutdown_request","request_id":"<uuid>"}'
+    """
+    if request_id is None:
+        request_id = str(uuid.uuid4())
+    return json.dumps({"type": "shutdown_request", "request_id": request_id})

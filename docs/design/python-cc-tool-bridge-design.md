@@ -611,6 +611,40 @@ Rev 2 conflated "Python crashed" with "Python is slow." Rev 3 separates them via
 
 For `aborted` (MINOR-AB fix), the **`args_json.team_ids_at_risk` field is the authoritative source of truth**. Python (or the next-run sweep) is the producer; S1's handler does NOT re-derive via SQL (the bad SQL pattern flagged in Rev 2 MINOR-ORPHAN). The orphan-team SQL is the responsibility of `scripts/sweep_leaked_teams.py` (see "Leaked-team recovery"), which populates `team_ids_at_risk` correctly using SQLite JSON1.
 
+### Teammate lifecycle trifecta (2026-05-24)
+
+A spawned teammate is NOT a single resource. It is **three resources at three layers**, each created and cleaned by a different primitive. Conflating them was the root cause of every pre-GAP-7 orphan incident (smokes #2 and #3 accumulated 8 orphan processes + 8 orphan panes across two runs).
+
+| Layer | What it is | Lives in | Created by | Cleaned by | Visible via |
+|---|---|---|---|---|---|
+| **Process** | OS-level `claude --agent-id <name>@<team>` process consuming RAM | Linux process table | `Agent(team_name=...)` spawn | `shutdown_request` handshake → CC kills PID (or manual `kill <pid>`) | `pgrep -af '\-\-agent-id'` |
+| **Pane** | tmux pane hosting the teammate's TTY/UI | Current tmux session/window | CC's spawn — one pane per teammate | Pane closes when the hosted process exits, usually (or `tmux kill-pane` — see `docs/runbooks/orphan-teammate-cleanup.md` Step 2 for the shell-stays-open edge case) | `tmux list-panes -a` |
+| **Config** | Team manifest dir (roster, routing tables, team_id) | `~/.claude/teams/<team_id>/` (or equivalent) | `TeamCreate` | `TeamDelete` | `ls ~/.claude/teams/` |
+
+**Causal chain (post-GAP-7, working as designed):**
+
+```
+shutdown_request → teammate replies shutdown_response{approve:true}
+       ↓
+   CC kills the PROCESS (layer 1)
+       ↓
+   Process exit closes the PANE (layer 2, automatic)
+       ↓
+   TeamDelete removes the CONFIG (layer 3, must be called explicitly)
+```
+
+**What `TeamDelete` does NOT do** (and why pre-GAP-7 leaked):
+- Does not send `shutdown_request` to active teammates
+- Does not `kill` lingering Claude processes
+- Does not `kill-pane` the tmux panes
+- Only removes the team config dir
+
+So `TeamDelete` alone with live teammates produces a **partial cleanup**: configs gone, processes and panes orphaned. Two-of-three layers leaked = the trifecta failure mode.
+
+**Operational rule:** Every cleanup path must address all three layers in the right order — `shutdown_request` the processes first (which cascades to panes via process-exit), THEN `TeamDelete` for the configs. Skipping the handshake means manual `kill` + `kill-pane` later.
+
+**Scope of Layer 3 sweep below:** `scripts/sweep_leaked_teams.py` addresses ONLY the config layer. Processes and panes are out of scope and depend on the GAP-7 `shutdown_request` handshake (happy path) or manual `pkill` + `tmux kill-pane` (orphan recovery). See `docs/runbooks/orphan-teammate-cleanup.md` for the full recipe.
+
 ### Leaked-team recovery (Rev 3, GAP-7 addendum 2026-05-24)
 
 Four layers — Layer 0 added 2026-05-24 (GAP-7); Layers 1-3 unchanged in
@@ -630,7 +664,7 @@ structure from Rev 2 but with corrected SQL:
   clause appended to `TEAMMATE_REPLY_RULE` at spawn-prompt time.
 - **Layer 1 — `finally`:** `team_cycle_executor`'s finally enqueues `team_delete` (after Layer 0).
 - **Layer 2 — cleanup timeout:** if `team_delete` request times out (`CLEANUP_TIMEOUT_S=20s`, bumped from Rev 2's 15s), Python appends `{run_id, team_id, leaked_at}` to `.ai/leaked_teams.json` and exits.
-- **Layer 3 — next-run sweep (`scripts/sweep_leaked_teams.py`):** invoked from `skills/improve/SKILL.md` Step 3b.3 (team-mode runs only; subagent mode does not use `TeamCreate` and so cannot leak teams). Uses SQLite JSON1 to find orphan team_ids correctly (MINOR-ORPHAN fix):
+- **Layer 3 — next-run sweep (`scripts/sweep_leaked_teams.py`):** invoked from `skills/improve/SKILL.md` Step 3b.3 (team-mode runs only; subagent mode does not use `TeamCreate` and so cannot leak teams). Addresses ONLY the config layer of the trifecta above; processes and panes are out-of-scope and depend on Layer 0's handshake (happy path) or manual recovery. See `docs/runbooks/orphan-teammate-cleanup.md` for the manual recipe. Uses SQLite JSON1 to find orphan team_ids correctly (MINOR-ORPHAN fix):
 
 ```sql
 -- Find team_ids that were created in any past run but never deleted.

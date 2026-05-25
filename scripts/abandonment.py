@@ -27,7 +27,19 @@ VALID_PHASES: frozenset[str] = frozenset(
     {"agenda", "meeting", "implementation", "test", "review", "push"}
 )
 VALID_REASONS: frozenset[str] = frozenset(
-    {"no_consensus", "destructive_rejected", "tests_unrecoverable", "review_unrecoverable", "other"}
+    {
+        "no_consensus",
+        "destructive_rejected",
+        "tests_unrecoverable",
+        "review_unrecoverable",
+        # F12 (audit cleanup): per-CI-category abandonment reasons. Mirrored
+        # in migrations/005_reason_taxonomy.sql — any addition here MUST
+        # also extend the SQL CHECK constraint in the next migration.
+        "lint_failed",
+        "security_failed",
+        "sca_failed",
+        "other",
+    }
 )
 
 

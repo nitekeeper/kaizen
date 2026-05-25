@@ -97,6 +97,7 @@ import logging
 import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -111,7 +112,6 @@ from scripts.dispatch_templates import (
     phase_3_debate,
     phase_3_open,
     phase_4_implementer,
-    phase_5b_ci_failure,
     phase_5b_prime_fix,
     phase_5b_prime_pm_acceptance,
     phase_5b_prime_reviewer,
@@ -402,6 +402,76 @@ def _abandon(
     outcome_acc.reason = reason
     outcome_acc.detail = detail
     return outcome_acc
+
+
+# F12 (audit cleanup): map a CI-mirror check name to the abandonment-reason
+# enum value that best describes its failure category. The reasons enum
+# is documented in scripts/abandonment.VALID_REASONS and migrations/005.
+#
+# Ordering matters for the multi-category case — see `_pick_highest_reason`.
+_CHECK_TO_REASON = {
+    "ruff_check": "lint_failed",
+    "ruff_format": "lint_failed",
+    "bandit": "security_failed",
+    "pip_audit": "sca_failed",
+    "tests": "tests_unrecoverable",
+}
+
+# Highest-severity first: when multiple checks fail in the same wave, we
+# pick the most severe category so the abandonment is taxonomically right
+# (a test break shadows a lint break, a security break shadows an SCA
+# break, etc.). The order is fixed deterministically:
+#   tests_unrecoverable > security_failed > sca_failed > lint_failed
+_REASON_SEVERITY_ORDER = (
+    "tests_unrecoverable",
+    "security_failed",
+    "sca_failed",
+    "lint_failed",
+)
+
+
+def _pick_highest_reason(failed_checks: list[str]) -> str:
+    """Map ``failed_checks`` → the single highest-severity abandonment reason.
+
+    Unrecognised check names fall back to ``tests_unrecoverable`` so a
+    mystery break still surfaces with a plausible category (and the detail
+    string carries the raw check names so triage can see the truth).
+    """
+    reasons = {_CHECK_TO_REASON.get(name, "tests_unrecoverable") for name in failed_checks}
+    for r in _REASON_SEVERITY_ORDER:
+        if r in reasons:
+            return r
+    return "tests_unrecoverable"
+
+
+def _diff_ci_results(
+    baseline: dict[str, dict] | None,
+    current: dict[str, dict],
+) -> tuple[list[str], list[str]]:
+    """Split current-wave failures into cycle-introduced vs. pre-existing.
+
+    F10 (audit cleanup): a CI mirror runs at every Phase 4 wave boundary.
+    Without a baseline, ANY ``status == "fail"`` aborts the cycle — which
+    means a host with a pre-existing ruff lint debt (or a stale pip-audit
+    CVE) causes every kaizen run to abandon, regardless of whether the
+    cycle's edits introduced the breakage.
+
+    Returns a 2-tuple ``(cycle_introduced, pre_existing)`` keyed by check
+    name. A check fails as "cycle-introduced" iff its current status is
+    ``fail`` AND its baseline status (when baseline is non-None) was NOT
+    ``fail``. When ``baseline`` is None every fail is treated as
+    cycle-introduced — there is no baseline to diff against.
+    """
+    cycle_introduced: list[str] = []
+    pre_existing: list[str] = []
+    for name, result in current.items():
+        if result.get("status") != "fail":
+            continue
+        if baseline is not None and baseline.get(name, {}).get("status") == "fail":
+            pre_existing.append(name)
+        else:
+            cycle_introduced.append(name)
+    return cycle_introduced, pre_existing
 
 
 # ── Main entry point ───────────────────────────────────────────────────────
@@ -714,6 +784,24 @@ def team_cycle_executor(
                 owner = item.get("owner") or pm
                 for f in item.get("touches", []):
                     file_to_owner.setdefault(f, owner)
+
+        # F10 (audit cleanup): capture a CI baseline BEFORE wave 1 dispatch
+        # so the per-wave diff can tell "the cycle introduced this break"
+        # apart from "the host arrived with this break." We use ``"true"``
+        # as the test command so the baseline's pytest call is a no-op
+        # exit-0 — we want the lint/security/sca baseline, not a baseline
+        # pytest run (which would be unfaithful to the cycle's eventual
+        # post-wave invocation that uses the project's real test_command).
+        ci_baseline: dict[str, dict] | None = None
+        if not outcome_acc.abandoned and waves:
+            try:
+                _baseline_passed, ci_baseline = run_ci_checks(clone_dir, "true")
+            except Exception as baseline_exc:
+                # A baseline crash is non-fatal — log and proceed without
+                # a baseline (every fail will be "cycle-introduced," same
+                # as the pre-F10 behavior).
+                _log.warning("CI baseline run failed: %s — proceeding without diff", baseline_exc)
+                ci_baseline = None
         if not outcome_acc.abandoned and waves:
             items_by_id = {item["id"]: item for item in action_items}
             for wave_n, wave_ids in enumerate(waves, start=1):
@@ -744,15 +832,37 @@ def team_cycle_executor(
                 test_command = project.get("test_command") or "pytest"
                 all_passed, results = run_ci_checks(clone_dir, test_command)
                 if not all_passed:
-                    failed = [name for name, r in results.items() if r.get("status") == "fail"]
+                    # F10 (audit cleanup): diff against the pre-wave-1
+                    # baseline so a pre-existing host failure does NOT
+                    # abandon the cycle. Only cycle-introduced failures
+                    # are unrecoverable; pre-existing ones are logged.
+                    cycle_introduced, pre_existing = _diff_ci_results(ci_baseline, results)
+                    if pre_existing:
+                        # Pre-existing failures: log to stderr (structured
+                        # logging is out of scope) but do not abandon.
+                        print(
+                            f"[team_executor] wave {wave_n} CI: ignoring pre-existing "
+                            f"failures from baseline: {pre_existing}",
+                            file=sys.stderr,
+                        )
+                    if not cycle_introduced:
+                        # All failures were pre-existing → cycle continues.
+                        continue
+                    # F12 (audit cleanup): map the highest-severity failed
+                    # category to a per-CI-kind reason rather than always
+                    # using `tests_unrecoverable`. Detail names both
+                    # cycle-introduced and pre-existing for triage.
+                    reason = _pick_highest_reason(cycle_introduced)
+                    detail = (
+                        f"CI failed after wave {wave_n}: "
+                        f"cycle-introduced={cycle_introduced}, "
+                        f"pre-existing={pre_existing}"
+                    )
                     _abandon(
                         outcome_acc,
                         phase_reached="test",
-                        reason="tests_unrecoverable",
-                        detail=phase_5b_ci_failure(
-                            wave_n=wave_n,
-                            failed_checks=failed,
-                        ),
+                        reason=reason,
+                        detail=detail,
                     )
                     break
 

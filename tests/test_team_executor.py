@@ -584,13 +584,32 @@ class TestPhase4Waves:
                 cycle_n=1,
                 tools=tools,
             )
-        # Two waves → two CI invocations.
-        assert len(ci_calls) == 2, f"expected 2 CI runs (one per wave); got {len(ci_calls)}"
+        # F10 (audit cleanup): one baseline + one per wave. With two waves
+        # we expect 1 baseline + 2 wave-boundary invocations = 3 total.
+        assert len(ci_calls) == 3, (
+            f"expected 3 CI runs (1 baseline + 1 per wave); got {len(ci_calls)}"
+        )
+        # The first call is the baseline — its test_command is the literal
+        # "true" sentinel (we don't want a baseline pytest run).
+        assert ci_calls[0][1] == "true", (
+            f"first call must be the baseline with test_command='true'; got {ci_calls[0]}"
+        )
 
     def test_phase_4_ci_failure_abandons_with_tests_unrecoverable(self, tmp_path, monkeypatch):
-        """A red CI at a wave boundary abandons phase=test reason=tests_unrecoverable."""
+        """A red CI at a wave boundary abandons phase=test reason=tests_unrecoverable.
+
+        F10 (audit cleanup): the abandonment fires only when the post-wave
+        fail is CYCLE-INTRODUCED relative to the pre-wave-1 baseline. We
+        stub the baseline (test_command="true") to be green and the
+        post-wave call (test_command="pytest") to be red so the diff
+        flags "tests" as cycle-introduced.
+        """
 
         def fake_ci(clone_dir, test_command):
+            # First call is the baseline ("true"); make it pass so the
+            # post-wave fail registers as cycle-introduced.
+            if test_command == "true":
+                return True, {"tests": {"status": "pass", "output": "ok"}}
             return False, {"tests": {"status": "fail", "output": "boom"}}
 
         monkeypatch.setattr(team_executor_mod, "run_ci_checks", fake_ci)
@@ -616,6 +635,242 @@ class TestPhase4Waves:
         assert outcome["phase_reached"] == "test"
         assert outcome["reason"] == "tests_unrecoverable"
         assert "tests" in outcome["detail"]
+
+    # ── F10 — Baseline-diff: pre-existing vs. cycle-introduced ────────
+
+    def test_baseline_diff_pre_existing_fail_does_not_abandon(self, tmp_path, monkeypatch):
+        """F10 (audit cleanup): a check that was already failing on the
+        baseline must NOT abandon the cycle when it's still failing post-
+        wave — that's a pre-existing host issue, not a cycle-introduced
+        regression."""
+        _patch_phase5c(monkeypatch)
+
+        def fake_ci(clone_dir, test_command):
+            # Both the baseline AND the post-wave run report pip_audit=fail.
+            # The diff must mark this as pre-existing → no abandon.
+            return False, {
+                "tests": {"status": "pass", "output": "ok"},
+                "pip_audit": {"status": "fail", "output": "stale CVE"},
+            }
+
+        monkeypatch.setattr(team_executor_mod, "run_ci_checks", fake_ci)
+        tools = MockTeamTools(
+            scripted={
+                "Phase 1": "do x",
+                "Phase 2": "proposal",
+                "Phase 3 close": self._two_wave_json(),
+                "Phase 4 wave": "applied",
+                "Phase 5b'": "NO ISSUES",
+            }
+        )
+        roster = ["pm-1", "be-1", "se-1", "security-engineer-1", "architect-1"]
+        with patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}):
+            outcome = team_cycle_executor(
+                clone_dir=tmp_path,
+                project=_project(roster=roster),
+                run_row=_run_row(),
+                cycle_n=1,
+                tools=tools,
+            )
+        # No cycle-introduced fails → cycle completes successfully.
+        assert outcome["status"] == "success", outcome
+
+    def test_baseline_diff_cycle_introduced_fail_abandons(self, tmp_path, monkeypatch):
+        """F10 (audit cleanup): a fail that was clean at baseline but red
+        post-wave IS cycle-introduced → abandon with the right reason and
+        a detail that mentions which checks went red and which were
+        pre-existing."""
+        _patch_phase5c(monkeypatch)
+
+        def fake_ci(clone_dir, test_command):
+            if test_command == "true":
+                # Baseline: everything clean.
+                return True, {
+                    "tests": {"status": "pass", "output": "ok"},
+                    "ruff_check": {"status": "pass", "output": "ok"},
+                }
+            # Post-wave: tests went red.
+            return False, {
+                "tests": {"status": "fail", "output": "boom"},
+                "ruff_check": {"status": "pass", "output": "ok"},
+            }
+
+        monkeypatch.setattr(team_executor_mod, "run_ci_checks", fake_ci)
+        tools = MockTeamTools(
+            scripted={
+                "Phase 1": "do x",
+                "Phase 2": "proposal",
+                "Phase 3 close": self._two_wave_json(),
+                "Phase 4 wave": "applied",
+            }
+        )
+        roster = ["pm-1", "be-1", "se-1", "security-engineer-1", "architect-1"]
+        with patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}):
+            outcome = team_cycle_executor(
+                clone_dir=tmp_path,
+                project=_project(roster=roster),
+                run_row=_run_row(),
+                cycle_n=1,
+                tools=tools,
+            )
+        assert outcome["status"] == "abandoned"
+        assert outcome["phase_reached"] == "test"
+        assert outcome["reason"] == "tests_unrecoverable"
+        assert "cycle-introduced=['tests']" in outcome["detail"]
+
+    def test_baseline_diff_mixed_pre_existing_and_cycle_introduced(self, tmp_path, monkeypatch):
+        """F10 (audit cleanup): the detail string must surface BOTH the
+        cycle-introduced and the pre-existing categories so triage isn't
+        misdirected."""
+        _patch_phase5c(monkeypatch)
+
+        def fake_ci(clone_dir, test_command):
+            if test_command == "true":
+                return False, {
+                    "tests": {"status": "pass", "output": "ok"},
+                    "pip_audit": {"status": "fail", "output": "stale CVE"},
+                }
+            return False, {
+                "tests": {"status": "fail", "output": "boom"},
+                "pip_audit": {"status": "fail", "output": "stale CVE"},
+            }
+
+        monkeypatch.setattr(team_executor_mod, "run_ci_checks", fake_ci)
+        tools = MockTeamTools(
+            scripted={
+                "Phase 1": "do x",
+                "Phase 2": "proposal",
+                "Phase 3 close": self._two_wave_json(),
+                "Phase 4 wave": "applied",
+            }
+        )
+        roster = ["pm-1", "be-1", "se-1", "security-engineer-1", "architect-1"]
+        with patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}):
+            outcome = team_cycle_executor(
+                clone_dir=tmp_path,
+                project=_project(roster=roster),
+                run_row=_run_row(),
+                cycle_n=1,
+                tools=tools,
+            )
+        assert outcome["status"] == "abandoned"
+        assert "cycle-introduced=['tests']" in outcome["detail"]
+        assert "pre-existing=['pip_audit']" in outcome["detail"]
+
+    # ── F12 — Reason taxonomy ─────────────────────────────────────────
+
+    def test_reason_taxonomy_maps_bandit_fail_to_security_failed(self, tmp_path, monkeypatch):
+        """F12 (audit cleanup): a cycle-introduced bandit fail must surface
+        with reason=security_failed (not tests_unrecoverable) so triage
+        lands on the security-engineer agent, not pytest debugging."""
+        _patch_phase5c(monkeypatch)
+
+        def fake_ci(clone_dir, test_command):
+            if test_command == "true":
+                return True, {
+                    "tests": {"status": "pass", "output": "ok"},
+                    "bandit": {"status": "pass", "output": "ok"},
+                }
+            return False, {
+                "tests": {"status": "pass", "output": "ok"},
+                "bandit": {"status": "fail", "output": "B101 hit"},
+            }
+
+        monkeypatch.setattr(team_executor_mod, "run_ci_checks", fake_ci)
+        tools = MockTeamTools(
+            scripted={
+                "Phase 1": "do x",
+                "Phase 2": "proposal",
+                "Phase 3 close": self._two_wave_json(),
+                "Phase 4 wave": "applied",
+            }
+        )
+        roster = ["pm-1", "be-1", "se-1", "security-engineer-1", "architect-1"]
+        with patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}):
+            outcome = team_cycle_executor(
+                clone_dir=tmp_path,
+                project=_project(roster=roster),
+                run_row=_run_row(),
+                cycle_n=1,
+                tools=tools,
+            )
+        assert outcome["status"] == "abandoned"
+        assert outcome["reason"] == "security_failed"
+
+    def test_reason_taxonomy_maps_ruff_fail_to_lint_failed(self, tmp_path, monkeypatch):
+        """F12 (audit cleanup): a cycle-introduced ruff_check fail maps to
+        reason=lint_failed."""
+        _patch_phase5c(monkeypatch)
+
+        def fake_ci(clone_dir, test_command):
+            if test_command == "true":
+                return True, {
+                    "tests": {"status": "pass", "output": "ok"},
+                    "ruff_check": {"status": "pass", "output": "ok"},
+                }
+            return False, {
+                "tests": {"status": "pass", "output": "ok"},
+                "ruff_check": {"status": "fail", "output": "E501 line too long"},
+            }
+
+        monkeypatch.setattr(team_executor_mod, "run_ci_checks", fake_ci)
+        tools = MockTeamTools(
+            scripted={
+                "Phase 1": "do x",
+                "Phase 2": "proposal",
+                "Phase 3 close": self._two_wave_json(),
+                "Phase 4 wave": "applied",
+            }
+        )
+        roster = ["pm-1", "be-1", "se-1", "security-engineer-1", "architect-1"]
+        with patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}):
+            outcome = team_cycle_executor(
+                clone_dir=tmp_path,
+                project=_project(roster=roster),
+                run_row=_run_row(),
+                cycle_n=1,
+                tools=tools,
+            )
+        assert outcome["status"] == "abandoned"
+        assert outcome["reason"] == "lint_failed"
+
+    def test_reason_taxonomy_picks_highest_severity_when_multiple(self, tmp_path, monkeypatch):
+        """F12 (audit cleanup): when multiple categories fail in one wave,
+        pick the highest-severity reason. tests > security > sca > lint."""
+        _patch_phase5c(monkeypatch)
+
+        def fake_ci(clone_dir, test_command):
+            if test_command == "true":
+                return True, {
+                    "tests": {"status": "pass", "output": "ok"},
+                    "ruff_check": {"status": "pass", "output": "ok"},
+                }
+            return False, {
+                "tests": {"status": "fail", "output": "boom"},
+                "ruff_check": {"status": "fail", "output": "lint"},
+            }
+
+        monkeypatch.setattr(team_executor_mod, "run_ci_checks", fake_ci)
+        tools = MockTeamTools(
+            scripted={
+                "Phase 1": "do x",
+                "Phase 2": "proposal",
+                "Phase 3 close": self._two_wave_json(),
+                "Phase 4 wave": "applied",
+            }
+        )
+        roster = ["pm-1", "be-1", "se-1", "security-engineer-1", "architect-1"]
+        with patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}):
+            outcome = team_cycle_executor(
+                clone_dir=tmp_path,
+                project=_project(roster=roster),
+                run_row=_run_row(),
+                cycle_n=1,
+                tools=tools,
+            )
+        assert outcome["status"] == "abandoned"
+        # tests outranks lint.
+        assert outcome["reason"] == "tests_unrecoverable"
 
 
 # ── Phase 5b' — Reviewers ─────────────────────────────────────────────────

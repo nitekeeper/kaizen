@@ -7,6 +7,7 @@ import sqlite3
 import pytest
 
 from scripts.abandonment import (
+    VALID_REASONS,
     format_report,
     process_abandonment,
     record_abandonment,
@@ -440,3 +441,33 @@ def test_process_abandonment_full_flow(db, run_and_cycle):
     assert row["cycle_id"] == run_and_cycle["cycle"]["id"]
     assert "Cycle 1 abandoned" in markdown
     assert "type: abandonment-report" in markdown
+
+
+# ── F12 — extended reason taxonomy ────────────────────────────────────────
+
+
+def test_valid_reasons_includes_new_taxonomy():
+    """F12 (audit cleanup): the per-CI-category reasons must be in
+    VALID_REASONS so the orchestrator's allowlist guard accepts them."""
+    assert "lint_failed" in VALID_REASONS
+    assert "security_failed" in VALID_REASONS
+    assert "sca_failed" in VALID_REASONS
+    # Existing reasons are preserved.
+    assert "tests_unrecoverable" in VALID_REASONS
+    assert "review_unrecoverable" in VALID_REASONS
+
+
+@pytest.mark.parametrize("new_reason", ["lint_failed", "security_failed", "sca_failed"])
+def test_record_abandonment_accepts_new_reasons(db, run_and_cycle, new_reason):
+    """F12 (audit cleanup): migration 005 extended the CHECK constraint to
+    accept the three new categories — inserting a row with any of them must
+    succeed (not raise an IntegrityError)."""
+    row = record_abandonment(
+        db_path=db,
+        cycle_id=run_and_cycle["cycle"]["id"],
+        phase_reached="test",
+        reason=new_reason,
+        detail="auto",
+        report_memex_slug=None,
+    )
+    assert row["reason"] == new_reason

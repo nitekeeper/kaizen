@@ -36,13 +36,13 @@ def test_migration_recorded(tmp_path):
 
 
 def test_migration_is_idempotent(tmp_path):
-    """Re-running migrations is a no-op and does not double-apply (001 + 002 + 003 + 004)."""
+    """Re-running migrations is a no-op and does not double-apply (001-005)."""
     db_path = str(tmp_path / "test.db")
     apply_migrations(db_path, MIGRATIONS_DIR)
     apply_migrations(db_path, MIGRATIONS_DIR)  # must not raise
     with closing(get_connection(db_path)) as conn:
         count = conn.execute("SELECT COUNT(*) FROM migrations").fetchone()[0]
-    assert count == 4
+    assert count == 5
 
 
 def test_fk_indexes_created(tmp_path):

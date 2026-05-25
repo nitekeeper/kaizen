@@ -203,11 +203,21 @@ def test_python_heartbeat_written_every_poll_tick(bridge_path):
 
 
 def test_bridge_stall_raises_when_s1_heartbeat_old(bridge_path):
-    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=5)
+    """Issue #41 + SDET-review-PR follow-up: the stall predicate now
+    requires BOTH clocks to agree. To exercise the raise branch we
+    pre-seed `_last_python_tick_monotonic[run_id]` with an OLD monotonic
+    timestamp BEFORE constructing the wrapper, simulating "Python was
+    ticking, then stopped" (a real S1 stall, not a suspend-resume).
+    Without the pre-seed, mono_gap would be None and the predicate
+    correctly falls through to the suspend-resume branch."""
+    run_id = 5
+    # Simulate prior monotonic activity that then went silent.
+    bridge_mod._last_python_tick_monotonic[run_id] = time.monotonic() - 600.0
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=run_id)
     # Pretend S1's last poll was 600s ago — past HEARTBEAT_STALL_S=300s
     # (bumped in run-21 from the original 60s; see scripts/cc_tool_bridge.py
     # module-level comment).
-    _tick_bridge_heartbeat(bridge_path, run_id=5, at_offset_seconds=600)
+    _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=600)
 
     with pytest.raises(BridgeStallError) as exc_info:
         wrapper.team_create(name="x", members=[])
@@ -228,7 +238,7 @@ def test_heartbeat_stall_constants_match_run21_values():
     assert QueueBridgeWrapper.PER_CALL_TIMEOUT_S == 600.0
 
 
-def test_long_sendmessage_does_not_trip_stall_at_old_threshold(bridge_path, monkeypatch):
+def test_long_sendmessage_does_not_trip_stall_at_old_threshold(bridge_path):
     """Run-21 GAP-1 regression guard — the case run 20 hit empirically.
 
     A SendMessage round-trip taking ~90 seconds with NO interleaved S1
@@ -248,26 +258,11 @@ def test_long_sendmessage_does_not_trip_stall_at_old_threshold(bridge_path, monk
     # Initial heartbeat: S1 polled once at t=0.
     _tick_bridge_heartbeat(bridge_path, run_id=20, at_offset_seconds=0)
 
-    # Compress wall clock for the deadline check; keep the real DB clock
-    # honest by simulating S1's heartbeat as "90s old" right before the row
-    # is marked ready. The stall predicate compares julianday('now')
-    # against last_polled_at — both real DB calls — so we set the DB
-    # heartbeat to a fixed "90s ago" value once, mid-call.
-    state = {"sim_elapsed": 0.0}
-    real_monotonic = time.monotonic
-
-    def fake_monotonic():
-        return real_monotonic() + state["sim_elapsed"]
-
-    # TODO(cosmetic): unused monkeypatch — stall predicate reads SQLite
-    # julianday('now') against bridge_heartbeat.last_polled_at, NOT
-    # Python's time.monotonic. The fake_monotonic above only fast-forwards
-    # the per-call deadline counter, which is fine but not load-bearing
-    # for the stall assertion this test makes. Reviewer noted but DEFER:
-    # leaving the monkeypatch documents the intent (compress wall clock
-    # so PER_CALL_TIMEOUT_S=600 isn't actually waited out) even though
-    # the 90s simulated gap finishes well under the real deadline.
-    monkeypatch.setattr(bridge_mod.time, "monotonic", fake_monotonic)
+    # The stall predicate compares SQLite julianday('now') against
+    # bridge_heartbeat.last_polled_at — both real DB calls. Simulate a
+    # 90s heartbeat gap by re-stamping last_polled_at mid-call to "90s
+    # ago"; the actual call completes in real time well under the
+    # PER_CALL_TIMEOUT_S=600 deadline.
 
     def fake_s1():
         row_id = _wait_for_pending_row(bridge_path, run_id=20)
@@ -277,9 +272,6 @@ def test_long_sendmessage_does_not_trip_stall_at_old_threshold(bridge_path, monk
         # (the empirical run-20 number, well past the old 60s threshold
         # but well under the new 300s threshold).
         _tick_bridge_heartbeat(bridge_path, run_id=20, at_offset_seconds=90)
-        # Advance simulated monotonic so the per-call deadline budget is
-        # accounted for; 90s is well under the new PER_CALL_TIMEOUT_S=600.
-        state["sim_elapsed"] = 90.0
         _mark_row_ready(bridge_path, row_id, {"response": "finally back"})
 
     t = threading.Thread(target=fake_s1, daemon=True)
@@ -635,3 +627,277 @@ def test_team_delete_does_not_trip_timeout_at_60s_under_new_deadline(bridge_path
     t.join(timeout=10)
     # Sanity: actually elapsed past the old deadline.
     assert state["sim_elapsed"] >= 60.0
+
+
+# ── Issue #41: hybrid monotonic-friendly stall check ─────────────────────
+
+
+def test_hybrid_stall_no_raise_on_wall_clock_skew_alone(bridge_path):
+    """Issue #41: laptop suspend/resume defence.
+
+    Simulates the failure mode: SQLite wall clock has jumped FAR forward
+    (julianday('now') - bridge_heartbeat.last_polled_at > HEARTBEAT_STALL_S)
+    while Python's CLOCK_MONOTONIC has NOT advanced by a comparable amount
+    (the macOS suspend behaviour — Python was paused too, so the gap from
+    the previous tick to the current tick is small).
+
+    Under the old single-condition stall predicate, this scenario would
+    spuriously raise BridgeStallError and abandon the cycle on every
+    laptop-resume. The hybrid predicate must NOT raise here — instead it
+    falls through to the suspend/resume branch and continues polling.
+    """
+    # Pre-seed: pretend a PRIOR tick happened recently (so mono_gap measured
+    # at the top of the loop is small) by writing _last_python_tick_monotonic
+    # to "now-1s". This bypasses the first-iteration None-mono_gap branch
+    # and exercises the suspend-resume code path directly.
+    run_id = 300
+    bridge_mod._last_python_tick_monotonic[run_id] = time.monotonic() - 1.0
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=run_id)
+    # SQLite-side: pretend S1's heartbeat is 8 hours stale (28800s) —
+    # WAY past HEARTBEAT_STALL_S=300. This is the wall-clock-skew signal.
+    _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=28800)
+
+    def fake_s1():
+        # S1 is alive again — refresh heartbeat to "now" and mark the
+        # row ready after the wrapper has had ≥1 poll iteration to
+        # observe the suspend signal and reset the deadline.
+        row_id = _wait_for_pending_row(bridge_path, run_id=run_id)
+        # Give the wrapper one full POLL_INTERVAL_S to observe the skew.
+        time.sleep(QueueBridgeWrapper.POLL_INTERVAL_S * 2)
+        _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=0)
+        _mark_row_ready(bridge_path, row_id, {"team_id": "post-resume-team"})
+
+    t = threading.Thread(target=fake_s1, daemon=True)
+    t.start()
+    # Must NOT raise BridgeStallError despite the 8h SQLite-side gap.
+    team_id = wrapper.team_create(name="x", members=[])
+    t.join(timeout=10)
+    assert team_id == "post-resume-team"
+
+
+def test_hybrid_stall_raises_when_both_clocks_agree(bridge_path):
+    """Issue #41 companion: when BOTH the SQLite wall clock gap AND the
+    monotonic gap exceed HEARTBEAT_STALL_S, the predicate raises as before.
+
+    This is the "real S1 stall on a machine that was NOT suspended" case —
+    Python kept ticking the whole time (mono_gap large), and S1 also went
+    silent (julianday gap large). Abandonment is the correct call.
+    """
+    run_id = 301
+    # Pre-seed: pretend a PRIOR tick happened LONG ago (mono_gap will be
+    # large). Combined with the stale bridge_heartbeat below, both clocks
+    # agree → raise.
+    bridge_mod._last_python_tick_monotonic[run_id] = time.monotonic() - 600.0
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=run_id)
+    _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=600)
+    with pytest.raises(BridgeStallError) as exc_info:
+        wrapper.team_create(name="x", members=[])
+    msg = str(exc_info.value)
+    assert "stall" in msg.lower()
+    # Both clocks were reported as contributing to the decision.
+    assert "python monotonic gap" in msg
+
+
+def test_python_monotonic_gap_updated_per_tick(bridge_path):
+    """Issue #41: ``_tick_python_heartbeat`` must update the module-level
+    ``_last_python_tick_monotonic`` entry keyed by run_id on every call —
+    that's the load-bearing side-effect the hybrid stall check depends on.
+    """
+    run_id = 302
+    bridge_mod._last_python_tick_monotonic.pop(run_id, None)
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=run_id)
+    assert run_id not in bridge_mod._last_python_tick_monotonic
+    wrapper._tick_python_heartbeat()
+    first = bridge_mod._last_python_tick_monotonic[run_id]
+    assert isinstance(first, float)
+    time.sleep(0.05)
+    wrapper._tick_python_heartbeat()
+    second = bridge_mod._last_python_tick_monotonic[run_id]
+    assert second > first, "monotonic tick timestamp must strictly increase"
+
+
+def test_first_iteration_after_resume_does_not_raise(bridge_path):
+    """Issue #41 follow-up (SDET review on the #40-#45 bundled PR).
+
+    The cross-cycle suspend-resume scenario the original #41 fix was filed
+    to prevent: a new cycle constructs a FRESH wrapper instance for the
+    same run_id after the laptop resumed from suspend. The bridge_heartbeat
+    row's `last_polled_at` is hours stale (set pre-suspend), but
+    `_last_python_tick_monotonic[run_id]` is empty — this is a fresh
+    wrapper instance, no prior tick to measure a monotonic gap against.
+
+    Under the OLD semantics (`mono_gap is None or mono_gap > stall → raise`)
+    this fresh-wrapper case would spuriously raise BridgeStallError because
+    `mono_gap is None`. Under the FIXED semantics (`mono_gap is not None
+    and mono_gap > stall → raise`) it falls through to the suspend-resume
+    branch, resets the per-call deadline, and continues polling — which is
+    exactly what we want for a fresh resume.
+
+    This test would FAIL on the unfixed (`is None or` short-circuit) code:
+    the wrapper would raise BridgeStallError on the first poll iteration
+    instead of waiting for S1 to come back. Run this test against the
+    pre-fix code to confirm.
+    """
+    run_id = 303
+    # Clear any leftover monotonic tick (defence in depth — fixtures don't
+    # currently scrub this module-level dict; see deferred TODO).
+    bridge_mod._last_python_tick_monotonic.pop(run_id, None)
+    # SQLite-side: heartbeat is 8 hours stale (pre-suspend last_polled_at).
+    _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=8 * 3600)
+    # Fresh wrapper instance — emulates "new cycle constructs a new wrapper".
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=run_id)
+    assert run_id not in bridge_mod._last_python_tick_monotonic, (
+        "pre-condition: fresh wrapper means no prior monotonic tick"
+    )
+
+    # Track that the wrapper actually reached the suspend-resume branch
+    # (i.e. it DID observe the stale heartbeat and DID NOT raise). We
+    # detect this by: (a) S1 ticks the heartbeat back to fresh on the
+    # second iteration, (b) marks the row ready, (c) wrapper returns
+    # cleanly. Plus we cross-check the per-call deadline was extended by
+    # observing the wrapper waited at least one POLL_INTERVAL_S after the
+    # initial stale-heartbeat observation.
+
+    branch_taken = {"observed_stale_then_resumed": False}
+
+    def fake_s1():
+        row_id = _wait_for_pending_row(bridge_path, run_id=run_id)
+        # Give the wrapper a couple of poll iterations so it DEFINITELY
+        # observed the 8h-stale heartbeat at least once. If the wrapper
+        # raised, _wait_for_pending_row already succeeded but the main
+        # thread is about to raise BridgeStallError before this sleep
+        # completes — the test would then fail with the raised exception
+        # propagated.
+        time.sleep(QueueBridgeWrapper.POLL_INTERVAL_S * 2)
+        # S1 came back — refresh heartbeat to now and mark the row ready.
+        _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=0)
+        _mark_row_ready(bridge_path, row_id, {"team_id": "post-resume-team"})
+        branch_taken["observed_stale_then_resumed"] = True
+
+    t = threading.Thread(target=fake_s1, daemon=True)
+    t.start()
+    # Must NOT raise BridgeStallError on the first iteration despite the
+    # 8h-stale SQLite heartbeat — the fresh wrapper has no monotonic
+    # evidence and must default to "treat as suspend-resume, continue".
+    team_id = wrapper.team_create(name="x", members=[])
+    t.join(timeout=10)
+    assert team_id == "post-resume-team"
+    assert branch_taken["observed_stale_then_resumed"], (
+        "fake_s1 path must have run to completion — confirms wrapper "
+        "didn't raise on the first iteration"
+    )
+    # After the call, the wrapper MUST have ticked python_heartbeat at
+    # least once → _last_python_tick_monotonic must now be populated.
+    assert run_id in bridge_mod._last_python_tick_monotonic, (
+        "wrapper should have ticked at least once before returning"
+    )
+
+
+# ── Issue #42: per-cycle outer wall-clock deadline ───────────────────────
+
+
+def test_cycle_wall_constant_default():
+    """Issue #42: pin the module + class CYCLE_WALL_S default at 3600s."""
+    assert bridge_mod.CYCLE_WALL_S == 3600.0
+    assert QueueBridgeWrapper.CYCLE_WALL_S == 3600.0
+
+
+def test_cycle_wall_clock_exceeded_raises_bridge_stall_error(bridge_path, monkeypatch):
+    """Issue #42: when the per-cycle outer wall-clock budget is exceeded,
+    the next ``_request()`` call raises ``BridgeStallError`` carrying
+    'cycle wall-clock exceeded' in the message.
+
+    Drives the deadline trip via a short CYCLE_WALL_S override (10s) and a
+    monkeypatched ``time.monotonic`` that fast-forwards past it. The fake
+    S1 keeps heartbeating so the hybrid stall predicate doesn't fire first.
+    """
+    run_id = 400
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=run_id)
+    # Tighten the budget so the test trips it without simulating an hour.
+    wrapper.CYCLE_WALL_S = 10.0
+    _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=0)
+
+    # Compress wall clock: every monotonic call advances by 5s of simulated
+    # time. After ~2-3 polls the wrapper sees self._cycle_deadline blown
+    # and raises. We keep S1 heartbeating (refreshed inside fake_s1 below)
+    # to ensure the cycle-wall raise — not the stall raise — fires.
+    state = {"sim_elapsed": 0.0}
+    real_monotonic = time.monotonic
+
+    def fake_monotonic():
+        # Advance by 5s of simulated time on every call; this aggregates
+        # past the 10s cycle budget quickly.
+        state["sim_elapsed"] += 5.0
+        return real_monotonic() + state["sim_elapsed"]
+
+    monkeypatch.setattr(bridge_mod.time, "monotonic", fake_monotonic)
+
+    def fake_s1():
+        # Refresh the heartbeat repeatedly so the stall predicate never trips.
+        for _ in range(20):
+            _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=0)
+            time.sleep(0.02)
+
+    t = threading.Thread(target=fake_s1, daemon=True)
+    t.start()
+    with pytest.raises(BridgeStallError) as exc_info:
+        wrapper.team_create(name="x", members=[])
+    t.join(timeout=5)
+    msg = str(exc_info.value)
+    assert "cycle wall-clock exceeded" in msg, (
+        f"expected 'cycle wall-clock exceeded' in error; got: {msg}"
+    )
+    assert "CYCLE_WALL_S=10.0" in msg
+
+
+def test_cycle_deadline_lazy_init_on_first_request(bridge_path):
+    """Issue #42: ``_cycle_deadline`` is None at construction and is set
+    on the first ``_request()`` call. Pre-call inspection must see None;
+    a successful call must leave it populated."""
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=401)
+    assert wrapper._cycle_deadline is None
+    _tick_bridge_heartbeat(bridge_path, run_id=401, at_offset_seconds=0)
+
+    def fake_s1():
+        row_id = _wait_for_pending_row(bridge_path, run_id=401)
+        _mark_row_ready(bridge_path, row_id, {"team_id": "t"})
+
+    t = threading.Thread(target=fake_s1, daemon=True)
+    t.start()
+    wrapper.team_create(name="x", members=[])
+    t.join(timeout=5)
+    assert wrapper._cycle_deadline is not None
+    assert isinstance(wrapper._cycle_deadline, float)
+
+
+def test_reset_cycle_deadline_clears_state(bridge_path):
+    """Issue #42: ``reset_cycle_deadline()`` clears the deadline so a
+    fresh ``CYCLE_WALL_S`` budget starts on the next ``_request()`` call.
+    This is the explicit-reset hook for callers that reuse a wrapper
+    across cycles (the production path uses one wrapper per cycle, so this
+    method is the defensive escape hatch)."""
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=402)
+    _tick_bridge_heartbeat(bridge_path, run_id=402, at_offset_seconds=0)
+
+    def fake_s1_once():
+        row_id = _wait_for_pending_row(bridge_path, run_id=402)
+        _mark_row_ready(bridge_path, row_id, {"team_id": "t1"})
+
+    t = threading.Thread(target=fake_s1_once, daemon=True)
+    t.start()
+    wrapper.team_create(name="x", members=[])
+    t.join(timeout=5)
+    assert wrapper._cycle_deadline is not None
+    wrapper.reset_cycle_deadline()
+    assert wrapper._cycle_deadline is None
+
+    # Second call starts a fresh deadline.
+    def fake_s1_twice():
+        row_id = _wait_for_pending_row(bridge_path, run_id=402)
+        _mark_row_ready(bridge_path, row_id, {"team_id": "t2"})
+
+    t = threading.Thread(target=fake_s1_twice, daemon=True)
+    t.start()
+    wrapper.team_create(name="y", members=[])
+    t.join(timeout=5)
+    assert wrapper._cycle_deadline is not None

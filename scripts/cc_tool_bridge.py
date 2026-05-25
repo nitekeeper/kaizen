@@ -64,6 +64,25 @@ CLEANUP_TIMEOUT_S: float = 120.0
 HEARTBEAT_STALL_S: float = 300.0
 POLL_INTERVAL_S: float = 0.2
 STALE_ROW_S: float = 900.0
+# Per-cycle outer wall-clock deadline. Bounds worst-case bridge time at
+# CYCLE_WALL_S regardless of how many dispatches the cycle issues. Without
+# this, a cycle that issues N requests can in principle block
+# PER_CALL_TIMEOUT_S * N before any single-call timeout fires (e.g., 50 * 600s
+# = 8h). 3600s is generous for legitimate multi-wave cycles but bounds the
+# pathological case. Tripped via `BridgeStallError("cycle wall-clock exceeded")`.
+# Issue #42 / PR review round 1 (architect MINOR finding).
+CYCLE_WALL_S: float = 3600.0
+
+# Module-level table of per-run "last python heartbeat" monotonic timestamps.
+# Keyed by run_id (multiple QueueBridgeWrapper instances in one process may
+# share this table; each updates only its own row). Used by the hybrid stall
+# check to distinguish a wall-clock skew (laptop suspend/resume) from a real
+# S1 stall: julianday('now') can jump 8h ahead of the SQLite-stored
+# bridge_heartbeat row while CLOCK_MONOTONIC (on macOS) does not advance during
+# suspend; tripping BridgeStallError on the julianday signal alone would
+# spuriously abandon every cycle resumed after a laptop close. The hybrid
+# predicate raises only when BOTH gaps exceed HEARTBEAT_STALL_S. Issue #41.
+_last_python_tick_monotonic: dict[int, float] = {}
 
 
 class BridgeError(RuntimeError):
@@ -105,10 +124,19 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
     HEARTBEAT_STALL_S: float = HEARTBEAT_STALL_S
     POLL_INTERVAL_S: float = POLL_INTERVAL_S
     STALE_ROW_S: float = STALE_ROW_S
+    CYCLE_WALL_S: float = CYCLE_WALL_S
 
     def __init__(self, db_path: str | Path, run_id: int):
         self._db_path = Path(db_path)
         self._run_id = int(run_id)
+        # Per-cycle wall-clock deadline; set lazily on the first _request()
+        # call so the deadline measures from first dispatch, not wrapper
+        # construction. reset_cycle_deadline() puts it back to None when a
+        # cycle finalizes and the same wrapper instance is to be reused.
+        # New wrapper instances also start with None — so the production
+        # path (a fresh wrapper per tools_provider() call per cycle) gets
+        # automatic reset by construction. Issue #42.
+        self._cycle_deadline: float | None = None
         # Last-line guard — if a user wired this up bare without going
         # through run_bridged.py, the schema may not exist yet.
         bootstrap(self._db_path)
@@ -275,7 +303,13 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
         completed: set[int] = set()
         placeholders = ",".join("?" for _ in row_ids)
         deadline = time.monotonic() + self.PER_CALL_TIMEOUT_S
+        # Lazy-init per-cycle outer deadline (Issue #42). Mirrors _request.
+        if self._cycle_deadline is None:
+            self._cycle_deadline = time.monotonic() + self.CYCLE_WALL_S
         while True:
+            # Capture monotonic gap BEFORE this iteration's tick — see the
+            # Issue #41 rationale in `_request` for the why.
+            mono_gap = self._python_monotonic_gap()
             self._tick_python_heartbeat()
             con = _connect(self._db_path)
             try:
@@ -332,13 +366,37 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
                 return [r if r is not None else {} for r in results]
 
             # Stall + deadline checks — same shape as _request, just batch-scoped.
+            # Hybrid stall predicate (Issue #41): both clocks must agree.
+            # If `mono_gap is None` (fresh wrapper, no prior monotonic
+            # tick), we have NO monotonic evidence to corroborate the
+            # stall — treat as possible suspend-resume and reset the
+            # deadline rather than abandon. Mirrors `_request`'s logic.
             stall = self._s1_seconds_since_last_poll()
             if stall is not None and stall > self.HEARTBEAT_STALL_S:
+                if mono_gap is not None and mono_gap > self.HEARTBEAT_STALL_S:
+                    pending_ids = [rid for rid in row_ids if rid not in completed]
+                    raise BridgeStallError(
+                        f"S1 heartbeat stalled during send_message_many batch: "
+                        f"last_polled_at is {stall:.1f}s old "
+                        f"(> HEARTBEAT_STALL_S={self.HEARTBEAT_STALL_S}s); "
+                        f"python monotonic gap is "
+                        f"{mono_gap if mono_gap is None else f'{mono_gap:.1f}s'}; "
+                        f"{len(pending_ids)} of {len(row_ids)} rows still pending "
+                        f"(rows={pending_ids})"
+                    )
+                # Suspend/resume detected (or first iteration after a
+                # fresh-wrapper construction with no prior monotonic
+                # tick): reset the per-batch deadline so the suspend
+                # window does not eat into the legitimate per-call budget.
+                deadline = time.monotonic() + self.PER_CALL_TIMEOUT_S
+
+            # Per-cycle outer wall-clock bound (Issue #42).
+            if time.monotonic() >= self._cycle_deadline:
                 pending_ids = [rid for rid in row_ids if rid not in completed]
+                elapsed = time.monotonic() - (self._cycle_deadline - self.CYCLE_WALL_S)
                 raise BridgeStallError(
-                    f"S1 heartbeat stalled during send_message_many batch: "
-                    f"last_polled_at is {stall:.1f}s old "
-                    f"(> HEARTBEAT_STALL_S={self.HEARTBEAT_STALL_S}s); "
+                    f"cycle wall-clock exceeded during send_message_many batch: "
+                    f"{elapsed:.1f}s elapsed (> CYCLE_WALL_S={self.CYCLE_WALL_S}s); "
                     f"{len(pending_ids)} of {len(row_ids)} rows still pending "
                     f"(rows={pending_ids})"
                 )
@@ -373,7 +431,13 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
     def _tick_python_heartbeat(self) -> None:
         """UPSERT `python_heartbeat` for this run. Called on EVERY poll
         tick so S1 can prove Python is alive even when the row Python is
-        waiting on takes a long time to come back."""
+        waiting on takes a long time to come back.
+
+        Also records the current monotonic timestamp into the module-level
+        ``_last_python_tick_monotonic`` table keyed by ``run_id`` — the
+        hybrid stall predicate reads this to distinguish wall-clock skew
+        from real S1 silence (Issue #41).
+        """
         con = _connect(self._db_path)
         try:
             con.execute(
@@ -387,6 +451,7 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
             con.commit()
         finally:
             con.close()
+        _last_python_tick_monotonic[self._run_id] = time.monotonic()
 
     def _s1_seconds_since_last_poll(self) -> float | None:
         """Return wall-clock seconds since S1's last bridge_heartbeat
@@ -397,18 +462,17 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
         — caller _request() treats None as "S1 still booting, assume
         alive" and falls through to the per-call timeout check. A
         present-and-stale heartbeat (row[0] > HEARTBEAT_STALL_S) is
-        the only condition that trips BridgeStallError. Rationale:
+        one of two conditions that trip BridgeStallError; see
+        ``_python_monotonic_gap`` for the second. Rationale:
         on a cold start S1 fires its first bridge_heartbeat UPSERT
         inside the FIRST iteration of the poll loop — there is a
         small window before that first tick where the row simply
         doesn't exist; raising BridgeStallError then would abandon
         every cycle on its first request.
 
-        # TODO(follow-up): wall-clock skew on laptop suspend can make
-        # julianday('now') jump 8h forward while monotonic stays still
-        # — would trip a spurious stall. Out of scope here per the
-        # round-1 review DEFER decision (m4); revisit once we have a
-        # cross-platform monotonic-friendly stall check.
+        This method returns ONLY the julianday-based gap. The caller
+        combines it with ``_python_monotonic_gap`` to gate the stall
+        raise on BOTH clocks (Issue #41 — laptop-suspend skew defence).
         """
         con = _connect(self._db_path)
         try:
@@ -426,6 +490,31 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
         finally:
             con.close()
 
+    def _python_monotonic_gap(self) -> float | None:
+        """Return monotonic seconds since this wrapper last UPSERTed
+        ``python_heartbeat`` (i.e., since the last ``_tick_python_heartbeat``
+        for our run_id), or None if we have not ticked yet.
+
+        The hybrid stall predicate uses this in conjunction with
+        ``_s1_seconds_since_last_poll``: a large julianday gap with a small
+        monotonic gap means the wall-clock skew is local to SQLite's clock
+        (laptop suspend/resume on platforms where CLOCK_MONOTONIC pauses
+        across suspend) — NOT a real S1 stall. See Issue #41.
+        """
+        last = _last_python_tick_monotonic.get(self._run_id)
+        if last is None:
+            return None
+        return time.monotonic() - last
+
+    def reset_cycle_deadline(self) -> None:
+        """Clear the per-cycle outer deadline so the next ``_request()`` call
+        starts a fresh ``CYCLE_WALL_S`` budget. The production path constructs
+        a new wrapper per cycle via ``queue_bridge_provider`` (auto-reset by
+        construction), so this method is the explicit escape hatch for
+        callers that retain a wrapper instance across cycles or for
+        defensive use in cycle finalization (Issue #42)."""
+        self._cycle_deadline = None
+
     def _request(
         self,
         kind: str,
@@ -434,16 +523,33 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
         timeout_s: float | None = None,
     ) -> dict:
         """Enqueue + poll one bridge_requests row. Returns the decoded
-        `response_json` dict (or raises one of the Bridge*Error)."""
-        # TODO(follow-up): per-cycle outer deadline — see review round-1
-        # architect finding. Worst case today is PER_CALL_TIMEOUT_S * (number
-        # of dispatches per cycle), so a 50-call cycle could in principle
-        # block 8h+ before any single-call timeout fires. A `CYCLE_WALL_S`
-        # bound (≈3600s) would cap that. Out of scope for run 21; defer.
+        `response_json` dict (or raises one of the Bridge*Error).
+
+        Cycle wall-clock bound (Issue #42): on the first ``_request()`` call
+        per cycle the wrapper sets ``self._cycle_deadline`` to
+        ``time.monotonic() + CYCLE_WALL_S``. Subsequent calls inherit the
+        same deadline; once exceeded any call raises
+        ``BridgeStallError("cycle wall-clock exceeded")``. The deadline
+        resets when a new wrapper is constructed (the production path) or
+        when ``reset_cycle_deadline()`` is called explicitly.
+        """
         timeout_s = self.PER_CALL_TIMEOUT_S if timeout_s is None else timeout_s
+        # Lazy-initialize the per-cycle outer deadline on first dispatch.
+        if self._cycle_deadline is None:
+            self._cycle_deadline = time.monotonic() + self.CYCLE_WALL_S
         row_id = self._insert(kind, args)
         deadline = time.monotonic() + timeout_s
         while True:
+            # Hybrid stall predicate (Issue #41 — laptop-suspend skew):
+            # capture the monotonic gap BEFORE this iteration's tick so it
+            # reflects elapsed time since the PREVIOUS tick (i.e., one
+            # iteration ago). Normal cadence is ~POLL_INTERVAL_S; a value
+            # exceeding HEARTBEAT_STALL_S means Python was unable to tick
+            # for that long — which is the corroborating signal we need
+            # alongside the SQLite-side julianday gap to distinguish a
+            # genuine S1 stall (Python kept running, S1 stopped) from a
+            # suspend/resume artefact (BOTH paused, neither is "gone").
+            mono_gap = self._python_monotonic_gap()
             self._tick_python_heartbeat()
             status, response_json, error_text = self._poll(row_id)
 
@@ -463,14 +569,49 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
                 )
 
             # status == 'pending': decide whether to keep waiting.
+            # Raise BridgeStallError ONLY when BOTH the SQLite wall-clock
+            # gap AND the monotonic gap (since the prior iteration's tick)
+            # exceed HEARTBEAT_STALL_S. A large julianday gap with a small
+            # monotonic gap is a suspend/resume artefact on platforms where
+            # CLOCK_MONOTONIC pauses across suspend (macOS) — reset the
+            # per-call deadline and keep waiting rather than abandoning.
+            #
+            # If `mono_gap is None` (no prior tick for this run_id — e.g.
+            # a fresh wrapper instance constructed for a new cycle after
+            # the laptop resumed from suspend) we have NO monotonic
+            # evidence to corroborate the stall. The conservative call is
+            # to treat that as a possible suspend-resume and fall through
+            # to the reset-deadline-and-continue branch rather than
+            # abandoning the cycle on a single clock reading (Issue #41 +
+            # SDET review on PR for #40-#45).
             stall = self._s1_seconds_since_last_poll()
-            # When S1 has heartbeated at least once, a stall older than
-            # HEARTBEAT_STALL_S means S1 is gone — raise immediately
-            # rather than waiting out the full per-call timeout.
             if stall is not None and stall > self.HEARTBEAT_STALL_S:
+                if mono_gap is not None and mono_gap > self.HEARTBEAT_STALL_S:
+                    raise BridgeStallError(
+                        f"S1 heartbeat stalled: last_polled_at is "
+                        f"{stall:.1f}s old "
+                        f"(> HEARTBEAT_STALL_S={self.HEARTBEAT_STALL_S}s); "
+                        f"python monotonic gap is "
+                        f"{mono_gap if mono_gap is None else f'{mono_gap:.1f}s'}; "
+                        f"row {row_id} ({kind}) abandoned"
+                    )
+                # Suspend/resume detected (or first iteration after a
+                # fresh-wrapper construction with no prior monotonic
+                # tick): wall clock skewed, but either our monotonic
+                # clock confirms Python was paused too (small mono_gap)
+                # OR we have no monotonic evidence yet (mono_gap is None).
+                # In both cases the safe action is the same — reset the
+                # per-call deadline so the suspend window does not eat
+                # into the legitimate per-call budget, and continue.
+                deadline = time.monotonic() + timeout_s
+
+            # Per-cycle outer wall-clock bound. Applies across all calls in
+            # the cycle; if the aggregate budget is blown, abandon.
+            if time.monotonic() >= self._cycle_deadline:
+                elapsed = time.monotonic() - (self._cycle_deadline - self.CYCLE_WALL_S)
                 raise BridgeStallError(
-                    f"S1 heartbeat stalled: last_polled_at is "
-                    f"{stall:.1f}s old (> HEARTBEAT_STALL_S={self.HEARTBEAT_STALL_S}s); "
+                    f"cycle wall-clock exceeded: {elapsed:.1f}s elapsed "
+                    f"(> CYCLE_WALL_S={self.CYCLE_WALL_S}s); "
                     f"row {row_id} ({kind}) abandoned"
                 )
 

@@ -105,6 +105,38 @@ rm -rf ~/.claude/teams/<team_id>/
 ```
 `TeamDelete` invoked from a fresh session will no-op silently on cross-session orphans (see `feedback-cc-teamdelete-per-session.md`); filesystem removal is the only working path until a `TeamAttach`/`TeamLoad` primitive exists.
 
+## Automated helper
+
+The three-step manual recipe above is also available as a callable Python helper at `scripts/cleanup_orphans.py`. It is a thin driver over the same primitives — `pgrep`, `tmux list-panes`, `tmux kill-pane`, `os.kill`, and `rm -rf` — plus reuses `scripts.sweep_leaked_teams.find_orphan_team_ids` for Layer 3 discovery.
+
+**Default is dry-run.** The CLI enumerates Layer 3 orphan team_ids from the bridge DB without invoking any subprocess. Use this to scope a planned cleanup before pulling the trigger:
+
+```bash
+python3 -m scripts.cleanup_orphans
+```
+
+**Destructive mode requires `--pattern`.** A safety gate raises `ValueError` BEFORE any subprocess call if `--apply` is set without `--pattern`. This is deliberate: an unscoped apply would `pkill`/`tmux kill-pane`/`rm -rf` every Claude teammate on the host, including teammates owned by unrelated live sessions.
+
+```bash
+# Scoped cleanup — preferred form.
+python3 -m scripts.cleanup_orphans --apply --pattern kaizen-cycle-
+```
+
+The `--pattern` substring is matched against:
+- the `--agent-id <name>@<team>` argv of `claude` teammate processes (Layer 1),
+- the team_id directory names under `~/.claude/teams/` (Layer 3).
+
+Layer 2 (panes) is derived from the Layer 1 PID list — never from a pane name filter — so it is automatically scoped by the same pattern.
+
+Library use:
+
+```python
+from scripts.cleanup_orphans import cleanup_orphans
+report = cleanup_orphans(team_id_pattern="kaizen-cycle-", dry_run=False)
+```
+
+The helper covers the same three layers as the manual recipe and emits a per-layer report. Manual `pkill` / `rm -rf` remain useful when you need fine-grained control or when the bridge DB is unavailable.
+
 ## Prevention
 
 Use the GAP-7 `shutdown_request` handshake on every cleanup path. The kaizen bridge wires this in `team_cycle_executor`'s finally block via `tools.send_message_many` immediately before `tools.team_delete`. See `docs/design/python-cc-tool-bridge-design.md` section "Leaked-team recovery (Rev 3, GAP-7 addendum 2026-05-24)" for the protocol and best-effort failure semantics.

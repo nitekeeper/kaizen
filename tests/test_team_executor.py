@@ -141,7 +141,7 @@ def _patch_ci_green(monkeypatch):
 
     def fake_run_ci_checks(clone_dir, test_command):
         calls.append((clone_dir, test_command))
-        return True, {"tests": (True, "ok")}
+        return True, {"tests": {"status": "pass", "output": "ok"}}
 
     monkeypatch.setattr(team_executor_mod, "run_ci_checks", fake_run_ci_checks)
     return calls
@@ -591,7 +591,7 @@ class TestPhase4Waves:
         """A red CI at a wave boundary abandons phase=test reason=tests_unrecoverable."""
 
         def fake_ci(clone_dir, test_command):
-            return False, {"tests": (False, "boom")}
+            return False, {"tests": {"status": "fail", "output": "boom"}}
 
         monkeypatch.setattr(team_executor_mod, "run_ci_checks", fake_ci)
         _patch_phase5c(monkeypatch)

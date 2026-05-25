@@ -1,45 +1,67 @@
-"""Tests for scripts/ci_runner.py — target-repo CI mirror."""
+"""Tests for scripts/ci_runner.py — target-repo CI mirror.
+
+These tests stub ``subprocess.run`` so the real Bandit / pip-audit / ruff /
+pytest binaries are never invoked. The goal is to verify the dispatch logic
+(detection + opt-in + exit-code handling + skip-reason wording), not the
+behavior of the third-party tools themselves.
+"""
 
 from __future__ import annotations
 
-from scripts.ci_runner import _has_ruff_config, run_ci_checks
+import subprocess as real_subprocess
+import types
+
+from scripts import ci_runner
+from scripts.ci_runner import (
+    _bandit_config_path,
+    _has_ruff_config,
+    _pip_audit_referenced_in_workflows,
+    run_ci_checks,
+)
 
 
-def test_no_ruff_config_skips_lint_with_warning(tmp_path):
-    """When the target has no ruff config, lint is skipped and a warning is logged."""
+def _mk_completed(returncode: int = 0, stdout: str = "", stderr: str = ""):
+    """Build a CompletedProcess stand-in without re-running anything."""
+    return real_subprocess.CompletedProcess(
+        args=[], returncode=returncode, stdout=stdout, stderr=stderr
+    )
+
+
+# ── existing ruff/lint behavior (preserved across the shape migration) ────
+
+
+def test_no_ruff_config_skips_lint_with_warning(tmp_path, monkeypatch):
+    """When the target has no ruff config, lint is skipped with status=skip."""
     clone = tmp_path / "fake_clone"
     clone.mkdir()
-    # Create a minimal pyproject without [tool.ruff]; tests must run though.
     (clone / "pyproject.toml").write_text('[project]\nname = "fake"\n')
-    # Stub a test command that always passes.
+    monkeypatch.setattr(ci_runner.subprocess, "run", lambda *a, **kw: _mk_completed(0, "ok", ""))
     all_passed, results = run_ci_checks(clone, "true")
     assert all_passed is True
     assert "tests" in results
     assert "lint_warning" in results
+    assert results["lint_warning"]["status"] == "skip"
+    assert results["lint_warning"]["reason"] == "no_ruff_config"
     assert "ruff_check" not in results
     assert "ruff_format" not in results
-    warning_text = results["lint_warning"][1]
-    assert "No ruff config detected" in warning_text
+    assert "No ruff config detected" in results["lint_warning"]["output"]
 
 
-def test_ruff_config_runs_check_and_format(tmp_path):
-    """When the target has [tool.ruff] in pyproject.toml, both ruff checks run."""
+def test_ruff_config_runs_check_and_format(tmp_path, monkeypatch):
+    """When [tool.ruff] is present, both ruff_check and ruff_format run."""
     clone = tmp_path / "fake_clone"
     clone.mkdir()
     (clone / "pyproject.toml").write_text(
         '[project]\nname = "fake"\n\n[tool.ruff]\nline-length = 100\n'
     )
-    # Add a syntactically valid, ruff-clean python file so both checks pass.
-    (clone / "hello.py").write_text('print("hi")\n')
+    monkeypatch.setattr(ci_runner.subprocess, "run", lambda *a, **kw: _mk_completed(0, "", ""))
     _all_passed, results = run_ci_checks(clone, "true")
     assert "tests" in results
     assert "ruff_check" in results
     assert "ruff_format" in results
     assert "lint_warning" not in results
-    # All should pass against a trivially-clean file.
-    assert results["tests"][0] is True
-    # Note: ruff_check and ruff_format may pass or fail depending on the specific
-    # ruff config + file contents; we only assert they were attempted.
+    assert results["ruff_check"]["status"] == "pass"
+    assert results["ruff_format"]["status"] == "pass"
 
 
 def test_has_ruff_config_detects_ruff_toml(tmp_path):
@@ -53,31 +75,309 @@ def test_has_ruff_config_detects_ruff_toml(tmp_path):
 def test_ruff_missing_returns_failed_result_not_exception(tmp_path, monkeypatch):
     """Safety F1.3: ruff binary absent must produce a failed check result,
     not crash the cycle with FileNotFoundError."""
-    import subprocess as real_subprocess
-
-    from scripts import ci_runner
-
     clone = tmp_path / "fake_clone"
     clone.mkdir()
     (clone / "pyproject.toml").write_text(
         '[project]\nname = "fake"\n\n[tool.ruff]\nline-length = 100\n'
     )
 
-    original_run = real_subprocess.run
-
     def fake_run(argv, *args, **kwargs):
-        # Let the test command ("true") run normally; simulate ruff absent.
         if argv and argv[0] == "ruff":
             raise FileNotFoundError(2, "No such file or directory: 'ruff'")
-        return original_run(argv, *args, **kwargs)
+        return _mk_completed(0, "ok", "")
 
     monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
 
-    all_passed, results = ci_runner.run_ci_checks(clone, "true")
-    # Should not crash. Both ruff checks should be present with passed=False.
+    all_passed, results = run_ci_checks(clone, "true")
     assert "ruff_check" in results
     assert "ruff_format" in results
-    assert results["ruff_check"][0] is False
-    assert results["ruff_format"][0] is False
-    assert "ruff binary not found" in results["ruff_check"][1]
+    assert results["ruff_check"]["status"] == "fail"
+    assert results["ruff_format"]["status"] == "fail"
+    assert results["ruff_check"]["reason"] == "ruff_binary_missing"
+    assert "ruff binary not found" in results["ruff_check"]["output"]
     assert all_passed is False
+
+
+# ── Bandit detection ──────────────────────────────────────────────────────
+
+
+def test_bandit_config_detected_via_bandit_yaml(tmp_path):
+    clone = tmp_path / "c"
+    clone.mkdir()
+    (clone / "bandit.yaml").write_text("skips: []\n")
+    cfg = _bandit_config_path(clone)
+    assert cfg is not None
+    assert cfg.name == "bandit.yaml"
+
+
+def test_bandit_config_detected_via_bandit_yml(tmp_path):
+    clone = tmp_path / "c"
+    clone.mkdir()
+    (clone / "bandit.yml").write_text("skips: []\n")
+    cfg = _bandit_config_path(clone)
+    assert cfg is not None
+    assert cfg.name == "bandit.yml"
+
+
+def test_bandit_config_detected_via_dot_bandit(tmp_path):
+    clone = tmp_path / "c"
+    clone.mkdir()
+    (clone / ".bandit").write_text("[bandit]\nskips: B101\n")
+    cfg = _bandit_config_path(clone)
+    assert cfg is not None
+    assert cfg.name == ".bandit"
+
+
+def test_bandit_config_detected_via_pyproject_section(tmp_path):
+    clone = tmp_path / "c"
+    clone.mkdir()
+    (clone / "pyproject.toml").write_text(
+        '[project]\nname = "x"\n[tool.bandit]\nskips = ["B101"]\n'
+    )
+    cfg = _bandit_config_path(clone)
+    assert cfg is not None
+    assert cfg.name == "pyproject.toml"
+
+
+def test_bandit_no_config_returns_none(tmp_path):
+    clone = tmp_path / "c"
+    clone.mkdir()
+    (clone / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    assert _bandit_config_path(clone) is None
+
+
+# ── Bandit dispatch + exit-code handling ──────────────────────────────────
+
+
+def _setup_bandit_only_clone(tmp_path):
+    """Build a clone where only Bandit is opted in (no ruff, no pip-audit)."""
+    clone = tmp_path / "c"
+    clone.mkdir()
+    (clone / "bandit.yaml").write_text("skips: []\n")
+    return clone
+
+
+def _patch_subprocess_for_bandit(monkeypatch, bandit_rc: int):
+    """Patch subprocess so Bandit returns ``bandit_rc``; everything else 0."""
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "bandit":
+            return _mk_completed(bandit_rc, f"bandit stdout rc={bandit_rc}", "")
+        return _mk_completed(0, "", "")
+
+    monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
+
+
+def test_bandit_exit_0_is_pass(tmp_path, monkeypatch):
+    clone = _setup_bandit_only_clone(tmp_path)
+    _patch_subprocess_for_bandit(monkeypatch, 0)
+    monkeypatch.setenv("KAIZEN_SKIP_PIP_AUDIT", "1")
+    all_passed, results = run_ci_checks(clone, "true")
+    assert results["bandit"]["status"] == "pass"
+    assert "reason" not in results["bandit"]
+    assert all_passed is True
+
+
+def test_bandit_exit_1_is_fail_findings(tmp_path, monkeypatch):
+    """Exit code 1 = real Bandit findings — fail with reason 'bandit_findings'."""
+    clone = _setup_bandit_only_clone(tmp_path)
+    _patch_subprocess_for_bandit(monkeypatch, 1)
+    monkeypatch.setenv("KAIZEN_SKIP_PIP_AUDIT", "1")
+    all_passed, results = run_ci_checks(clone, "true")
+    assert results["bandit"]["status"] == "fail"
+    assert results["bandit"]["reason"] == "bandit_findings"
+    assert all_passed is False
+
+
+def test_bandit_exit_2_is_fail_config_error(tmp_path, monkeypatch):
+    """Exit code 2 = Bandit config file invalid — fail with distinct reason."""
+    clone = _setup_bandit_only_clone(tmp_path)
+    _patch_subprocess_for_bandit(monkeypatch, 2)
+    monkeypatch.setenv("KAIZEN_SKIP_PIP_AUDIT", "1")
+    all_passed, results = run_ci_checks(clone, "true")
+    assert results["bandit"]["status"] == "fail"
+    assert results["bandit"]["reason"] == "bandit_config_error"
+    # Confirm config-error reason is NOT conflated with findings reason.
+    assert results["bandit"]["reason"] != "bandit_findings"
+    assert all_passed is False
+
+
+def test_bandit_unexpected_exit_code_named(tmp_path, monkeypatch):
+    """Exit codes other than 0/1/2 fail with a reason naming the code."""
+    clone = _setup_bandit_only_clone(tmp_path)
+    _patch_subprocess_for_bandit(monkeypatch, 137)
+    monkeypatch.setenv("KAIZEN_SKIP_PIP_AUDIT", "1")
+    _all_passed, results = run_ci_checks(clone, "true")
+    assert results["bandit"]["status"] == "fail"
+    assert results["bandit"]["reason"] == "bandit_unexpected_exit_137"
+
+
+def test_no_bandit_config_skipped_with_reason(tmp_path, monkeypatch):
+    clone = tmp_path / "c"
+    clone.mkdir()
+    (clone / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    monkeypatch.setattr(ci_runner.subprocess, "run", lambda *a, **kw: _mk_completed(0, "", ""))
+    monkeypatch.setenv("KAIZEN_SKIP_PIP_AUDIT", "1")
+    all_passed, results = run_ci_checks(clone, "true")
+    assert results["bandit"]["status"] == "skip"
+    assert results["bandit"]["reason"] == "no_bandit_config"
+    assert "No Bandit config detected" in results["bandit"]["output"]
+    # Skip never counts as a failure.
+    assert all_passed is True
+
+
+def test_bandit_binary_missing_is_named_fail(tmp_path, monkeypatch):
+    clone = _setup_bandit_only_clone(tmp_path)
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "bandit":
+            raise FileNotFoundError(2, "No such file or directory: 'bandit'")
+        return _mk_completed(0, "", "")
+
+    monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
+    monkeypatch.setenv("KAIZEN_SKIP_PIP_AUDIT", "1")
+    _all_passed, results = run_ci_checks(clone, "true")
+    assert results["bandit"]["status"] == "fail"
+    assert results["bandit"]["reason"] == "bandit_binary_missing"
+
+
+# ── pip-audit detection + dispatch ────────────────────────────────────────
+
+
+def test_pip_audit_referenced_in_workflow_yaml(tmp_path):
+    clone = tmp_path / "c"
+    (clone / ".github" / "workflows").mkdir(parents=True)
+    (clone / ".github" / "workflows" / "ci.yml").write_text(
+        "jobs:\n  audit:\n    steps:\n      - run: pip-audit\n"
+    )
+    assert _pip_audit_referenced_in_workflows(clone) is True
+
+
+def test_pip_audit_not_referenced_returns_false(tmp_path):
+    clone = tmp_path / "c"
+    (clone / ".github" / "workflows").mkdir(parents=True)
+    (clone / ".github" / "workflows" / "ci.yml").write_text(
+        "jobs:\n  test:\n    steps:\n      - run: pytest\n"
+    )
+    assert _pip_audit_referenced_in_workflows(clone) is False
+
+
+def test_pip_audit_no_workflow_dir_returns_false(tmp_path):
+    clone = tmp_path / "c"
+    clone.mkdir()
+    assert _pip_audit_referenced_in_workflows(clone) is False
+
+
+def test_pip_audit_dispatched_when_workflow_mentions_it(tmp_path, monkeypatch):
+    """Workflow opts in via the literal 'pip-audit' string → check runs."""
+    clone = tmp_path / "c"
+    (clone / ".github" / "workflows").mkdir(parents=True)
+    (clone / ".github" / "workflows" / "ci.yml").write_text(
+        "jobs:\n  a:\n    steps:\n      - run: pip-audit --strict\n"
+    )
+
+    invoked: list[list[str]] = []
+
+    def fake_run(argv, *args, **kwargs):
+        invoked.append(list(argv))
+        if argv and argv[0] == "pip-audit":
+            return _mk_completed(0, "no vulns", "")
+        return _mk_completed(0, "", "")
+
+    monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
+    monkeypatch.delenv("KAIZEN_SKIP_PIP_AUDIT", raising=False)
+    all_passed, results = run_ci_checks(clone, "true")
+    assert ["pip-audit"] in invoked
+    assert results["pip_audit"]["status"] == "pass"
+    assert all_passed is True
+
+
+def test_pip_audit_fail_when_exit_nonzero(tmp_path, monkeypatch):
+    clone = tmp_path / "c"
+    (clone / ".github" / "workflows").mkdir(parents=True)
+    (clone / ".github" / "workflows" / "ci.yml").write_text("run: pip-audit\n")
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "pip-audit":
+            return _mk_completed(1, "CVE-XXXX-YYYY", "")
+        return _mk_completed(0, "", "")
+
+    monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
+    monkeypatch.delenv("KAIZEN_SKIP_PIP_AUDIT", raising=False)
+    all_passed, results = run_ci_checks(clone, "true")
+    assert results["pip_audit"]["status"] == "fail"
+    assert results["pip_audit"]["reason"] == "pip_audit_exit_1"
+    assert "CVE" in results["pip_audit"]["output"]
+    assert all_passed is False
+
+
+def test_pip_audit_skipped_when_no_workflow_reference(tmp_path, monkeypatch):
+    clone = tmp_path / "c"
+    clone.mkdir()
+    monkeypatch.setattr(ci_runner.subprocess, "run", lambda *a, **kw: _mk_completed(0, "", ""))
+    monkeypatch.delenv("KAIZEN_SKIP_PIP_AUDIT", raising=False)
+    all_passed, results = run_ci_checks(clone, "true")
+    assert results["pip_audit"]["status"] == "skip"
+    assert results["pip_audit"]["reason"] == "no_pip_audit_in_workflows"
+    assert all_passed is True
+
+
+def test_pip_audit_opt_out_via_env_var(tmp_path, monkeypatch):
+    """KAIZEN_SKIP_PIP_AUDIT=1 must skip even when workflows opt in."""
+    clone = tmp_path / "c"
+    (clone / ".github" / "workflows").mkdir(parents=True)
+    (clone / ".github" / "workflows" / "ci.yml").write_text("run: pip-audit\n")
+
+    invoked: list[list[str]] = []
+
+    def fake_run(argv, *args, **kwargs):
+        invoked.append(list(argv))
+        return _mk_completed(0, "", "")
+
+    monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
+    monkeypatch.setenv("KAIZEN_SKIP_PIP_AUDIT", "1")
+    all_passed, results = run_ci_checks(clone, "true")
+    assert results["pip_audit"]["status"] == "skip"
+    assert results["pip_audit"]["reason"] == "opted out via KAIZEN_SKIP_PIP_AUDIT"
+    # Crucially, pip-audit must NOT have been invoked.
+    assert not any(call and call[0] == "pip-audit" for call in invoked)
+    assert all_passed is True
+
+
+def test_pip_audit_binary_missing_named_fail(tmp_path, monkeypatch):
+    clone = tmp_path / "c"
+    (clone / ".github" / "workflows").mkdir(parents=True)
+    (clone / ".github" / "workflows" / "ci.yml").write_text("run: pip-audit\n")
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "pip-audit":
+            raise FileNotFoundError(2, "No such file or directory: 'pip-audit'")
+        return _mk_completed(0, "", "")
+
+    monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
+    monkeypatch.delenv("KAIZEN_SKIP_PIP_AUDIT", raising=False)
+    _all_passed, results = run_ci_checks(clone, "true")
+    assert results["pip_audit"]["status"] == "fail"
+    assert results["pip_audit"]["reason"] == "pip_audit_binary_missing"
+
+
+# ── result-shape contract (uniform across all checks) ─────────────────────
+
+
+def test_all_results_use_uniform_dict_shape(tmp_path, monkeypatch):
+    """Every check's result is a dict with 'status' and 'output' keys."""
+    clone = tmp_path / "c"
+    clone.mkdir()
+    (clone / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    monkeypatch.setattr(ci_runner.subprocess, "run", lambda *a, **kw: _mk_completed(0, "", ""))
+    monkeypatch.setenv("KAIZEN_SKIP_PIP_AUDIT", "1")
+    _all_passed, results = run_ci_checks(clone, "true")
+    for name, r in results.items():
+        assert isinstance(r, dict), f"{name} result is not a dict: {type(r)}"
+        assert "status" in r, f"{name} missing status"
+        assert r["status"] in ("pass", "fail", "skip"), f"{name} bad status {r['status']}"
+        assert "output" in r, f"{name} missing output"
+
+
+# Sentinel: keep linter happy about an otherwise-unused import.
+assert isinstance(types.ModuleType, type)

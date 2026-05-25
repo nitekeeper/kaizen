@@ -248,7 +248,7 @@ def test_bandit_binary_missing_returns_skip(tmp_path, monkeypatch):
     assert all_passed is True
 
 
-def test_bandit_opt_out_via_KAIZEN_SKIP_BANDIT_env(tmp_path, monkeypatch):
+def test_bandit_opt_out_via_KAIZEN_SKIP_CHECKS_env(tmp_path, monkeypatch):
     """F2/F11 (audit cleanup): KAIZEN_SKIP_CHECKS=bandit short-circuits the
     branch entirely — bandit is never invoked even when the target opts in
     via a config file."""

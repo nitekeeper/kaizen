@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+from scripts._tmux_config import (
+    CONFIG_BLOCK,
+    MARKER_VERSION,
+    apply_config_block,
+    detect_existing_marker,
+    show_diff,
+)
 from scripts.migrate import apply_migrations
 from scripts.seed_atelier_in_clone import find_atelier_root
 
@@ -119,6 +127,107 @@ def print_results(checks: list[DepCheck]) -> None:
             print(_safe(f"       fix: {c.fix}"))
 
 
+def _locate_tmux_conf() -> Path:
+    """Return the path setup should target for tmux.conf.
+
+    Prefers ``~/.tmux.conf`` (the canonical location). Falls back to
+    ``~/.config/tmux/tmux.conf`` if THAT file exists and the canonical
+    one does not — this matches the XDG-style layout some users adopt.
+    Returns the canonical path when neither exists (so the "create new"
+    branch in the consent flow proposes ``~/.tmux.conf``, which is what
+    tmux looks for first).
+    """
+    home = Path(os.path.expanduser("~"))
+    canonical = home / ".tmux.conf"
+    xdg = home / ".config" / "tmux" / "tmux.conf"
+    if canonical.exists():
+        return canonical
+    if xdg.exists():
+        return xdg
+    return canonical
+
+
+def _prompt_yes(question: str) -> bool:
+    """Prompt the user for Y/n; default is yes. Standardised wrapper."""
+    try:
+        ans = input(question).strip().lower()
+    except EOFError:
+        # Non-interactive stdin → default to "no" so unattended runs never
+        # write to a user's tmux.conf without consent.
+        return False
+    return ans in ("", "y", "yes")
+
+
+def _check_tmux_config() -> None:
+    """Interactive consent flow for installing the agent-teams tmux block.
+
+    Idempotent: a second invocation when the file already carries the
+    current marker version is a single info-line no-op. See
+    scripts/_tmux_config.py for the block content and helpers.
+    """
+    tmux_conf = _locate_tmux_conf()
+    # Branch 1: file missing → offer to create.
+    if not tmux_conf.exists():
+        print(f"\nagent-teams tmux config: tmux.conf not found at {tmux_conf}.")
+        print("Proposed block to install:\n")
+        print(CONFIG_BLOCK)
+        if _prompt_yes(f"Create {tmux_conf} with the agent-teams block? (Y/n) "):
+            apply_config_block(tmux_conf, MARKER_VERSION)
+            print(f"Created {tmux_conf} with v{MARKER_VERSION} block.")
+        else:
+            print("Skipped; you can re-run setup later.")
+        return
+
+    # The remaining branches depend on whether a marker is already present.
+    try:
+        existing_version = detect_existing_marker(tmux_conf)
+    except ValueError as exc:
+        # Malformed marker — surface but don't crash setup.
+        print(f"\nagent-teams tmux config: WARNING — {exc}")
+        print("Skipping tmux setup; please remove the malformed marker by hand.")
+        return
+
+    # Branch 2: file exists, no marker → offer to append.
+    if existing_version is None:
+        print(f"\nagent-teams tmux config: not yet installed in {tmux_conf}.")
+        print("The following block will be appended:\n")
+        print(CONFIG_BLOCK)
+        if _prompt_yes("Apply now? (Y/n) "):
+            apply_config_block(tmux_conf, MARKER_VERSION)
+            print(f"Appended v{MARKER_VERSION} block to {tmux_conf}.")
+        else:
+            print("Skipped.")
+        return
+
+    # Branch 3: file exists, marker at current version → silent info line.
+    if existing_version == MARKER_VERSION:
+        print(f"agent-teams tmux config: up-to-date (v{existing_version})")
+        return
+
+    # Branch 4: file exists, marker older than current → offer to update.
+    while True:
+        print(
+            f"\nagent-teams tmux config v{existing_version} → v{MARKER_VERSION} "
+            f"available in {tmux_conf}."
+        )
+        try:
+            ans = input("Update? (Y/n) [d to show diff] ").strip().lower()
+        except EOFError:
+            print(f"Kept v{existing_version}; re-run setup to update later.")
+            return
+        if ans == "d":
+            print()
+            print(show_diff(tmux_conf, MARKER_VERSION))
+            continue
+        if ans in ("", "y", "yes"):
+            apply_config_block(tmux_conf, MARKER_VERSION)
+            print(f"Updated {tmux_conf} from v{existing_version} to v{MARKER_VERSION}.")
+            return
+        # Anything else = decline.
+        print(f"Kept v{existing_version}; re-run setup to update later.")
+        return
+
+
 def run_setup() -> int:
     checks = verify_all()
     print_results(checks)
@@ -132,6 +241,13 @@ def run_setup() -> int:
     except ValueError:
         rel = DB_PATH
     print(f"Database migrations applied to {rel}")
+    # T2 (audit cleanup): offer to install the shared agent-teams tmux
+    # config block. Idempotent + consent-gated; safe to call on every run.
+    try:
+        _check_tmux_config()
+    except Exception as exc:
+        # Don't fail setup on a tmux-config issue — the user's DB is fine.
+        print(f"agent-teams tmux config check failed: {exc}")
     return 0
 
 

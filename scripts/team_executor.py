@@ -102,6 +102,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from scripts._tmux_workspace import apply_main_vertical_layout, set_pane_title
 from scripts.ci_runner import run_ci_checks
 from scripts.cycle_git import commit_cycle
 from scripts.dag import validate_dag
@@ -483,6 +484,51 @@ def _diff_ci_results(
     return cycle_introduced, pre_existing
 
 
+# ── Post-spawn tmux helpers ────────────────────────────────────────────────
+#
+# T3/T4 (audit cleanup): kaizen launches teammates into a tmux workspace
+# via the Agent Teams API. The default tmux layout is "tiled" and panes
+# have anonymous titles, which makes it hard to follow a multi-wave cycle
+# at a glance. We apply main-vertical layout + per-pane titles ("[w1]
+# backend-engineer-1") once per wave so the visual surface mirrors the
+# logical structure.
+#
+# PER-WAVE: after every Agent.spawn batch (i.e. once team-mode actually
+# materialises the panes for the teammates we just SendMessage'd), call
+# `_post_spawn_tmux_setup(team_name, wave_n, agents)` once per wave to
+# promote the lead architect to the main pane and rename each teammate's
+# pane with its wave tag. The exact firing point may need refinement
+# once we see real CC team-mode spawn timing — for now we fire it once
+# per wave at the START of the wave, after the wave's dispatch loop
+# enters but BEFORE the first SendMessage. Tmux hooks tolerate the case
+# where the workspace doesn't exist yet (no-op on "no server running").
+
+_MAIN_AGENT_PREFERENCE = ("agent-systems-architect-1", "software-architect-1", "pm-1")
+
+
+def _post_spawn_tmux_setup(team_name: str, wave_n: int, agents: list[str]) -> None:
+    """Apply main-vertical layout + per-pane titles for the given wave.
+
+    Selects the first preferred main-agent that appears in ``agents`` so
+    the lead architect/PM ends up in the main pane. ``agents`` is the
+    list of role ids that just had a SendMessage delivered for this wave;
+    typically the owners of every Action Item in the wave.
+
+    Tolerant of "no tmux server running" / "workspace missing" — both
+    helpers return early in those cases without raising.
+    """
+    main_agent = ""
+    for candidate in _MAIN_AGENT_PREFERENCE:
+        if candidate in agents:
+            main_agent = candidate
+            break
+    if not main_agent and agents:
+        main_agent = agents[0]
+    apply_main_vertical_layout(workspace_name=team_name, main_agent=main_agent)
+    for name in agents:
+        set_pane_title(workspace_name=team_name, agent_name=name, wave_n=wave_n)
+
+
 # ── Main entry point ───────────────────────────────────────────────────────
 
 
@@ -814,6 +860,16 @@ def team_cycle_executor(
         if not outcome_acc.abandoned and waves:
             items_by_id = {item["id"]: item for item in action_items}
             for wave_n, wave_ids in enumerate(waves, start=1):
+                # T4: collect the wave's owners up-front so the tmux hook
+                # can rename their panes and promote a main agent. Order
+                # mirrors wave_ids so the visual order matches the DAG order.
+                wave_owners = [items_by_id[ai_id].get("owner") or pm for ai_id in wave_ids]
+                # T3/T4: best-effort tmux layout/title hook. Tolerant of
+                # "no server running" — never raises. Fires once per wave.
+                try:
+                    _post_spawn_tmux_setup(team_name=team_name, wave_n=wave_n, agents=wave_owners)
+                except Exception as tmux_exc:  # pragma: no cover - defensive
+                    _log.warning("post-spawn tmux setup failed: %s", tmux_exc)
                 wave_abandoned = False
                 for ai_id in wave_ids:
                     item = items_by_id[ai_id]

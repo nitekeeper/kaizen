@@ -18,6 +18,7 @@ string. One test per template for clear failure messages.
 from __future__ import annotations
 
 from scripts.dispatch_templates import (
+    _TESTS_STATUS_REPLY_SUFFIX,
     TEAMMATE_REPLY_RULE,
     phase_1_agenda,
     phase_2_preanalysis,
@@ -38,6 +39,10 @@ from scripts.fix_loop import Finding
 # phase_5b_ci_failure, which is an abandonment-detail formatter, not a
 # teammate dispatch).
 _RULE = TEAMMATE_REPLY_RULE
+# F9 (audit cleanup): phase_4_implementer and phase_5b_prime_fix carry an
+# additional per-phase reply-format suffix so the implementer always tells
+# team-lead whether pytest passes after the edit.
+_TESTS_SUFFIX = _TESTS_STATUS_REPLY_SUFFIX
 
 
 def _canonical_finding() -> Finding:
@@ -102,7 +107,10 @@ def test_phase_3_close_golden():
         "Action Item dicts. Each dict must have keys: id (str), touches "
         "(list[str]), reads (list[str]), depends_on (list[str]), "
         "wave (int), owner (str role id). "
-        "Prefix 'ABANDON:' if no DAG can be agreed." + _RULE
+        "Prefix 'ABANDON:' if no DAG can be agreed. "
+        "For each file in `touches`, include any corresponding test file "
+        "in `reads` (e.g. `tests/test_X.py` for `src/X.py` or "
+        "`scripts/X.py`)." + _RULE
     )
 
 
@@ -114,7 +122,11 @@ def test_phase_4_implementer_golden():
         "You own this item. Touches: ['foo.py']; "
         "reads: ['bar.py']. Apply the change to disk in the "
         "clone and reply with a one-line summary of what you did. "
-        "Prefix 'ABANDON:' if the change cannot be applied." + _RULE
+        "Prefix 'ABANDON:' if the change cannot be applied. "
+        "Before editing, list the directory containing each `touches` "
+        "path. Read any neighbor file that shares a prefix or suffix "
+        "with your target (e.g. `001_*.sql`, `002_*.sql` when touching "
+        "`003_*.sql`) so your change matches existing style." + _RULE + _TESTS_SUFFIX
     )
 
 
@@ -141,7 +153,10 @@ def test_phase_5b_prime_fix_golden():
     assert out == (
         "Phase 5b' fix — address finding R1-1 (blocker) at foo.py:1: "
         "issue text. Apply the fix and reply with a one-line confirmation. "
-        "Prefix 'ABANDON:' if the fix cannot be applied." + _RULE
+        "Prefix 'ABANDON:' if the fix cannot be applied. "
+        "If your fix changes a contract that tests assert on, update "
+        "those tests in the same change. Report whether `pytest` still "
+        "passes locally." + _RULE + _TESTS_SUFFIX
     )
 
 

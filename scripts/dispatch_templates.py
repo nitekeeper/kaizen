@@ -122,6 +122,20 @@ _SHUTDOWN_RULE = (
 
 TEAMMATE_REPLY_RULE = _REPLY_RULE + _SHUTDOWN_RULE
 
+# F9 (audit cleanup): per-phase reply-format suffix used by the two templates
+# whose replies REALLY need to surface test/lint status before team-lead can
+# proceed (phase_4_implementer and phase_5b_prime_fix). Kept as a separate
+# suffix so the global TEAMMATE_REPLY_RULE stays unchanged and the byte-
+# identity goldens for the other 8 templates keep passing.
+_TESTS_STATUS_REPLY_SUFFIX = (
+    "\n\nIMPORTANT — Reply format: your SendMessage body MUST begin with "
+    "either `OK:` (change applied cleanly) or `BLOCKED:` (you could not "
+    "complete the change). It MUST also include a one-line "
+    "`tests: pass | fail | not-run` tag stating whether `pytest` still "
+    "passes locally after your edit (use `not-run` only if running pytest "
+    "is impossible from where you sit)."
+)
+
 
 def _require(name: str, value: Any, type_: type) -> None:
     """Validate a required kwarg is present, well-typed, and non-empty.
@@ -204,7 +218,14 @@ def phase_3_close(*, proposals: list[dict], agreements: list[dict]) -> str:
         "Action Item dicts. Each dict must have keys: id (str), touches "
         "(list[str]), reads (list[str]), depends_on (list[str]), "
         "wave (int), owner (str role id). "
-        "Prefix 'ABANDON:' if no DAG can be agreed."
+        "Prefix 'ABANDON:' if no DAG can be agreed. "
+        # F8 (audit cleanup): for each file in `touches`, include the
+        # corresponding test file in `reads` so implementers in Phase 4
+        # can update tests in the same change (mocks-must-match-reality
+        # rule: a touched contract must travel with its tests).
+        "For each file in `touches`, include any corresponding test file "
+        "in `reads` (e.g. `tests/test_X.py` for `src/X.py` or "
+        "`scripts/X.py`)."
     ) + TEAMMATE_REPLY_RULE
 
 
@@ -213,12 +234,23 @@ def phase_4_implementer(*, item: dict, wave_n: int) -> str:
     _require("item", item, dict)
     _require("wave_n", wave_n, int)
     return (
-        f"Phase 4 wave {wave_n} — implement Action Item {item['id']}. "
-        f"You own this item. Touches: {item.get('touches')}; "
-        f"reads: {item.get('reads')}. Apply the change to disk in the "
-        "clone and reply with a one-line summary of what you did. "
-        "Prefix 'ABANDON:' if the change cannot be applied."
-    ) + TEAMMATE_REPLY_RULE
+        (
+            f"Phase 4 wave {wave_n} — implement Action Item {item['id']}. "
+            f"You own this item. Touches: {item.get('touches')}; "
+            f"reads: {item.get('reads')}. Apply the change to disk in the "
+            "clone and reply with a one-line summary of what you did. "
+            "Prefix 'ABANDON:' if the change cannot be applied. "
+            # F7 (audit cleanup): tell the implementer to list the parent
+            # directory and read any prefix/suffix neighbour so the change
+            # matches surrounding style (numbered migration files etc).
+            "Before editing, list the directory containing each `touches` "
+            "path. Read any neighbor file that shares a prefix or suffix "
+            "with your target (e.g. `001_*.sql`, `002_*.sql` when touching "
+            "`003_*.sql`) so your change matches existing style."
+        )
+        + TEAMMATE_REPLY_RULE
+        + _TESTS_STATUS_REPLY_SUFFIX
+    )
 
 
 def phase_5b_ci_failure(*, wave_n: int, failed_checks: list[str]) -> str:
@@ -282,11 +314,21 @@ def phase_5b_prime_fix(*, finding: Finding) -> str:
     """Phase 5b' fix brief: dispatch a single finding to its implementer."""
     _require("finding", finding, Finding)
     return (
-        f"Phase 5b' fix — address finding {finding.finding_id} "
-        f"({finding.severity}) at {finding.file_line}: {finding.finding}. "
-        "Apply the fix and reply with a one-line confirmation. Prefix "
-        "'ABANDON:' if the fix cannot be applied."
-    ) + TEAMMATE_REPLY_RULE
+        (
+            f"Phase 5b' fix — address finding {finding.finding_id} "
+            f"({finding.severity}) at {finding.file_line}: {finding.finding}. "
+            "Apply the fix and reply with a one-line confirmation. Prefix "
+            "'ABANDON:' if the fix cannot be applied. "
+            # F6 (audit cleanup): a finding-driven fix can change a contract
+            # that the tests assert on. The implementer must update those
+            # tests in the same change and report local pytest status.
+            "If your fix changes a contract that tests assert on, update "
+            "those tests in the same change. Report whether `pytest` still "
+            "passes locally."
+        )
+        + TEAMMATE_REPLY_RULE
+        + _TESTS_STATUS_REPLY_SUFFIX
+    )
 
 
 def phase_5b_prime_pm_acceptance(*, findings: list[Finding], iter_n: int) -> str:

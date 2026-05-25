@@ -413,10 +413,22 @@ def test_every_template_appends_teammate_reply_rule(name, builder):
     assert TEAMMATE_REPLY_RULE.strip() in msg, (
         f"{name}: TEAMMATE_REPLY_RULE.strip() not found in rendered body"
     )
-    assert msg.endswith(TEAMMATE_REPLY_RULE), (
-        f"{name}: rendered body must END with TEAMMATE_REPLY_RULE "
-        "(append, not prepend) — last 200 chars: " + repr(msg[-200:])
-    )
+    # F9 (audit cleanup): phase_4_implementer and phase_5b_prime_fix append
+    # an EXTRA per-phase reply-format suffix AFTER TEAMMATE_REPLY_RULE so
+    # team-lead always sees an `OK:`/`BLOCKED:` + `tests:` tag on reply. The
+    # global rule still appears verbatim — it just isn't the trailing block.
+    from scripts.dispatch_templates import _TESTS_STATUS_REPLY_SUFFIX
+
+    if name in ("phase_4_implementer", "phase_5b_prime_fix"):
+        assert msg.endswith(TEAMMATE_REPLY_RULE + _TESTS_STATUS_REPLY_SUFFIX), (
+            f"{name}: rendered body must end with TEAMMATE_REPLY_RULE + the "
+            "F9 per-phase suffix — last 300 chars: " + repr(msg[-300:])
+        )
+    else:
+        assert msg.endswith(TEAMMATE_REPLY_RULE), (
+            f"{name}: rendered body must END with TEAMMATE_REPLY_RULE "
+            "(append, not prepend) — last 200 chars: " + repr(msg[-200:])
+        )
     # MAJOR-1: literal copy-pasteable `to="team-lead"` recipient example.
     assert 'to="team-lead"' in msg, (
         f'{name}: appended rule must include literal `to="team-lead"` '
@@ -528,6 +540,115 @@ def test_phase_5d_shutdown_does_NOT_carry_reply_rule():
 
     parsed = _json.loads(out_default)
     assert set(parsed.keys()) == {"type", "request_id"}
+
+
+# ── Group 2 (audit cleanup): brief templates aware of test side effects ──
+
+
+def test_phase_5b_prime_fix_mentions_pytest_status():
+    """F6: a fix that touches a tested contract must update those tests in
+    the same change and report whether pytest passes locally."""
+    msg = phase_5b_prime_fix(
+        finding=Finding(
+            finding_id="R1-1",
+            reviewer="r",
+            severity="blocker",
+            finding="x",
+            file_line="a.py:1",
+        )
+    )
+    assert "tests in the same change" in msg
+    assert "pytest" in msg
+
+
+def test_phase_3_close_asks_for_test_files_in_reads():
+    """F8: each touched file's corresponding test file must be in `reads`
+    so the implementer can update tests in the same Phase 4 commit."""
+    msg = phase_3_close(
+        proposals=[{"agent": "be-1", "raw": "p"}],
+        agreements=[{"agent": "be-1", "raw": "a"}],
+    )
+    assert "corresponding test file" in msg
+    assert "tests/test_X.py" in msg
+
+
+def test_phase_4_implementer_brief_directs_neighbor_file_reading():
+    """F7: the implementer must list the parent directory and read any
+    prefix/suffix neighbour file so the new change matches existing style."""
+    item = {"id": "AI-1", "touches": ["migrations/003_x.sql"], "reads": []}
+    msg = phase_4_implementer(item=item, wave_n=1)
+    assert "list the directory" in msg
+    assert "neighbor file" in msg
+    assert "001_*.sql" in msg
+
+
+def test_phase_4_implementer_reply_contract_includes_tests_status_tag():
+    """F9: phase_4_implementer (and ONLY phase_4_implementer + phase_5b_prime_fix)
+    appends a per-phase reply-format suffix demanding `OK:` / `BLOCKED:` plus a
+    `tests: pass | fail | not-run` tag."""
+    item = {"id": "AI-1", "touches": ["foo.py"], "reads": []}
+    msg = phase_4_implementer(item=item, wave_n=1)
+    assert "OK:" in msg
+    assert "BLOCKED:" in msg
+    assert "tests: pass | fail | not-run" in msg
+
+
+def test_phase_5b_prime_fix_reply_contract_includes_tests_status_tag():
+    """F9: phase_5b_prime_fix carries the same OK/BLOCKED + tests-status
+    contract as phase_4_implementer."""
+    msg = phase_5b_prime_fix(
+        finding=Finding(
+            finding_id="R1-1",
+            reviewer="r",
+            severity="blocker",
+            finding="x",
+            file_line="a.py:1",
+        )
+    )
+    assert "OK:" in msg
+    assert "BLOCKED:" in msg
+    assert "tests: pass | fail | not-run" in msg
+
+
+def test_global_TEAMMATE_REPLY_RULE_unchanged_by_F9_suffix():
+    """F9: the per-phase suffix is appended in phase_4_implementer and
+    phase_5b_prime_fix ONLY; the global TEAMMATE_REPLY_RULE itself must
+    NOT carry the tests-status contract (other templates would otherwise
+    inherit irrelevant reply rules)."""
+    assert "tests: pass | fail | not-run" not in TEAMMATE_REPLY_RULE
+
+
+def test_F9_suffix_not_appended_to_other_phase_templates():
+    """F9 negative test: phase_1, phase_2, phase_3, phase_5b_prime_reviewer,
+    and phase_5b_prime_pm_acceptance must NOT carry the tests-status suffix.
+    Only phase_4_implementer and phase_5b_prime_fix do."""
+    examples = [
+        phase_1_agenda(subject="x", cycle_n=1),
+        phase_2_preanalysis(agenda_items=["a"], participant="p"),
+        phase_3_open(proposals=[{"agent": "a", "raw": "x"}]),
+        phase_3_debate(),
+        phase_3_close(
+            proposals=[{"agent": "a", "raw": "x"}],
+            agreements=[{"agent": "a", "raw": "y"}],
+        ),
+        phase_5b_prime_reviewer(iter_n=1, action_items=[{"id": "A"}], prior_findings=None),
+        phase_5b_prime_pm_acceptance(
+            findings=[
+                Finding(
+                    finding_id="R1-1",
+                    reviewer="r",
+                    severity="blocker",
+                    finding="x",
+                    file_line="a.py:1",
+                )
+            ],
+            iter_n=1,
+        ),
+    ]
+    for msg in examples:
+        assert "tests: pass | fail | not-run" not in msg, (
+            f"F9: per-phase suffix leaked into a non-fix template: {msg[-200:]!r}"
+        )
 
 
 def test_teammate_reply_rule_split_into_subconstants():

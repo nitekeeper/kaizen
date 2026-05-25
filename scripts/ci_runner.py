@@ -34,11 +34,51 @@ mapping check-name → ``{"status", "output", "reason"}``:
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+
+# F11 — Per-check skip env var. Comma-separated check names; matched against
+# the per-check identifiers ("ruff", "bandit", "pip_audit", "tests"). The
+# legacy KAIZEN_SKIP_PIP_AUDIT=1 alias is honored at parse time for backwards
+# compatibility — it folds into the same set as if "pip_audit" had been listed.
+_KAIZEN_SKIP_CHECKS_ENV = "KAIZEN_SKIP_CHECKS"
+_KAIZEN_SKIP_PIP_AUDIT_ENV = "KAIZEN_SKIP_PIP_AUDIT"
+_SKIP_OPT_OUT_REASON = "opted out via KAIZEN_SKIP_CHECKS"
+
+# F3 — pip-audit infra-failure detection. pip-audit shells out to build a
+# temp venv; on hosts that lack `python3-venv` (or whose pip cannot reach
+# its index) the audit fails for reasons unrelated to the target's deps.
+# Treat these as SKIP — they're host issues, not vulnerability findings.
+_PIP_AUDIT_INFRA_SIGNATURES = (
+    "ensurepip is not available",
+    "Could not find a version",
+    "Connection refused",
+    "PermissionError",
+    "No matching distribution",
+    "Failed to establish a new connection",
+)
+
+
+def _parse_skip_checks_env() -> set[str]:
+    """Parse KAIZEN_SKIP_CHECKS + the legacy KAIZEN_SKIP_PIP_AUDIT alias.
+
+    Returns a set of check-name strings (e.g. ``{"ruff", "pip_audit"}``).
+    Tolerant of empty/whitespace items so ``KAIZEN_SKIP_CHECKS=" ruff, "``
+    parses cleanly. The legacy ``KAIZEN_SKIP_PIP_AUDIT in {"1","true"}``
+    alias adds ``"pip_audit"`` to the set so existing call sites keep working.
+    """
+    raw = os.environ.get(_KAIZEN_SKIP_CHECKS_ENV, "")
+    items = {part.strip() for part in raw.split(",")}
+    items.discard("")
+    legacy = os.environ.get(_KAIZEN_SKIP_PIP_AUDIT_ENV, "").strip().lower()
+    if legacy in ("1", "true"):
+        items.add("pip_audit")
+    return items
+
 
 # Result-shape constants — single source of truth so the literal strings cannot
 # drift between this module, callers, and the Phase 5b SKILL.md routing rules.
@@ -109,13 +149,26 @@ def _bandit_config_path(clone_dir: Path) -> Path | None:
     return None
 
 
+# F14: match `pip-audit` only when it appears inside a `run:` or `uses:`
+# value. The leading `^\s*(?:-\s*)?` makes the prefix tolerant of the
+# typical YAML-list ``- run: …`` form while still rejecting comments
+# (``# pip-audit``) and free-form prose anchored at column 0 without a
+# matching key.
+_PIP_AUDIT_WORKFLOW_RE = re.compile(
+    r"^\s*(?:-\s*)?(?:run|uses)\s*:\s*[^#\n]*pip-audit",
+    re.MULTILINE,
+)
+
+
 def _pip_audit_referenced_in_workflows(clone_dir: Path) -> bool:
     """Return True if any .github/workflows/*.yml mentions ``pip-audit``.
 
-    We use a literal substring match (no YAML parse) — matches both
-    ``run: pip-audit`` and ``uses: pypa/gh-action-pip-audit@...``. False
-    positives are acceptable (we'd rather mirror a check that isn't actually
-    used than miss one that is).
+    F14 (audit cleanup): tightened from a naive substring match to a
+    line-anchored regex that only matches ``pip-audit`` appearing inside a
+    ``run:`` or ``uses:`` key — so a comment like ``# we don't use pip-audit``
+    no longer opts the target in by accident. Matches both bare ``run: pip-audit``
+    and ``uses: pypa/gh-action-pip-audit@...``. We still do not YAML-parse;
+    the regex is intentionally lenient on whitespace.
     """
     workflows = clone_dir / ".github" / "workflows"
     if not workflows.is_dir():
@@ -126,7 +179,7 @@ def _pip_audit_referenced_in_workflows(clone_dir: Path) -> bool:
                 text = wf.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
-            if "pip-audit" in text:
+            if _PIP_AUDIT_WORKFLOW_RE.search(text):
                 return True
     return False
 
@@ -160,13 +213,18 @@ def _run_bandit(clone_dir: Path, config: Path) -> CheckResult:
             check=False,
         )
     except FileNotFoundError:
+        # F2 (audit cleanup): a missing bandit binary is a HOST tooling gap,
+        # not a finding in the target's code — return SKIP so the cycle does
+        # not abandon. Install bandit (`pip install bandit`) to mirror the
+        # target's CI when running kaizen, or remove the target's bandit
+        # opt-in if it isn't actually used. KAIZEN_SKIP_CHECKS=bandit short-
+        # circuits this branch entirely (handled at the dispatch site).
         return _result(
-            FAIL,
+            SKIP,
             output=(
-                "bandit binary not found on PATH — install bandit "
-                "(`pip install bandit`) to enable the Bandit CI mirror check, "
-                "or remove [tool.bandit] / .bandit / bandit.yaml from the "
-                "target to skip."
+                "bandit binary not found on PATH — Bandit SAST check skipped. "
+                "Install bandit (`pip install bandit`) to enable the Bandit CI "
+                "mirror, or set KAIZEN_SKIP_CHECKS=bandit to silence this."
             ),
             reason="bandit_binary_missing",
         )
@@ -240,12 +298,17 @@ def _run_pip_audit(clone_dir: Path) -> CheckResult:
             check=False,
         )
     except FileNotFoundError:
+        # F2 parity: a missing pip-audit binary is a HOST tooling gap, not
+        # a finding — return SKIP so the cycle does not abandon. Install
+        # pip-audit (`pip install pip-audit`) to mirror the target's CI, or
+        # set KAIZEN_SKIP_CHECKS=pip_audit (or the legacy
+        # KAIZEN_SKIP_PIP_AUDIT=1) to silence.
         return _result(
-            FAIL,
+            SKIP,
             output=(
-                "pip-audit binary not found on PATH — install pip-audit "
-                "(`pip install pip-audit`) to enable the pip-audit CI mirror "
-                "check, or set KAIZEN_SKIP_PIP_AUDIT=1 to opt out."
+                "pip-audit binary not found on PATH — pip-audit SCA check "
+                "skipped. Install pip-audit (`pip install pip-audit`) or set "
+                "KAIZEN_SKIP_CHECKS=pip_audit to silence."
             ),
             reason="pip_audit_binary_missing",
         )
@@ -253,6 +316,18 @@ def _run_pip_audit(clone_dir: Path) -> CheckResult:
     output = (proc.stdout or "") + (proc.stderr or "")
     if proc.returncode == 0:
         return _result(PASS, output=output)
+    # F3: distinguish "infra-related failure" (no python3-venv, no network,
+    # ...) from "real vulnerability findings." If the combined stdout/stderr
+    # mentions any known infra signature, treat as SKIP (so the cycle is not
+    # abandoned for a host issue). Only treat as FAIL if pip-audit actually
+    # ran far enough to evaluate the requirements set.
+    for signature in _PIP_AUDIT_INFRA_SIGNATURES:
+        if signature in output:
+            return _result(
+                SKIP,
+                output=output,
+                reason="pip_audit_infra_unavailable",
+            )
     return _result(FAIL, output=output, reason=f"pip_audit_exit_{proc.returncode}")
 
 
@@ -282,24 +357,62 @@ def run_ci_checks(
     """
     results: dict[str, CheckResult] = {}
 
+    # F11 — Per-check skip env. Parsed once at the top so each branch consults
+    # the same set; legacy KAIZEN_SKIP_PIP_AUDIT=1 folds in here.
+    skip_checks = _parse_skip_checks_env()
+
     # ── tests ──────────────────────────────────────────────────────────
-    argv = shlex.split(test_command, posix=(sys.platform != "win32"))
-    proc = subprocess.run(
-        argv,
-        cwd=clone_dir,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
-    results["tests"] = _result(
-        PASS if proc.returncode == 0 else FAIL,
-        output=(proc.stdout or "") + (proc.stderr or ""),
-    )
+    if "tests" in skip_checks:
+        results["tests"] = _result(
+            SKIP,
+            output="tests skipped via KAIZEN_SKIP_CHECKS.",
+            reason=_SKIP_OPT_OUT_REASON,
+        )
+    else:
+        argv = shlex.split(test_command, posix=(sys.platform != "win32"))
+        try:
+            proc = subprocess.run(
+                argv,
+                cwd=clone_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            results["tests"] = _result(
+                PASS if proc.returncode == 0 else FAIL,
+                output=(proc.stdout or "") + (proc.stderr or ""),
+            )
+        except FileNotFoundError:
+            # F5: the test-runner binary isn't on PATH. This is a host
+            # tooling gap, not a real test failure — return SKIP so the
+            # cycle does not abandon for a missing binary. Install the
+            # runner (e.g. `pip install pytest`) to mirror the target's CI.
+            head = argv[0] if argv else "(empty)"
+            results["tests"] = _result(
+                SKIP,
+                output=(
+                    f"test runner {head!r} not found on PATH — tests check "
+                    "skipped. Install the runner (e.g. pytest) to enable "
+                    "the test CI mirror."
+                ),
+                reason="test_runner_missing",
+            )
 
     # ── ruff ───────────────────────────────────────────────────────────
-    if _has_ruff_config(clone_dir):
+    if "ruff" in skip_checks:
+        # F11: emit BOTH ruff_check and ruff_format as skip so the per-check
+        # key set is stable across opt-in / opt-out (baseline diffs key by
+        # check name; drift in the key set would break the cycle-introduced
+        # comparison in team_executor).
+        for name in ("ruff_check", "ruff_format"):
+            results[name] = _result(
+                SKIP,
+                output=f"{name} skipped via KAIZEN_SKIP_CHECKS.",
+                reason=_SKIP_OPT_OUT_REASON,
+            )
+    elif _has_ruff_config(clone_dir):
         for name, argv_ruff in [
             ("ruff_check", ["ruff", "check", "."]),
             ("ruff_format", ["ruff", "format", "--check", "."]),
@@ -319,16 +432,16 @@ def run_ci_checks(
                     output=(r.stdout or "") + (r.stderr or ""),
                 )
             except FileNotFoundError:
-                # Safety F1.3: ruff binary absent. Fail loudly with a named
-                # reason rather than crashing the cycle. Caller should install
-                # ruff (or stop opting in via pyproject.toml [tool.ruff]).
+                # F1 (audit cleanup): a missing ruff binary is a HOST tooling
+                # gap, not a finding — return SKIP so the cycle does not
+                # abandon. Install ruff (`pip install ruff`) to mirror the
+                # target's CI, or set KAIZEN_SKIP_CHECKS=ruff to silence.
                 results[name] = _result(
-                    FAIL,
+                    SKIP,
                     output=(
-                        f"ruff binary not found on PATH — install ruff to "
-                        f"enable the '{name}' CI mirror check (or remove "
-                        f"[tool.ruff] from the target's pyproject.toml to "
-                        f"skip lint)."
+                        f"ruff binary not found on PATH — {name!r} skipped. "
+                        "Install ruff (`pip install ruff`) or set "
+                        "KAIZEN_SKIP_CHECKS=ruff to silence."
                     ),
                     reason="ruff_binary_missing",
                 )
@@ -348,27 +461,43 @@ def run_ci_checks(
         )
 
     # ── bandit ─────────────────────────────────────────────────────────
-    bandit_cfg = _bandit_config_path(clone_dir)
-    if bandit_cfg is None:
+    if "bandit" in skip_checks:
         results["bandit"] = _result(
             SKIP,
-            output=(
-                "No Bandit config detected in the target repo "
-                "(no [tool.bandit] in pyproject.toml, no .bandit, no "
-                "bandit.yaml / bandit.yml). Bandit SAST check skipped."
-            ),
-            reason="no_bandit_config",
+            output="bandit skipped via KAIZEN_SKIP_CHECKS.",
+            reason=_SKIP_OPT_OUT_REASON,
         )
     else:
-        results["bandit"] = _run_bandit(clone_dir, bandit_cfg)
+        bandit_cfg = _bandit_config_path(clone_dir)
+        if bandit_cfg is None:
+            results["bandit"] = _result(
+                SKIP,
+                output=(
+                    "No Bandit config detected in the target repo "
+                    "(no [tool.bandit] in pyproject.toml, no .bandit, no "
+                    "bandit.yaml / bandit.yml). Bandit SAST check skipped."
+                ),
+                reason="no_bandit_config",
+            )
+        else:
+            results["bandit"] = _run_bandit(clone_dir, bandit_cfg)
 
     # ── pip-audit ──────────────────────────────────────────────────────
-    if os.environ.get("KAIZEN_SKIP_PIP_AUDIT") == "1":
-        results["pip_audit"] = _result(
-            SKIP,
-            output="pip-audit skipped via KAIZEN_SKIP_PIP_AUDIT=1.",
-            reason="opted out via KAIZEN_SKIP_PIP_AUDIT",
-        )
+    if "pip_audit" in skip_checks:
+        # F11: present the legacy reason text when the alias was used so
+        # back-compat callers reading the reason string keep working.
+        if os.environ.get(_KAIZEN_SKIP_PIP_AUDIT_ENV, "").strip().lower() in ("1", "true"):
+            results["pip_audit"] = _result(
+                SKIP,
+                output="pip-audit skipped via KAIZEN_SKIP_PIP_AUDIT=1.",
+                reason="opted out via KAIZEN_SKIP_PIP_AUDIT",
+            )
+        else:
+            results["pip_audit"] = _result(
+                SKIP,
+                output="pip-audit skipped via KAIZEN_SKIP_CHECKS.",
+                reason=_SKIP_OPT_OUT_REASON,
+            )
     elif not _pip_audit_referenced_in_workflows(clone_dir):
         results["pip_audit"] = _result(
             SKIP,

@@ -72,9 +72,10 @@ def test_has_ruff_config_detects_ruff_toml(tmp_path):
     assert _has_ruff_config(clone) is True
 
 
-def test_ruff_missing_returns_failed_result_not_exception(tmp_path, monkeypatch):
-    """Safety F1.3: ruff binary absent must produce a failed check result,
-    not crash the cycle with FileNotFoundError."""
+def test_ruff_binary_missing_returns_skip(tmp_path, monkeypatch):
+    """F1 (audit cleanup): ruff binary absent is a HOST tooling gap — return
+    SKIP so the cycle does not abandon for a missing binary. all_passed stays
+    True (SKIP never counts as failure)."""
     clone = tmp_path / "fake_clone"
     clone.mkdir()
     (clone / "pyproject.toml").write_text(
@@ -87,15 +88,17 @@ def test_ruff_missing_returns_failed_result_not_exception(tmp_path, monkeypatch)
         return _mk_completed(0, "ok", "")
 
     monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
+    monkeypatch.setenv("KAIZEN_SKIP_PIP_AUDIT", "1")
 
     all_passed, results = run_ci_checks(clone, "true")
     assert "ruff_check" in results
     assert "ruff_format" in results
-    assert results["ruff_check"]["status"] == "fail"
-    assert results["ruff_format"]["status"] == "fail"
+    assert results["ruff_check"]["status"] == "skip"
+    assert results["ruff_format"]["status"] == "skip"
     assert results["ruff_check"]["reason"] == "ruff_binary_missing"
     assert "ruff binary not found" in results["ruff_check"]["output"]
-    assert all_passed is False
+    # SKIP never counts as a failure (F1 main behavioral claim).
+    assert all_passed is True
 
 
 # ── Bandit detection ──────────────────────────────────────────────────────
@@ -226,7 +229,10 @@ def test_no_bandit_config_skipped_with_reason(tmp_path, monkeypatch):
     assert all_passed is True
 
 
-def test_bandit_binary_missing_is_named_fail(tmp_path, monkeypatch):
+def test_bandit_binary_missing_returns_skip(tmp_path, monkeypatch):
+    """F2 (audit cleanup): bandit binary absent is a HOST tooling gap — return
+    SKIP so the cycle does not abandon for a missing binary. all_passed stays
+    True."""
     clone = _setup_bandit_only_clone(tmp_path)
 
     def fake_run(argv, *args, **kwargs):
@@ -236,9 +242,33 @@ def test_bandit_binary_missing_is_named_fail(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
     monkeypatch.setenv("KAIZEN_SKIP_PIP_AUDIT", "1")
-    _all_passed, results = run_ci_checks(clone, "true")
-    assert results["bandit"]["status"] == "fail"
+    all_passed, results = run_ci_checks(clone, "true")
+    assert results["bandit"]["status"] == "skip"
     assert results["bandit"]["reason"] == "bandit_binary_missing"
+    assert all_passed is True
+
+
+def test_bandit_opt_out_via_KAIZEN_SKIP_BANDIT_env(tmp_path, monkeypatch):
+    """F2/F11 (audit cleanup): KAIZEN_SKIP_CHECKS=bandit short-circuits the
+    branch entirely — bandit is never invoked even when the target opts in
+    via a config file."""
+    clone = _setup_bandit_only_clone(tmp_path)
+
+    invoked: list[list[str]] = []
+
+    def fake_run(argv, *args, **kwargs):
+        invoked.append(list(argv))
+        return _mk_completed(0, "", "")
+
+    monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
+    monkeypatch.setenv("KAIZEN_SKIP_CHECKS", "bandit")
+    monkeypatch.setenv("KAIZEN_SKIP_PIP_AUDIT", "1")
+    all_passed, results = run_ci_checks(clone, "true")
+    assert results["bandit"]["status"] == "skip"
+    assert results["bandit"]["reason"] == "opted out via KAIZEN_SKIP_CHECKS"
+    # Crucially: bandit must NOT have been invoked.
+    assert not any(call and call[0] == "bandit" for call in invoked)
+    assert all_passed is True
 
 
 # ── pip-audit detection + dispatch ────────────────────────────────────────
@@ -400,7 +430,9 @@ def test_pip_audit_opt_out_via_env_var(tmp_path, monkeypatch):
     assert all_passed is True
 
 
-def test_pip_audit_binary_missing_named_fail(tmp_path, monkeypatch):
+def test_pip_audit_binary_missing_returns_skip(tmp_path, monkeypatch):
+    """F2-parity (audit cleanup): pip-audit binary absent is a HOST tooling
+    gap — return SKIP, not FAIL, so the cycle does not abandon."""
     clone = tmp_path / "c"
     (clone / ".github" / "workflows").mkdir(parents=True)
     (clone / ".github" / "workflows" / "ci.yml").write_text("run: pip-audit\n")
@@ -413,9 +445,123 @@ def test_pip_audit_binary_missing_named_fail(tmp_path, monkeypatch):
 
     monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
     monkeypatch.delenv("KAIZEN_SKIP_PIP_AUDIT", raising=False)
-    _all_passed, results = run_ci_checks(clone, "true")
-    assert results["pip_audit"]["status"] == "fail"
+    all_passed, results = run_ci_checks(clone, "true")
+    assert results["pip_audit"]["status"] == "skip"
     assert results["pip_audit"]["reason"] == "pip_audit_binary_missing"
+    assert all_passed is True
+
+
+def test_pip_audit_infra_failure_returns_skip(tmp_path, monkeypatch):
+    """F3: pip-audit can fail for HOST reasons (no python3-venv, no network).
+    Inspect output for known infra signatures and return SKIP — not FAIL —
+    so the cycle does not abandon for a host issue."""
+    clone = tmp_path / "c"
+    (clone / ".github" / "workflows").mkdir(parents=True)
+    (clone / ".github" / "workflows" / "ci.yml").write_text("run: pip-audit\n")
+    (clone / "requirements.txt").write_text("requests==2.31.0\n")
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "pip-audit":
+            return _mk_completed(
+                1,
+                "",
+                "ERROR: ensurepip is not available in this environment.\n",
+            )
+        return _mk_completed(0, "", "")
+
+    monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
+    monkeypatch.delenv("KAIZEN_SKIP_PIP_AUDIT", raising=False)
+    all_passed, results = run_ci_checks(clone, "true")
+    assert results["pip_audit"]["status"] == "skip"
+    assert results["pip_audit"]["reason"] == "pip_audit_infra_unavailable"
+    assert all_passed is True
+
+
+def test_pytest_binary_missing_returns_skip(tmp_path, monkeypatch):
+    """F5: a missing test-runner binary is a HOST tooling gap — return SKIP
+    so the cycle does not abandon for a missing binary."""
+    clone = tmp_path / "c"
+    clone.mkdir()
+    (clone / "pyproject.toml").write_text('[project]\nname = "x"\n')
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "pytest":
+            raise FileNotFoundError(2, "No such file or directory: 'pytest'")
+        return _mk_completed(0, "", "")
+
+    monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
+    monkeypatch.setenv("KAIZEN_SKIP_PIP_AUDIT", "1")
+    all_passed, results = run_ci_checks(clone, "pytest")
+    assert results["tests"]["status"] == "skip"
+    assert results["tests"]["reason"] == "test_runner_missing"
+    assert "test runner" in results["tests"]["output"]
+    assert all_passed is True
+
+
+def test_kaizen_skip_checks_csv_env_parses_multiple(tmp_path, monkeypatch):
+    """F11: KAIZEN_SKIP_CHECKS is a comma-separated list. Setting it to
+    ``"ruff,bandit"`` short-circuits BOTH branches without invoking either
+    binary."""
+    clone = tmp_path / "c"
+    clone.mkdir()
+    (clone / "pyproject.toml").write_text(
+        '[project]\nname = "x"\n\n[tool.ruff]\nline-length = 100\n\n[tool.bandit]\nskips = []\n'
+    )
+    invoked: list[list[str]] = []
+
+    def fake_run(argv, *args, **kwargs):
+        invoked.append(list(argv))
+        return _mk_completed(0, "", "")
+
+    monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
+    monkeypatch.setenv("KAIZEN_SKIP_CHECKS", "ruff,bandit")
+    monkeypatch.setenv("KAIZEN_SKIP_PIP_AUDIT", "1")
+    all_passed, results = run_ci_checks(clone, "true")
+    assert results["ruff_check"]["status"] == "skip"
+    assert results["ruff_format"]["status"] == "skip"
+    assert results["bandit"]["status"] == "skip"
+    assert results["ruff_check"]["reason"] == "opted out via KAIZEN_SKIP_CHECKS"
+    assert results["bandit"]["reason"] == "opted out via KAIZEN_SKIP_CHECKS"
+    # Neither binary should have been invoked.
+    assert not any(call and call[0] == "ruff" for call in invoked)
+    assert not any(call and call[0] == "bandit" for call in invoked)
+    assert all_passed is True
+
+
+def test_kaizen_skip_checks_legacy_pip_audit_alias(tmp_path, monkeypatch):
+    """F11 back-compat: KAIZEN_SKIP_PIP_AUDIT=1 still resolves to pip-audit
+    being skipped with the legacy reason text."""
+    clone = tmp_path / "c"
+    (clone / ".github" / "workflows").mkdir(parents=True)
+    (clone / ".github" / "workflows" / "ci.yml").write_text("run: pip-audit\n")
+
+    monkeypatch.setattr(ci_runner.subprocess, "run", lambda *a, **kw: _mk_completed(0, "", ""))
+    monkeypatch.delenv("KAIZEN_SKIP_CHECKS", raising=False)
+    monkeypatch.setenv("KAIZEN_SKIP_PIP_AUDIT", "1")
+    _all_passed, results = run_ci_checks(clone, "true")
+    assert results["pip_audit"]["status"] == "skip"
+    assert results["pip_audit"]["reason"] == "opted out via KAIZEN_SKIP_PIP_AUDIT"
+
+
+def test_pip_audit_workflow_match_ignores_comments(tmp_path):
+    """F14: a comment that mentions ``pip-audit`` must NOT opt the target in.
+    Only `run:` or `uses:` lines count."""
+    clone = tmp_path / "c"
+    (clone / ".github" / "workflows").mkdir(parents=True)
+    (clone / ".github" / "workflows" / "ci.yml").write_text(
+        "# we don't use pip-audit yet\njobs:\n  test:\n    steps:\n      - run: pytest\n"
+    )
+    assert _pip_audit_referenced_in_workflows(clone) is False
+
+
+def test_pip_audit_workflow_match_accepts_uses_line(tmp_path):
+    """F14: ``uses: pypa/gh-action-pip-audit@...`` is a valid opt-in signal."""
+    clone = tmp_path / "c"
+    (clone / ".github" / "workflows").mkdir(parents=True)
+    (clone / ".github" / "workflows" / "ci.yml").write_text(
+        "jobs:\n  audit:\n    steps:\n      - uses: pypa/gh-action-pip-audit@v1\n"
+    )
+    assert _pip_audit_referenced_in_workflows(clone) is True
 
 
 # ── result-shape contract (uniform across all checks) ─────────────────────

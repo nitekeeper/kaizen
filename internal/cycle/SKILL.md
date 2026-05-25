@@ -214,19 +214,39 @@ python3 -c "
 from pathlib import Path
 from scripts.ci_runner import run_ci_checks
 all_passed, results = run_ci_checks(Path(r'<clone_dir>'), '<project[\"test_command\"]>')
-for name, (ok, output) in results.items():
-    print(f'{\"PASS\" if ok else \"FAIL\"}: {name}')
+for name, r in results.items():
+    label = r['status'].upper()           # PASS / FAIL / SKIP
+    extra = f' ({r[\"reason\"]})' if 'reason' in r else ''
+    print(f'{label}{extra}: {name}')
 "
 ```
 
-- **PASS (all checks green):** proceed to Phase 5c.
-- **FAIL:**
+Each check returns ``{"status": "pass" | "fail" | "skip", "output": <stdout+stderr>, "reason": <named code, optional>}``. ``all_passed`` is ``True`` iff every check's status is ``pass`` or ``skip`` — a ``skip`` is never a failure. Keys in ``results``:
+
+| Key | When present | Status meaning |
+|---|---|---|
+| `tests` | always | `pass` / `fail` from the project's test_command |
+| `ruff_check`, `ruff_format` | when [tool.ruff] / ruff.toml is present in the target | `pass` / `fail` |
+| `lint_warning` | when no ruff config is detected | always `skip` with reason `no_ruff_config` |
+| `bandit` | always | `pass` / `fail` if [tool.bandit] / .bandit / bandit.yaml is present; `skip` with reason `no_bandit_config` otherwise |
+| `pip_audit` | always | `pass` / `fail` if any `.github/workflows/*.yml` mentions `pip-audit`; `skip` with reason `no_pip_audit_in_workflows` or `opted out via KAIZEN_SKIP_PIP_AUDIT` |
+
+- **PASS (all checks green or skipped):** proceed to Phase 5c.
+- **FAIL** (any check has `status == "fail"`):
   1. Capture the failing output for the agents to read.
   2. **Per-check routing**: when `results` contains failed checks, route by check name:
      - `tests` failure → dispatch the implementer agents from Phase 4 plus any test-focused experts. Diagnose the failure and apply a fix in the clone working tree.
      - `ruff_check` failure → dispatch a single style-focused agent (or the implementer); apply `ruff check --fix .` in the clone; recommit if changes were produced.
      - `ruff_format` failure → run `ruff format .` in the clone; recommit.
-     - `lint_warning` → not a failure; surface the warning to the user but proceed.
+     - `bandit` failure → check `results["bandit"]["reason"]` first:
+       - `bandit_findings` (exit 1) → real SAST hits; dispatch a security-focused agent (or the implementer) to read `output` and apply a fix in the clone — either patch the offending code, or add a justified `# nosec` / `[tool.bandit]` skip with an inline rationale. Recommit.
+       - `bandit_config_error` (exit 2) → Bandit config-file invalid (rc=2 means YAML parse error / unknown directive in `.bandit` / `bandit.yaml` / `pyproject.toml [tool.bandit]`, NOT a generic scanner crash). Treat as a Bandit-configuration bug rather than a code finding; dispatch an implementer to repair the config or pin a Bandit version. Do NOT silence by adding skips.
+       - `bandit_binary_missing` → Bandit isn't installed in the local environment. Install Bandit and re-run; if the local install can't be fixed, surface to the user — never silence by removing `[tool.bandit]` from the target.
+     - `pip_audit` failure → check `results["pip_audit"]["reason"]`:
+       - `pip_audit_exit_*` → real SCA hits or a pip-audit error; dispatch a security/dependency-focused agent to read `output`, upgrade the affected package (or pin a fixed version), and recommit. If the project documents the vulnerability as accepted-risk, the agent must record that decision in the cycle minutes — do NOT silently ignore.
+       - `pip_audit_binary_missing` → install pip-audit OR set `KAIZEN_SKIP_PIP_AUDIT=1` for this run (offline mode); surface to the user.
+     - `lint_warning` → status is `skip`, never a fail. Do NOT route as a failure. Surface the warning to the user once and proceed.
+     - `bandit` / `pip_audit` with `status == "skip"` → not failures (the target doesn't opt in, or pip-audit is opted out via `KAIZEN_SKIP_PIP_AUDIT=1`). Proceed.
   3. Re-run the CI checks. Iterate this fix-and-retest loop **within Phase 5b** — do NOT escalate a test failure to "next cycle." Multiple fix rounds happen in the same cycle.
   4. Bound the iteration: if after 3 fix attempts the suite is still red, OR if the agents conclude the failure is structural (test exposes a design flaw the proposed change cannot fix), abandon:
 

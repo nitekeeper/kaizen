@@ -744,7 +744,7 @@ def team_cycle_executor(
                 test_command = project.get("test_command") or "pytest"
                 all_passed, results = run_ci_checks(clone_dir, test_command)
                 if not all_passed:
-                    failed = [name for name, (ok, _) in results.items() if not ok]
+                    failed = [name for name, r in results.items() if r.get("status") == "fail"]
                     _abandon(
                         outcome_acc,
                         phase_reached="test",

@@ -90,7 +90,7 @@ def _stub_team_executor_helpers(monkeypatch):
     """Stub the executor's CI runner, commit_cycle, and git rev-parse."""
 
     def fake_run_ci_checks(clone_dir, test_command):
-        return True, {"tests": (True, "ok")}
+        return True, {"tests": {"status": "pass", "output": "ok"}}
 
     monkeypatch.setattr(team_executor_mod, "run_ci_checks", fake_run_ci_checks)
 

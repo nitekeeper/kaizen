@@ -269,12 +269,13 @@ def test_pip_audit_no_workflow_dir_returns_false(tmp_path):
 
 
 def test_pip_audit_dispatched_when_workflow_mentions_it(tmp_path, monkeypatch):
-    """Workflow opts in via the literal 'pip-audit' string → check runs."""
+    """Workflow opts in via the literal 'pip-audit' string → check runs against requirements.txt."""
     clone = tmp_path / "c"
     (clone / ".github" / "workflows").mkdir(parents=True)
     (clone / ".github" / "workflows" / "ci.yml").write_text(
         "jobs:\n  a:\n    steps:\n      - run: pip-audit --strict\n"
     )
+    (clone / "requirements.txt").write_text("requests==2.31.0\n")
 
     invoked: list[list[str]] = []
 
@@ -287,8 +288,62 @@ def test_pip_audit_dispatched_when_workflow_mentions_it(tmp_path, monkeypatch):
     monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
     monkeypatch.delenv("KAIZEN_SKIP_PIP_AUDIT", raising=False)
     all_passed, results = run_ci_checks(clone, "true")
-    assert ["pip-audit"] in invoked
+    assert ["pip-audit", "-r", "requirements.txt"] in invoked
     assert results["pip_audit"]["status"] == "pass"
+    assert all_passed is True
+
+
+def test_pip_audit_scans_all_requirements_files(tmp_path, monkeypatch):
+    """Every recognized requirements*.txt is passed via -r in one invocation."""
+    clone = tmp_path / "c"
+    (clone / ".github" / "workflows").mkdir(parents=True)
+    (clone / ".github" / "workflows" / "ci.yml").write_text("run: pip-audit\n")
+    (clone / "requirements.txt").write_text("a==1.0\n")
+    (clone / "requirements-dev.txt").write_text("b==1.0\n")
+    (clone / "requirements-test.txt").write_text("c==1.0\n")
+
+    invoked: list[list[str]] = []
+
+    def fake_run(argv, *args, **kwargs):
+        invoked.append(list(argv))
+        return _mk_completed(0, "", "")
+
+    monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
+    monkeypatch.delenv("KAIZEN_SKIP_PIP_AUDIT", raising=False)
+    run_ci_checks(clone, "true")
+    pip_audit_calls = [c for c in invoked if c and c[0] == "pip-audit"]
+    assert len(pip_audit_calls) == 1
+    assert pip_audit_calls[0] == [
+        "pip-audit",
+        "-r",
+        "requirements.txt",
+        "-r",
+        "requirements-dev.txt",
+        "-r",
+        "requirements-test.txt",
+    ]
+
+
+def test_pip_audit_skips_when_no_target_requirements(tmp_path, monkeypatch):
+    """Workflow opts in but no requirements*.txt exists → skip (do NOT scan host env)."""
+    clone = tmp_path / "c"
+    (clone / ".github" / "workflows").mkdir(parents=True)
+    (clone / ".github" / "workflows" / "ci.yml").write_text("run: pip-audit\n")
+    # No requirements*.txt in the clone.
+
+    invoked: list[list[str]] = []
+
+    def fake_run(argv, *args, **kwargs):
+        invoked.append(list(argv))
+        return _mk_completed(0, "", "")
+
+    monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
+    monkeypatch.delenv("KAIZEN_SKIP_PIP_AUDIT", raising=False)
+    all_passed, results = run_ci_checks(clone, "true")
+    assert results["pip_audit"]["status"] == "skip"
+    assert results["pip_audit"]["reason"] == "no_target_requirements"
+    # Critically: pip-audit MUST NOT have been invoked (no host-env scan).
+    assert not any(call and call[0] == "pip-audit" for call in invoked)
     assert all_passed is True
 
 
@@ -296,6 +351,7 @@ def test_pip_audit_fail_when_exit_nonzero(tmp_path, monkeypatch):
     clone = tmp_path / "c"
     (clone / ".github" / "workflows").mkdir(parents=True)
     (clone / ".github" / "workflows" / "ci.yml").write_text("run: pip-audit\n")
+    (clone / "requirements.txt").write_text("requests==2.31.0\n")
 
     def fake_run(argv, *args, **kwargs):
         if argv and argv[0] == "pip-audit":
@@ -348,6 +404,7 @@ def test_pip_audit_binary_missing_named_fail(tmp_path, monkeypatch):
     clone = tmp_path / "c"
     (clone / ".github" / "workflows").mkdir(parents=True)
     (clone / ".github" / "workflows" / "ci.yml").write_text("run: pip-audit\n")
+    (clone / "requirements.txt").write_text("requests==2.31.0\n")
 
     def fake_run(argv, *args, **kwargs):
         if argv and argv[0] == "pip-audit":

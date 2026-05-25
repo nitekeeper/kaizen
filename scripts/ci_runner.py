@@ -182,17 +182,56 @@ def _run_bandit(clone_dir: Path, config: Path) -> CheckResult:
     return _result(FAIL, output=output, reason=f"bandit_unexpected_exit_{rc}")
 
 
+_PIP_AUDIT_REQUIREMENTS_FILES = (
+    "requirements.txt",
+    "requirements-dev.txt",
+    "requirements-test.txt",
+)
+
+
+def _pip_audit_requirements_files(clone_dir: Path) -> list[Path]:
+    """Return the requirements files we'll feed to ``pip-audit -r``.
+
+    Bare ``pip-audit`` scans the active Python interpreter's site-packages
+    — that's the host env, not the target repo's pinned deps, so it
+    inevitably finds host-OS CVEs and fails the gate for reasons unrelated
+    to the cycle's changes. We mirror what target CI does by scanning the
+    target's requirements files instead.
+    """
+    return [
+        clone_dir / name for name in _PIP_AUDIT_REQUIREMENTS_FILES if (clone_dir / name).is_file()
+    ]
+
+
 def _run_pip_audit(clone_dir: Path) -> CheckResult:
-    """Invoke pip-audit; any non-zero exit is a fail.
+    """Invoke pip-audit on the target's requirements files.
 
     pip-audit's exit-code contract is binary (0 = clean, !=0 = findings or
     error), so we don't try to distinguish findings vs. crash the way we do
     for Bandit. A missing binary is reported as fail with a named reason so
     triage isn't silent.
+
+    Scope: every ``requirements*.txt`` discovered in the clone is passed
+    via ``-r`` so we audit only the target's pinned deps. If no
+    requirements file is present we return ``skip`` rather than fall back
+    to scanning the host interpreter — the latter is the bug this function
+    used to have.
     """
+    req_files = _pip_audit_requirements_files(clone_dir)
+    if not req_files:
+        return _result(
+            SKIP,
+            output="pip-audit skipped: no requirements*.txt in target repo (host-env scan suppressed).",
+            reason="no_target_requirements",
+        )
+
+    argv = ["pip-audit"]
+    for f in req_files:
+        argv.extend(["-r", str(f.relative_to(clone_dir))])
+
     try:
         proc = subprocess.run(
-            ["pip-audit"],
+            argv,
             cwd=clone_dir,
             capture_output=True,
             text=True,

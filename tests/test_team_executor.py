@@ -1130,6 +1130,119 @@ class TestOutcomeShapes:
             )
 
 
+# ── F4 — _collect_existing_files re-raises OSError with a clearer message ─
+
+
+class TestCollectExistingFilesErrorPath:
+    def test_collect_existing_files_reraises_oserror_with_clearer_message(
+        self, tmp_path, monkeypatch
+    ):
+        """F4 (audit cleanup): previously OSError silently returned an empty
+        frozenset which then misattributed the abandonment to "unsatisfiable
+        reads." Now the OSError is re-raised with the original path and
+        message so triage isn't misdirected."""
+        from pathlib import Path as _Path
+
+        from scripts.team_executor import _collect_existing_files
+
+        def broken_rglob(self, pattern):
+            raise OSError(13, "Permission denied")
+
+        monkeypatch.setattr(_Path, "rglob", broken_rglob)
+
+        with pytest.raises(OSError) as excinfo:
+            _collect_existing_files(tmp_path)
+        msg = str(excinfo.value)
+        assert "rglob failed" in msg
+        assert str(tmp_path) in msg
+        assert "Permission denied" in msg
+
+    def test_collect_existing_files_returns_frozenset_when_clone_missing(self, tmp_path):
+        """The "clone doesn't exist yet" case must still be tolerated — F4
+        only changes the rglob-error path, not the early-exit path."""
+        from scripts.team_executor import _collect_existing_files
+
+        out = _collect_existing_files(tmp_path / "does-not-exist")
+        assert out == frozenset()
+
+
+# ── F13 — rev-parse HEAD uses check=False with explicit assert ────────────
+
+
+class TestRevParseErrorPath:
+    def test_rev_parse_nonzero_exit_raises_runtime_error_with_clear_message(
+        self, tmp_path, monkeypatch
+    ):
+        """F13 (audit cleanup): rev-parse failure must surface a message that
+        names the exit code AND captures stderr — not an opaque
+        CalledProcessError that swallowed both."""
+        _patch_ci_green(monkeypatch)
+
+        def fake_commit_cycle(**kwargs):
+            return None
+
+        monkeypatch.setattr(team_executor_mod, "commit_cycle", fake_commit_cycle)
+
+        class _FakeProc:
+            stdout = ""
+            stderr = "fatal: ambiguous argument 'HEAD'"
+            returncode = 128
+
+        def fake_run(cmd, **kwargs):
+            return _FakeProc()
+
+        monkeypatch.setattr(team_executor_mod.subprocess, "run", fake_run)
+        tools = MockTeamTools(scripted=_happy_scripted())
+        with (
+            patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}),
+            pytest.raises(RuntimeError) as excinfo,
+        ):
+            team_cycle_executor(
+                clone_dir=tmp_path,
+                project=_project(),
+                run_row=_run_row(),
+                cycle_n=1,
+                tools=tools,
+            )
+        msg = str(excinfo.value)
+        assert "rev-parse HEAD" in msg
+        assert "128" in msg
+        assert "ambiguous argument" in msg
+
+    def test_rev_parse_empty_sha_raises_clearer_error(self, tmp_path, monkeypatch):
+        """F13 (audit cleanup): if rev-parse exits 0 but returns an empty
+        SHA (corrupt clone, detached HEAD edge case), raise a named error
+        instead of letting an empty commit_sha land in the outcome dict."""
+        _patch_ci_green(monkeypatch)
+
+        def fake_commit_cycle(**kwargs):
+            return None
+
+        monkeypatch.setattr(team_executor_mod, "commit_cycle", fake_commit_cycle)
+
+        class _FakeProc:
+            stdout = "\n"
+            stderr = ""
+            returncode = 0
+
+        def fake_run(cmd, **kwargs):
+            return _FakeProc()
+
+        monkeypatch.setattr(team_executor_mod.subprocess, "run", fake_run)
+        tools = MockTeamTools(scripted=_happy_scripted())
+        with (
+            patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}),
+            pytest.raises(RuntimeError, match="empty SHA"),
+        ):
+            team_cycle_executor(
+                clone_dir=tmp_path,
+                project=_project(),
+                run_row=_run_row(),
+                cycle_n=1,
+                tools=tools,
+            )
+
+
 # ── New: team_delete fires even when Phase 5 helper raises ────────────────
 
 

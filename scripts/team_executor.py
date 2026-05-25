@@ -326,10 +326,17 @@ def _collect_existing_files(clone_dir: Path) -> frozenset[str]:
     """Return the set of repo-relative file paths currently on disk in clone_dir.
 
     Used by `validate_dag` gate 3 (reads satisfiable). Walks the working
-    tree, skipping the usual transient/VCS directories. Errors (e.g. clone
-    doesn't exist yet) are tolerated by returning an empty frozenset — the
-    DAG validator will then surface unsatisfiable-reads errors with
-    meaningful messages.
+    tree, skipping the usual transient/VCS directories.
+
+    F4 (audit cleanup): previously, an OSError during rglob silently
+    returned an empty frozenset — which then made the DAG validator
+    surface every action item's `reads` as "unsatisfiable" because the
+    file set was empty. The abandonment then misattributed the cause to
+    "unsatisfiable reads" when the real problem was a permissions/IO
+    error walking the clone. Now an OSError is re-raised with a clearer
+    message naming the path and the original error so triage isn't
+    misdirected. The "clone doesn't exist yet" case is still tolerated by
+    the explicit `exists()` check above.
     """
     if not clone_dir or not Path(clone_dir).exists():
         return frozenset()
@@ -344,8 +351,10 @@ def _collect_existing_files(clone_dir: Path) -> frozenset[str]:
             if any(part in skip for part in p.relative_to(root).parts):
                 continue
             out.add(str(p.relative_to(root)))
-    except OSError:
-        return frozenset()
+    except OSError as exc:
+        # F4: re-raise with a clearer message so the abandonment caller can
+        # surface "the walk itself failed" instead of "reads unsatisfiable."
+        raise OSError(f"rglob failed on {root}: {exc}") from exc
     return frozenset(out)
 
 
@@ -1013,13 +1022,28 @@ def team_cycle_executor(
                 subject=subject or "team-mode",
                 minutes_rel_path=minutes_rel,
             )
+            # F13 (audit cleanup): check=True would raise CalledProcessError
+            # with no captured stdout/stderr in the message, masking the
+            # real problem (clone is corrupt, HEAD missing, etc). Use
+            # check=False and assert explicitly so the error names the
+            # actual exit code and stderr.
             rev = subprocess.run(
                 ["git", "-C", str(clone_dir), "rev-parse", "HEAD"],
                 capture_output=True,
                 text=True,
-                check=True,
+                check=False,
             )
+            if rev.returncode != 0:
+                raise RuntimeError(
+                    f"git rev-parse HEAD in {clone_dir} exited "
+                    f"{rev.returncode}: {(rev.stderr or rev.stdout or '').strip()}"
+                )
             commit_sha = rev.stdout.strip()
+            if not commit_sha:
+                raise RuntimeError(
+                    f"git rev-parse HEAD in {clone_dir} returned an empty SHA; "
+                    "the clone may be corrupt or HEAD may be unset."
+                )
     finally:
         # GAP-7 (docs/kaizen/2026-05-24-bridge-smoke-3.md) — graceful
         # teammate shutdown BEFORE team_delete. Per CC's TeamCreate docs:

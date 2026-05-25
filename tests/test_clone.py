@@ -100,6 +100,15 @@ class TestCleanupExperiment:
 
         cleanup_experiment(tmp_path / "nonexistent")  # must not raise
 
+    def test_accepts_str_path(self, tmp_path):
+        from scripts.clone import cleanup_experiment
+
+        exp = tmp_path / "experiment"
+        (exp / "target").mkdir(parents=True)
+        (exp / "target" / "file.txt").write_text("x")
+        cleanup_experiment(str(exp))  # str not Path — called from skill bash glue
+        assert not exp.exists()
+
     @pytest.mark.skipif(sys.platform != "win32", reason="Windows-only readonly attribute bug")
     def test_cleanup_removes_readonly_files_on_windows(self, tmp_path):
         """Read-only files (like git pack objects) must not block cleanup on Windows."""

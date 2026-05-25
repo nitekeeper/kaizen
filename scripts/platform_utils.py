@@ -21,14 +21,19 @@ def is_linux() -> bool:
     return sys.platform.startswith("linux")
 
 
-def safe_rmtree(path: Path) -> None:
+def safe_rmtree(path: Path | str) -> None:
     """Recursively delete a directory tree.
 
     On Windows, git pack files in .git/objects/ are marked read-only,
     causing shutil.rmtree to fail with PermissionError. The handler
     clears the read-only attribute and retries. No-op when the path
     does not exist.
+
+    Accepts ``str`` as well as ``Path`` — this helper is called from CLI
+    glue and direct ``python3 -c`` invocations where the caller may not
+    have already wrapped its argv in ``Path()``.
     """
+    path = Path(path)
     if not path.exists():
         return
 

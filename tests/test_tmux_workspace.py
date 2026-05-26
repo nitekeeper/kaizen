@@ -463,11 +463,23 @@ def test_set_pane_title_calls_select_pane_with_sanitized_title(monkeypatch):
 
     monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
     _tmux_workspace.set_pane_title("%5", "back#end-engineer-1\x1bhello")
-    assert len(calls) == 1
-    argv = calls[0]
-    # argv[0] is the "tmux" binary; argv[1] is the subcommand.
+    # kaizen#64 — set_pane_title now fires TWO tmux calls per pane:
+    #   1. set-option -p @desired_title (border-rendered, OSC-immune)
+    #   2. select-pane -T (legacy pane_title for non-agent-teams configs)
+    assert len(calls) == 2
+    # First call is the @desired_title persist.
+    set_opt_calls = [c for c in calls if "set-option" in c]
+    assert len(set_opt_calls) == 1
+    sa = set_opt_calls[0]
+    assert sa[0] == "tmux"
+    assert "@desired_title" in sa
+    assert sa[sa.index("-t") + 1] == "%5"
+    assert sa[sa.index("@desired_title") + 1] == "back##end-engineer-1hello"
+    # Second call is the legacy select-pane -T.
+    sp_calls = [c for c in calls if "select-pane" in c]
+    assert len(sp_calls) == 1
+    argv = sp_calls[0]
     assert argv[0] == "tmux"
-    assert "select-pane" in argv
     assert argv[argv.index("-t") + 1] == "%5"
     # Title is sanitized: # → ##, ESC stripped.
     assert argv[argv.index("-T") + 1] == "back##end-engineer-1hello"

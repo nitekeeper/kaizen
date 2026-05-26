@@ -28,14 +28,27 @@ from __future__ import annotations
 
 from pathlib import Path
 
-MARKER_VERSION = 1
+MARKER_VERSION = 2
 MARKER_START = "# >>> agent-teams v{} >>>"
 MARKER_END = "# <<< agent-teams v{} <<<"
 
 # Verbatim from the spec — keep this in sync with any future MARKER_VERSION bumps.
-CONFIG_BLOCK = """# Pane border format — show pane_title (set by app post-spawn)
+#
+# kaizen#64 (v2): the pane border now renders ``#{@desired_title}`` with a
+# fallback to ``#{pane_title}``. Background: when a Claude Code team-mode
+# pane becomes active, the subagent process emits an OSC 2 escape sequence
+# (``ESC ] 2 ; general-purpose BEL``) which tmux honors unconditionally,
+# overwriting the ``pane_title`` we set via ``select-pane -T``. tmux 3.4
+# has no gate to disable OSC 2 → pane_title (``allow-rename`` only gates
+# the legacy escape-k window-rename). We sidestep the override by storing
+# the authoritative title in the ``@desired_title`` per-pane user-option
+# (which OSC 2 cannot touch) and rendering THAT in the border. ``pane_title``
+# may still flicker to ``general-purpose`` in tmux's internal state, but
+# the operator-visible border keeps the wave/role label.
+CONFIG_BLOCK = """# Pane border format — render @desired_title (set by app) with fallback to pane_title.
+# kaizen#64 — @desired_title is immune to OSC 2 overrides from the pane process.
 set -g pane-border-status top
-set -g pane-border-format '#[fg=cyan]#{pane_title}#[default]'
+set -g pane-border-format '#[fg=cyan]#{?@desired_title,#{@desired_title},#{pane_title}}#[default]'
 
 # Default layout for new windows: main-vertical
 # Apps may override per-window via select-layout.

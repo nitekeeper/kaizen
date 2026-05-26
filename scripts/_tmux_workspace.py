@@ -390,6 +390,35 @@ def pin_orchestrator_title(pane_id: str, glyph: str | None = None) -> None:
     set_pane_title(pane_id, title)
 
 
+def _persist_desired_title(pane_id: str, sanitized: str) -> None:
+    """Store ``sanitized`` in the pane's ``@desired_title`` user-option.
+
+    kaizen#64 — the operator-visible pane title is rendered from
+    ``@desired_title`` by the pane-border-format installed in the
+    agent-teams tmux config block (see scripts/_tmux_config.py).
+    Storing the title here means it survives OSC 2 overrides emitted by
+    the pane process on activation: tmux 3.4 honors OSC 2 ``ESC ] 2 ;
+    <title> BEL`` and rewrites ``pane_title`` unconditionally (the
+    ``allow-rename`` option only gates the legacy escape-k window-rename,
+    not OSC 2 pane titles). User-options are NOT touched by OSC 2 — so
+    they are immune to the override and the border keeps displaying our
+    authoritative wave/role label.
+
+    Tolerant of "tmux server not running" / "pane gone": never raises.
+    Single stderr warning on hard failures.
+    """
+    proc = _run_tmux(["set-option", "-p", "-t", pane_id, "@desired_title", sanitized])
+    if proc.returncode == 0:
+        return
+    if _tmux_unavailable(proc):
+        return
+    print(
+        f"[_tmux_workspace] set-option -p @desired_title={shlex.quote(sanitized)} "
+        f"on {pane_id} failed: {(proc.stderr or '').strip()}",
+        file=sys.stderr,
+    )
+
+
 def set_pane_title(pane_id: str, title: str) -> None:
     """Set the title of one pane by global pane_id. Sanitized + idempotent.
 
@@ -402,10 +431,21 @@ def set_pane_title(pane_id: str, title: str) -> None:
     tmux does not interpret format specifiers), and left-truncates to
     the 64-char tmux soft limit. A ``[wN] `` wave prefix is preserved.
 
+    kaizen#64: ALSO writes the sanitized title to the pane's
+    ``@desired_title`` user-option, which the agent-teams pane-border
+    format renders in preference to ``pane_title``. This keeps the
+    operator-visible label stable across OSC 2 overrides emitted by the
+    pane process on activation (see :func:`_persist_desired_title`).
+
     Tolerant of "tmux server not running" / "pane gone": no exception is
     raised; a single stderr warning is emitted on hard failures.
     """
     sanitized = _sanitize_title(title)
+    # kaizen#64 — persist FIRST so a subsequent OSC 2 from the pane
+    # process cannot win the race against the border's rendered value
+    # (the border re-renders on pane_title change too, but it reads
+    # @desired_title via the format string).
+    _persist_desired_title(pane_id, sanitized)
     proc = _run_tmux(["select-pane", "-t", pane_id, "-T", sanitized])
     if proc.returncode == 0:
         return
@@ -439,6 +479,8 @@ def set_pane_titles(workspace_name: str, pane_to_title: dict[str, str]) -> None:
     del workspace_name  # currently unused; see docstring
     for pane_id, title in pane_to_title.items():
         sanitized = _sanitize_title(title)
+        # kaizen#64 — also persist to @desired_title (border-rendered).
+        _persist_desired_title(pane_id, sanitized)
         proc = _run_tmux(["select-pane", "-t", pane_id, "-T", sanitized])
         if proc.returncode == 0:
             continue

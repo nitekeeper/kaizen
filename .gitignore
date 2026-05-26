@@ -1,8 +1,16 @@
 # Plugin-internal state
-.ai/memex.db
-.ai/memex.db-shm
-.ai/memex.db-wal
+.ai/
 experiment/
+
+# Process artifacts — belong in Memex/Notion, not git (kaizen#51)
+# Cycle minutes, bridge-smoke reports, design specs, plans are write-once
+# history with no runtime consumer. Memex (`memex:run capture`) is the
+# canonical store; Notion Claude HQ → Decisions is the human-facing mirror.
+docs/kaizen/
+docs/plans/
+docs/design/
+docs/design.md
+docs/plan.md
 
 # Release dist bundles — body gitignored, manifest tracked
 # (the build path is dist/v<X.Y.Z>/; manifest.json is committed so version

@@ -380,18 +380,17 @@ Capture the resulting commit sha (`git -C <clone_dir> rev-parse HEAD`).
 
 Also write the full meeting minutes into the clone at the same relative path before committing — the commit message references it.
 
-### Phase 5d — Minutes (committed in Phase 5c; cross-run capture deferred)
+### Phase 5d — Minutes (captured to Memex; not committed to git)
 
-The cycle minutes are committed into the clone at `docs/kaizen/<YYYY-MM-DD>-cycle-<n>-minutes.md` during Phase 5c. The PR therefore preserves them in git history — that is the canonical store for cycle minutes.
+Cycle minutes are **process artifacts** per kaizen#51 and the `### Process-artifact storage` rule in `CLAUDE.md`. They MUST NOT be committed to the kaizen git tree. The canonical store is **Memex**; `docs/kaizen/` is gitignored.
 
-The original spec also intended to capture minutes into Kaizen's own Memex wiki via `memex:run capture` for cross-run search. **This is currently deferred** — `memex:run` is a Claude Code skill, not a CLI binary, and a Python subprocess cannot invoke a Claude Code skill. Until a future architecture allows skill invocation from subprocess, cross-run Memex capture is a manual step the user can perform post-cycle:
+The orchestrator may write the minutes to a temporary path under `docs/kaizen/<YYYY-MM-DD>-cycle-<n>-minutes.md` for the user to inspect locally (the directory is gitignored, so the file will not be staged), then capture them to Memex via the orchestrating Claude session — `memex:run` is a Claude Code skill, not a CLI binary, so the Python orchestrator cannot invoke it directly. The orchestrating session calls:
 
 ```
-# After the PR opens, from the kaizen repo root:
 memex:run capture --id kaizen:cycle:<run_id>-<cycle_n> docs/kaizen/<YYYY-MM-DD>-cycle-<n>-minutes.md
 ```
 
-Slug convention: `kaizen:cycle:<run_id>-<cycle_n>`.
+Slug convention: `kaizen:cycle:<run_id>-<cycle_n>`. Once captured, the local file may be deleted; Memex is the durable store.
 
 Set `minutes_memex_slug = "kaizen:cycle:<run_id>-<cycle_n>"` in the cycle return dict so the orchestrator surfaces it in the run summary — the slug is the intended identifier even though capture is manual.
 

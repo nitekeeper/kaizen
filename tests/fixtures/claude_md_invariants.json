@@ -1,0 +1,174 @@
+{
+  "version": 1,
+  "_doc": {
+    "purpose": "Source-of-truth invariants exercised by tests/test_skill_invariants.py. Each check guards a portability rule migrated from the maintainer's personal layer into the repo CLAUDE.md (see kaizen#53). Checks are keyword/anchor-based on purpose: literal-sentence assertions would break on benign editorial polish and erode trust in the test, defeating the point. Tier rationale follows Phase 3 consensus (RFC-2119 voice × evidence tiers).",
+    "check_types": {
+      "regex_present": "regex pattern matched anywhere in file",
+      "regex_in_section": "regex pattern matched within the named markdown section (heading line through next heading at same-or-shallower depth)",
+      "all_keywords": "every keyword string present (case-sensitive substring) anywhere in file",
+      "any_of_keywords": "at least one of the keyword strings present anywhere in file",
+      "all_keywords_in_section": "every keyword present within the named section; if `any_of_keywords` is also set, at least one of those must also appear in the section",
+      "absent": "literal pattern string MUST NOT appear in file",
+      "exists": "file exists at the given path (relative to repo root)"
+    },
+    "tbd_files": [
+      "PERSONAL_CLEANUP_AFTER_MERGE.md is created by Wave 1 A6; the `personal-cleanup-artifact-exists` check will fail until that file lands. CI gates on the full Wave 1 + Wave 2 sequence, not on this fixture in isolation."
+    ]
+  },
+  "checks": [
+    {
+      "id": "anchor-section-heading",
+      "rationale": "The dedicated section anchor is the contract surface for everything that follows. Loss of the heading would silently disable all section-scoped checks.",
+      "file": "CLAUDE.md",
+      "type": "regex_present",
+      "pattern": "^## Claude operational rules\\s*$",
+      "flags": "M"
+    },
+    {
+      "id": "scoping-sentence",
+      "rationale": "Bright-line between rules that apply when working ON kaizen vs rules that apply when kaizen runs against a target repo. ai-ethicist Phase 2.",
+      "file": "CLAUDE.md",
+      "type": "any_of_keywords",
+      "keywords": ["kaizen codebase", "working on kaizen"]
+    },
+    {
+      "id": "N1-precedence",
+      "rationale": "Repo CLAUDE.md supersedes personal layer. Without this, a personal-rule survivor after merge could compete with the migrated rule and reintroduce four-way drift.",
+      "file": "CLAUDE.md",
+      "type": "all_keywords_in_section",
+      "section": "## Claude operational rules",
+      "keywords": ["supersede"]
+    },
+    {
+      "id": "N2-self-modification-carveout",
+      "rationale": "Kaizen MUST NOT modify the user's personal `~/.claude` files. Carve-out keeps the migration a one-way contract; ai-safety Phase 2.",
+      "file": "CLAUDE.md",
+      "type": "regex_in_section",
+      "section": "## Claude operational rules",
+      "pattern": "MUST NOT modify",
+      "flags": "I"
+    },
+    {
+      "id": "F1-worker-checklist",
+      "rationale": "Worker subagents must run ruff (check + format) AND pytest before reporting green. High-evidence (multi-incident); MUST-tier.",
+      "file": "CLAUDE.md",
+      "type": "all_keywords_in_section",
+      "section": "## Claude operational rules",
+      "keywords": ["ruff check", "ruff format --check", "pytest"]
+    },
+    {
+      "id": "F2-cycle-verify-mirror",
+      "rationale": "Phase 4 implementers must mirror the TARGET repo's CI. Avoid 'kaizen has 5 checks therefore everyone has 5 checks' over-generalization (backend-engineer's JS-repo footgun).",
+      "file": "CLAUDE.md",
+      "type": "all_keywords",
+      "keywords": ["mirror", "target repo"]
+    },
+    {
+      "id": "F2-cycle-verify-five-checks",
+      "rationale": "The kaizen-on-kaizen and atelier-on-atelier case is 5 checks (ruff check, ruff format --check, bandit, pip-audit, pytest) — explicitly correcting the prior 3-check belief. Enumeration is illustrative for the kaizen self-CI case.",
+      "file": "CLAUDE.md",
+      "type": "all_keywords",
+      "keywords": ["ruff check", "ruff format --check", "pytest", "bandit", "pip-audit"]
+    },
+    {
+      "id": "F3-step6-ordering",
+      "rationale": "`record_cycle_success` MUST fire before `push_branch` or the PR title renders 0 succeeded (run 19/PR#30). Ordering language must be present.",
+      "file": "CLAUDE.md",
+      "type": "all_keywords_in_section",
+      "section": "## Claude operational rules",
+      "keywords": ["record_cycle_success", "push_branch"],
+      "any_of_keywords": ["before", "after"]
+    },
+    {
+      "id": "F4-branch-name-source",
+      "rationale": "Branch name passed downstream MUST be the canonical/verbatim string returned by `create_branch` — never a retyped slug (run 17).",
+      "file": "CLAUDE.md",
+      "type": "all_keywords_in_section",
+      "section": "## Claude operational rules",
+      "keywords": ["create_branch"],
+      "any_of_keywords": ["canonical", "verbatim"]
+    },
+    {
+      "id": "F7-async-pattern",
+      "rationale": "Team-mode teammates communicate via SendMessage; spawn-prompt output is not auto-relayed; teammates MUST NOT just go idle (run 20 smoke / PR#31).",
+      "file": "CLAUDE.md",
+      "type": "all_keywords_in_section",
+      "section": "## Claude operational rules",
+      "keywords": ["SendMessage", "do not just go idle"]
+    },
+    {
+      "id": "P2-review-fix",
+      "rationale": "Independent reviewer subagent + review→fix→review loop must not be collapsed (kaizen#22 cycle 2 caught 3 silent-data-loss blockers).",
+      "file": "CLAUDE.md",
+      "type": "all_keywords_in_section",
+      "section": "## Claude operational rules",
+      "keywords": ["review", "loop", "independent reviewer"]
+    },
+    {
+      "id": "absence-user-initiated-only",
+      "rationale": "The personal-rule string 'User-initiated only' was removed in PR#52 (kaizen-first-for-app-work supersedes it). Lock the absence in so a future copy-paste regression is caught at CI.",
+      "file": "CLAUDE.md",
+      "type": "absent",
+      "pattern": "User-initiated only"
+    },
+    {
+      "id": "test-loads-fixture",
+      "rationale": "test_skill_invariants.py must consume this fixture as its source of truth; ensures A5's loader wiring stays connected.",
+      "file": "tests/test_skill_invariants.py",
+      "type": "all_keywords",
+      "keywords": ["tests/fixtures/claude_md_invariants.json"]
+    },
+    {
+      "id": "personal-cleanup-artifact-exists",
+      "rationale": "Wave 1 A6 produces PERSONAL_CLEANUP_AFTER_MERGE.md at repo root. Its existence is the deliverable for the 'Personal cleanup to apply after merge' acceptance criterion in kaizen#53.",
+      "file": "PERSONAL_CLEANUP_AFTER_MERGE.md",
+      "type": "exists"
+    },
+    {
+      "id": "kaizen-54-model-recommendations-section",
+      "rationale": "kaizen#54 — repo CLAUDE.md must carry the model + effort recommendation so installers inherit the maintainer's posture.",
+      "file": "CLAUDE.md",
+      "type": "regex_present",
+      "pattern": "^## Model recommendations\\s*$",
+      "flags": "M"
+    },
+    {
+      "id": "kaizen-54-default-model-keywords",
+      "rationale": "kaizen#54 — default model + effort must be named explicitly (Opus 4.7 + high effortLevel).",
+      "file": "CLAUDE.md",
+      "type": "all_keywords_in_section",
+      "section": "## Model recommendations",
+      "keywords": ["claude-opus-4-7", "effortLevel", "high"]
+    },
+    {
+      "id": "kaizen-54-advisory-language",
+      "rationale": "kaizen#54 acceptance criterion: the recommendation is ADVISORY, not enforced. Lock the word 'advisory' into the section so a future contributor doesn't accidentally upgrade it to a hard requirement.",
+      "file": "CLAUDE.md",
+      "type": "all_keywords_in_section",
+      "section": "## Model recommendations",
+      "keywords": ["advisory"]
+    },
+    {
+      "id": "kaizen-51-process-artifact-storage-body",
+      "rationale": "kaizen#51 — the ### Process-artifact storage subsection must have a real body naming Memex as canonical store (no longer the cycle-1 TBD placeholder).",
+      "file": "CLAUDE.md",
+      "type": "all_keywords_in_section",
+      "section": "### Process-artifact storage",
+      "keywords": ["Memex", "gitignored"]
+    },
+    {
+      "id": "kaizen-51-gitignore-process-artifacts",
+      "rationale": "kaizen#51 — process-artifact directories must be in .gitignore so future commits don't accidentally re-track them.",
+      "file": ".gitignore",
+      "type": "all_keywords",
+      "keywords": ["docs/kaizen/", "docs/plans/", "docs/design/", "docs/design.md", "docs/plan.md"]
+    },
+    {
+      "id": "kaizen-51-cycle-skill-policy-reversal",
+      "rationale": "kaizen#51 explicitly reverses the prior 'git is canonical store for cycle minutes' stance in internal/cycle/SKILL.md. The reversed phrasing must be present so a future contributor doesn't restore the legacy text.",
+      "file": "internal/cycle/SKILL.md",
+      "type": "absent",
+      "pattern": "canonical store for cycle minutes"
+    }
+  ]
+}

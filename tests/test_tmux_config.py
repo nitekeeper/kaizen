@@ -122,6 +122,42 @@ def test_apply_config_block_is_idempotent_at_same_version(tmp_path):
     assert first == second
 
 
+# ── CONFIG_BLOCK content (kaizen#76 — dual-signal pane-border-format) ─────
+
+
+def test_marker_version_bumped_to_3():
+    """kaizen#76 — MARKER_VERSION must bump to 3 for the dual-signal block.
+
+    The bump is the forcing-function that drives setup.py's "update
+    available" branch on existing installs; without it, operators with a
+    v2 marker would not be prompted to refresh their tmux.conf.
+    """
+    assert MARKER_VERSION == 3
+
+
+def test_config_block_renders_activity_glyph_prefix():
+    """kaizen#76 — CONFIG_BLOCK must render the OSC 2 activity glyph.
+
+    ``#{=1:pane_title}`` is the tmux FORMATS construct "take the first 1
+    character of ``pane_title``"; this preserves Claude Code's idle dot /
+    busy spinner that the subagent process emits via OSC 2 even after we
+    override the kaizen-owned label via ``@desired_title``.
+    """
+    assert "#{=1:pane_title}" in CONFIG_BLOCK
+
+
+def test_config_block_renders_desired_title_token():
+    """kaizen#76 — CONFIG_BLOCK must render @desired_title with pane_title fallback.
+
+    The kaizen-owned wave/role label lives in the ``@desired_title``
+    per-pane user-option (immune to OSC 2 overrides); the fallback to
+    ``pane_title`` keeps pre-spawn panes (e.g. a bare ``zsh``) readable.
+    Asserted together with the glyph prefix to enforce the S6 dual-signal
+    Iron Law: both signals must be present in the rendered border.
+    """
+    assert "#{?@desired_title,#{@desired_title},#{pane_title}}" in CONFIG_BLOCK
+
+
 # ── show_diff ─────────────────────────────────────────────────────────────
 
 

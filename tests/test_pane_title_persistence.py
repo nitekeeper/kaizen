@@ -29,6 +29,7 @@ These tests verify:
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import time
@@ -187,6 +188,34 @@ def test_marker_version_bumped_for_kaizen_64():
 
 
 pytestmark = pytest.mark.skipif(not shutil.which("tmux"), reason="tmux not on PATH")
+
+
+def _tmux_version_tuple() -> tuple[int, int] | None:
+    """Return ``tmux -V`` as a ``(major, minor)`` int tuple, or None.
+
+    Tolerates the common suffix shapes:
+      - ``tmux 3.4``       → (3, 4)
+      - ``tmux 3.4a``      → (3, 4)   (point-release letter suffix)
+      - ``tmux 3.6b``      → (3, 6)
+      - ``tmux next-3.7``  → (3, 7)   (development snapshots)
+
+    Returns None when ``tmux`` is not on PATH or ``tmux -V`` did not print
+    a parseable ``MAJOR.MINOR`` token. Callers use this for an explicit
+    ``pytest.skip`` — never ``xfail``, never silent pass — so a CI image
+    missing tmux is clearly marked SKIP, not regression.
+    """
+    if not shutil.which("tmux"):
+        return None
+    proc = subprocess.run(["tmux", "-V"], capture_output=True, text=True, check=False)
+    if proc.returncode != 0:
+        return None
+    # Match the first ``MAJOR.MINOR`` token anywhere in the output. This
+    # absorbs ``next-`` prefixes and trailing letter suffixes (``3.4a``)
+    # without needing to enumerate them.
+    match = re.search(r"(\d+)\.(\d+)", proc.stdout)
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)))
 
 
 def _tmux(*args: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -406,4 +435,100 @@ def test_set_pane_title_persists_across_pane_activation(routed_persist_tmux):
     desired = _tmux("show-options", "-p", "-t", target, "-v", "@desired_title").stdout.strip()
     assert desired == "[w1] sdet-1", (
         f"@desired_title was lost across pane activation (kaizen#64 regression). Got: {desired!r}"
+    )
+
+
+def test_border_format_renders_activity_glyph_and_role_label(routed_persist_tmux, tmp_path):
+    """kaizen#76 v3 dual-signal Iron Law: border MUST render BOTH channels.
+
+    Run 40 was aborted because the prior fix attempt (``allow-set-title off``)
+    silenced CC's OSC 2 activity glyph entirely. The v3 design composes
+    the two signals instead of gating one off:
+
+      - **Activity glyph slot** = first display column of ``pane_title``
+        (rendered via ``#{=1:pane_title}``). CC emits an OSC 2 spinner
+        glyph here while busy and the literal default ``general-purpose``
+        while idle. The slot is OPERATOR-VISIBLE and unowned by kaizen.
+      - **Role label** = ``@desired_title`` (rendered via the
+        ``#{?@desired_title,#{@desired_title},#{pane_title}}`` conditional).
+        kaizen owns this; OSC 2 cannot touch it (user-options are not
+        in the OSC 2 namespace).
+
+    This test is the Iron-Law regression for kaizen#76: it MUST fail
+    against current ``main`` while ``CONFIG_BLOCK`` is at v2 (the v2
+    format lacks ``#{=1:pane_title}``) and pass once v3 lands. Without
+    this assertion a future "simplification" could revert to a single-
+    signal render and silently regress the operator-visible activity
+    indicator that triggered the run 40 abort.
+
+    The test renders the format via ``display-message -p '#{T:...}'``
+    which evaluates the option value AS a format string in the context
+    of the target pane — the same evaluation tmux performs when drawing
+    the pane border. The ``#{T:...}`` recursive-format expansion is a
+    tmux 3.2+ feature; older tmux is SKIPped (never xfail, never silent
+    pass) so an out-of-spec environment shows up clearly as SKIP rather
+    than as a phantom regression.
+    """
+    # Skip on tmux missing / <3.2 — #{T:...} needs the recursive-format
+    # support that landed in tmux 3.2.
+    version = _tmux_version_tuple()
+    if version is None:
+        pytest.skip("tmux not available on PATH (covered by module-level skipif)")
+    if version < (3, 2):
+        pytest.skip(
+            f"tmux >=3.2 required for #{{T:...}} recursive-format expansion "
+            f"(installed: {version[0]}.{version[1]})"
+        )
+
+    pane_ids = _spawn_session(n_panes=1)
+    assert len(pane_ids) >= 1
+    target = pane_ids[0]
+
+    # 1. Install the agent-teams CONFIG_BLOCK from the production helper.
+    #    apply_config_block writes the CURRENT CONFIG_BLOCK to the conf
+    #    file; sourcing it loads the same format string the user would
+    #    install via setup.py. While CONFIG_BLOCK is at v2 (no
+    #    #{=1:pane_title}) this test fails — the Iron-Law-fails-first
+    #    pattern. After v3 lands, the test passes.
+    conf_path = tmp_path / "agent-teams.conf"
+    _tmux_config.apply_config_block(conf_path, _tmux_config.MARKER_VERSION)
+    _tmux("source-file", str(conf_path))
+
+    # 2. Simulate CC's OSC 2 spinner: pane_title's first column is the
+    #    activity glyph. We use an ASCII char so the assertion is
+    #    deterministic across locales and tmux truncation modes — but
+    #    note that real CC emits multibyte spinner glyphs (⠋ ⠙ ⠹) which
+    #    tmux 3.0+ truncates by display column, not byte.
+    glyph = "X"
+    _tmux("select-pane", "-t", target, "-T", f"{glyph}busy-task-1")
+
+    # 3. Persist @desired_title (the role label channel — kaizen-owned).
+    role_label = "agent-systems-architect-1"
+    _tmux("set-option", "-p", "-t", target, "@desired_title", role_label)
+    time.sleep(0.05)
+
+    # 4. Render the fully-evaluated pane-border-format via #{T:...} on
+    #    the target pane. The output may contain SGR escape sequences
+    #    (the v3 design colors the role label cyan) — substring checks
+    #    survive embedded escapes since the literal glyph/label tokens
+    #    are present verbatim in the rendered byte stream.
+    rendered = _tmux(
+        "display-message", "-p", "-t", target, "#{T:pane-border-format}"
+    ).stdout.rstrip("\n")
+
+    # 5. Dual-signal assertion — BOTH channels MUST render.
+    assert glyph in rendered, (
+        f"kaizen#76 v3 regression: the activity-glyph slot (first "
+        f"display column of pane_title = {glyph!r}) is missing from "
+        f"the border render: {rendered!r}. Confirm CONFIG_BLOCK "
+        "pane-border-format includes #{=1:pane_title} so CC's OSC 2 "
+        "spinner glyph remains operator-visible (run 40 abort origin)."
+    )
+    assert role_label in rendered, (
+        f"kaizen#76 v3 regression: the @desired_title role label "
+        f"{role_label!r} is missing from the border render: {rendered!r}. "
+        "Confirm CONFIG_BLOCK preserves the "
+        "#{?@desired_title,#{@desired_title},#{pane_title}} conditional "
+        "so kaizen's labeled-identity channel survives alongside the "
+        "glyph slot (dual-signal Iron Law)."
     )

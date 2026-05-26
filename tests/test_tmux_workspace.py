@@ -1188,3 +1188,279 @@ def test_apply_workspace_layout_does_not_tag_orchestrator_pane(monkeypatch):
     # future leak via the explicit `if pid == lead_pane_id: continue`.
     assert "%9" not in panes_tagged
     assert panes_tagged == ["%1", "%2"]
+
+
+# ── _resolve_layout (kaizen#78) ───────────────────────────────────────────
+#
+# Contract:
+#   _resolve_layout(n_right_panes: int, raw_env: str | None) -> str
+#
+# Returns a CONCRETE layout string — one of {"grid-2col", "stripes"} —
+# never the alias "auto" (the helper auto-resolves before returning so
+# the caller has a single branch to drive).
+#
+# Normalisation: ``raw_env`` is trim+lower'd before allowlist check
+# (``.strip().lower()``; whitespace-only — NO alnum-stripping). This
+# rescues real typos (" GRID-2COL ", "Stripes") while leaving ambiguous
+# inputs (e.g. "grid 2col", "grid_2col") to fall through to the unknown
+# branch.
+#
+# Unknown values: emit a one-line stderr warning ONCE per process per
+# normalised value, then auto-resolve. The module holds the warned-set
+# in ``_warned_layout_values: set[str]``; tests must reset it via
+# ``monkeypatch.setattr(_tmux_workspace, "_warned_layout_values", set())``
+# so warn-once invariant is exercised per-test.
+#
+# Auto-resolution: N >= 4 → "grid-2col"; N <= 3 → "stripes" (the n=4
+# threshold is the inflection point per kaizen#78's observed-vs-readable
+# trade-off).
+
+
+def _auto_resolve(n: int) -> str:
+    """Mirror of the helper's auto-resolve rule used by the test oracle."""
+    return "grid-2col" if n >= 4 else "stripes"
+
+
+# Full Cartesian: N in {1,2,3,4,6} x raw_env in {6 values} = 30 rows. We
+# include every cell rather than sampling 16: the helper is pure and
+# parametrize gives us a free oracle per row.
+_RESOLVE_MATRIX: list[tuple[int, object, str, bool]] = []
+for _n in (1, 2, 3, 4, 6):
+    for _raw, _expected_fn, _warn in (
+        # raw_env=None  → auto-resolve, no warn
+        (None, _auto_resolve, False),
+        # raw_env="auto" → auto-resolve, no warn
+        ("auto", _auto_resolve, False),
+        # explicit grid-2col → grid-2col regardless of N, no warn
+        ("grid-2col", lambda _n: "grid-2col", False),
+        # explicit stripes → stripes regardless of N, no warn
+        ("stripes", lambda _n: "stripes", False),
+        # BOGUS → warn-once + auto-resolve
+        ("BOGUS", _auto_resolve, True),
+        # " GRID-2COL " → grid-2col via .strip().lower(), no warn (it IS valid post-normalisation)
+        (" GRID-2COL ", lambda _n: "grid-2col", False),
+    ):
+        _RESOLVE_MATRIX.append((_n, _raw, _expected_fn(_n), _warn))
+
+
+@pytest.fixture
+def _reset_layout_warnings(monkeypatch):
+    """Reset the module-level warn-once set before each test.
+
+    Without this, an "unknown" raw_env in an earlier test would suppress
+    the expected warning in a later test, masking warn-once regressions.
+    """
+    monkeypatch.setattr(_tmux_workspace, "_warned_layout_values", set(), raising=False)
+
+
+@pytest.mark.parametrize(
+    "n_right_panes,raw_env,expected,expects_warn",
+    _RESOLVE_MATRIX,
+    ids=[f"n={n}-env={raw!r}" for (n, raw, _expected, _warn) in _RESOLVE_MATRIX],
+)
+def test_resolve_layout_matrix(
+    n_right_panes,
+    raw_env,
+    expected,
+    expects_warn,
+    capsys,
+    _reset_layout_warnings,
+):
+    """Parametrize matrix — every (N, raw_env) cell resolves as documented.
+
+    Failure modes this catches:
+      * unknown value silently passes through (missing warn-once)
+      * normalisation is too lenient (e.g. ``grid 2col`` matched)
+      * auto-resolve threshold wrong (N=4 must go to grid-2col)
+      * explicit override fails to beat the n-based default
+    """
+    result = _tmux_workspace._resolve_layout(n_right_panes, raw_env)
+    assert result == expected, (
+        f"_resolve_layout({n_right_panes}, {raw_env!r}) returned {result!r}, expected {expected!r}"
+    )
+    captured = capsys.readouterr()
+    combined = captured.out + captured.err
+    if expects_warn:
+        assert "KAIZEN_TEAMMATE_LAYOUT" in combined, (
+            f"expected a stderr warning mentioning KAIZEN_TEAMMATE_LAYOUT for "
+            f"raw_env={raw_env!r}; got out={captured.out!r} err={captured.err!r}"
+        )
+    else:
+        assert "KAIZEN_TEAMMATE_LAYOUT" not in combined, (
+            f"unexpected layout warning for raw_env={raw_env!r}; "
+            f"out={captured.out!r} err={captured.err!r}"
+        )
+
+
+def test_resolve_layout_warns_once_per_value(capsys, _reset_layout_warnings):
+    """Same unknown raw_env across repeated calls emits the warning exactly ONCE."""
+    _tmux_workspace._resolve_layout(6, "BOGUS")
+    first = capsys.readouterr()
+    assert "KAIZEN_TEAMMATE_LAYOUT" in (first.out + first.err)
+
+    _tmux_workspace._resolve_layout(6, "BOGUS")
+    second = capsys.readouterr()
+    assert "KAIZEN_TEAMMATE_LAYOUT" not in (second.out + second.err), (
+        "warn-once invariant violated — same unknown value warned twice"
+    )
+
+    # A DIFFERENT unknown value must warn (it has its own slot in the set).
+    _tmux_workspace._resolve_layout(6, "still-bogus")
+    third = capsys.readouterr()
+    assert "KAIZEN_TEAMMATE_LAYOUT" in (third.out + third.err), (
+        "warn-once was over-eager — distinct unknown value did not warn"
+    )
+
+
+def test_resolve_layout_warn_set_keys_normalised(capsys, _reset_layout_warnings):
+    """Warn-once dedupes on the NORMALISED form, not the raw input.
+
+    Otherwise ``BOGUS`` and ``bogus`` would each warn — noisy and confusing
+    since they are the same logical value to the parser.
+    """
+    _tmux_workspace._resolve_layout(6, "BOGUS")
+    first = capsys.readouterr()
+    assert "KAIZEN_TEAMMATE_LAYOUT" in (first.out + first.err)
+
+    # Same logical value, different casing/whitespace.
+    _tmux_workspace._resolve_layout(6, "  bogus  ")
+    second = capsys.readouterr()
+    assert "KAIZEN_TEAMMATE_LAYOUT" not in (second.out + second.err), (
+        "normalised-key warn-once invariant violated"
+    )
+
+
+# ── apply_workspace_layout dispatch (kaizen#78) ───────────────────────────
+
+
+def test_apply_workspace_layout_stripes_calls_even_vertical_and_skips_fold(
+    monkeypatch, _reset_layout_warnings
+):
+    """KAIZEN_TEAMMATE_LAYOUT=stripes → select-layout even-vertical, no fold."""
+    calls: list[list[str]] = []
+    fold_calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv:
+            return _mk_proc(0, "%1\n%2\n%3\n%4\n%5\n")
+        return _mk_proc(0, "")
+
+    def fake_fold(pane_ids):
+        fold_calls.append(list(pane_ids))
+
+    monkeypatch.setenv("KAIZEN_TEAMMATE_LAYOUT", "stripes")
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    monkeypatch.setattr(_tmux_workspace, "fold_right_column", fake_fold)
+
+    _tmux_workspace.apply_workspace_layout(
+        workspace_name="w",
+        ordered_agents=["a", "b", "c", "d", "e"],
+    )
+
+    layout_args = [c for c in calls if "select-layout" in c]
+    assert len(layout_args) == 1, f"expected exactly one select-layout call, got {layout_args!r}"
+    assert "even-vertical" in layout_args[0], (
+        f"stripes layout must call select-layout even-vertical; got {layout_args[0]!r}"
+    )
+    assert "main-vertical" not in layout_args[0], (
+        "stripes branch must NOT fall back to main-vertical"
+    )
+    assert fold_calls == [], f"stripes branch must NOT call fold_right_column; got {fold_calls!r}"
+
+
+def test_apply_workspace_layout_grid_2col_calls_main_vertical_and_folds(
+    monkeypatch, _reset_layout_warnings
+):
+    """KAIZEN_TEAMMATE_LAYOUT=grid-2col → select-layout main-vertical + fold."""
+    calls: list[list[str]] = []
+    fold_calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv:
+            return _mk_proc(0, "%1\n%2\n%3\n%4\n%5\n")
+        return _mk_proc(0, "")
+
+    def fake_fold(pane_ids):
+        fold_calls.append(list(pane_ids))
+
+    monkeypatch.setenv("KAIZEN_TEAMMATE_LAYOUT", "grid-2col")
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    monkeypatch.setattr(_tmux_workspace, "fold_right_column", fake_fold)
+
+    _tmux_workspace.apply_workspace_layout(
+        workspace_name="w",
+        ordered_agents=["a", "b", "c", "d", "e"],
+    )
+
+    layout_args = [c for c in calls if "select-layout" in c]
+    assert len(layout_args) == 1
+    assert "main-vertical" in layout_args[0], (
+        f"grid-2col layout must call select-layout main-vertical; got {layout_args[0]!r}"
+    )
+    assert "even-vertical" not in layout_args[0]
+    assert len(fold_calls) == 1, (
+        f"grid-2col branch must call fold_right_column exactly once; got {fold_calls!r}"
+    )
+
+
+def test_apply_workspace_layout_team_id_tag_runs_in_stripes_branch(
+    monkeypatch, _reset_layout_warnings
+):
+    """Mesh-residual C5: team_id tagging MUST run regardless of resolved layout.
+
+    Stripes branch skips fold_right_column but the @kaizen_team_id loop
+    must still tag every teammate pane so the cleanup gate keeps working.
+    """
+    set_option_calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        if "list-panes" in argv:
+            return _mk_proc(0, "%1\n%2\n%3\n")
+        if "set-option" in argv and "@kaizen_team_id" in argv:
+            set_option_calls.append(list(argv))
+        return _mk_proc(0, "")
+
+    monkeypatch.setenv("KAIZEN_TEAMMATE_LAYOUT", "stripes")
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    # Stub fold to confirm we never reach it in this branch.
+    monkeypatch.setattr(_tmux_workspace, "fold_right_column", lambda _ids: None)
+
+    _tmux_workspace.apply_workspace_layout(
+        workspace_name="w",
+        ordered_agents=["arch-1", "be-1", "sdet-1"],
+        team_id="team-stripes",
+    )
+
+    tagged = sorted(call[call.index("-t") + 1] for call in set_option_calls)
+    assert tagged == ["%1", "%2", "%3"], (
+        f"team_id tagging missed panes in stripes branch; tagged={tagged!r}"
+    )
+
+
+def test_apply_workspace_layout_team_id_tag_runs_in_grid_branch(
+    monkeypatch, _reset_layout_warnings
+):
+    """Symmetric to the stripes case — grid-2col branch also tags every pane."""
+    set_option_calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        if "list-panes" in argv:
+            return _mk_proc(0, "%1\n%2\n%3\n")
+        if "set-option" in argv and "@kaizen_team_id" in argv:
+            set_option_calls.append(list(argv))
+        return _mk_proc(0, "")
+
+    monkeypatch.setenv("KAIZEN_TEAMMATE_LAYOUT", "grid-2col")
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    monkeypatch.setattr(_tmux_workspace, "fold_right_column", lambda _ids: None)
+
+    _tmux_workspace.apply_workspace_layout(
+        workspace_name="w",
+        ordered_agents=["arch-1", "be-1", "sdet-1"],
+        team_id="team-grid",
+    )
+
+    tagged = sorted(call[call.index("-t") + 1] for call in set_option_calls)
+    assert tagged == ["%1", "%2", "%3"]

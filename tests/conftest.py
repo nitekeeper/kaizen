@@ -7,6 +7,29 @@ from pathlib import Path
 
 import pytest
 
+from scripts.dispatch_templates import _reset_template_cache
+
+
+# Any test that mutates files in `internal/cycle/templates/` (or that
+# depends on a freshly-read template body — e.g. byte-identity goldens,
+# positional-clause asserts, frontmatter-parity tests) RELIES on this
+# fixture to clear the module-level `_TEMPLATE_CACHE` in
+# `scripts.dispatch_templates`. Autouse + function-scoped means every
+# test sees a cold cache, so cross-test ordering can never cause one
+# test's edits to bleed into another's rendered output.
+@pytest.fixture(autouse=True)
+def _isolate_template_cache():
+    """Clear `scripts.dispatch_templates._TEMPLATE_CACHE` before each test.
+
+    The cache is process-wide and otherwise persists across tests; a
+    test that monkey-patches or rewrites a template file would
+    otherwise still read the previous test's cached body. Clearing on
+    setup (not teardown) guarantees the test's *own* renders are fresh
+    without depending on prior teardowns having run.
+    """
+    _reset_template_cache()
+    yield
+
 
 def _git(args: list[str], cwd: Path) -> None:
     subprocess.run(

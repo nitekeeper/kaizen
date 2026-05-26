@@ -84,6 +84,13 @@ Cycle agents MUST NOT modify `CLAUDE.md` or `docs/claude-operational-rules.md` d
 - **F7 — Team-mode async pattern.** In `--mode team`, teammate spawn-prompt output is NOT auto-relayed. Every teammate prompt MUST end with: `On completion, SendMessage(to="team-lead", ...) — do not just go idle.` *(run 20 / PR#31)*
 - **P2 / F9 — Review-fix loop must not collapse.** Cycle agents MUST run a review → fix loop; an independent reviewer with a different persona MUST be dispatched after each implementer reports green, and the loop MUST NOT be collapsed even when self-review is clean. *(kaizen#22 cycle 2)*
 - **F10 — Parallel subagent grouping (kaizen hand-orch shape).** When orchestrating cycle implementers by hand, group tasks by file-ownership DAG and dispatch parallel waves; one sequential agent is correct only when work touches deeply-shared state. *(run 32 / atelier#38)*
+- **F14 — Dispatch-template frontmatter contract.** Dispatch templates obey four rules:
+  1. Declare substituted kwargs in `<!--vars:-->` (rendered via `{{ NAME }}`) and truthiness signals in `<!--vars-conditional:-->` (consumed only by `{{# if NAME #}}`).
+  2. Strict equality — any kwarg in neither set is rejected.
+  3. Layer A: list/dict/tuple/set values are `repr()`-escaped at substitution to neutralize multi-line injection.
+  4. Layer B: teammate-authored strings are blockquoted via `textwrap.indent(..., '> ')` at the wrapper layer (multi-line only; single-line content relies on the canonical untrusted-input boundary clause AFTER the placeholder as backstop).
+
+  *(kaizen#62 AI-5; rationale in `docs/claude-operational-rules.md`)*
 
 ### Post-cycle
 

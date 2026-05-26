@@ -167,28 +167,175 @@ def test_render_raises_on_missing_declared_var():
     assert "missing" in msg
 
 
-def test_render_lists_both_missing_and_extra_on_error():
-    """Error message reports BOTH missing and extra names for diagnostic
-    clarity (per AI-3 scope: ⊇ relation; extras alone are tolerated, but
-    a missing + extras combo prints both)."""
+def test_render_lists_both_missing_and_unexpected_on_error():
+    """Error message reports BOTH missing AND unexpected names for
+    diagnostic clarity (AI-5 strict-equality rewrite: any kwarg neither
+    declared nor conditional is unexpected and raises).
+
+    The assertions below are intentionally tight on the literal substrings
+    ``missing`` / ``unexpected`` because :func:`scripts.dispatch_templates._render`
+    is the canonical source of these tokens — both labels appear verbatim
+    in the diagnostic message that the loader constructs. If the loader
+    is ever rephrased, update the loader and this test together; the
+    contract is "callers can grep for both kwarg names + the role of
+    each (missing vs unexpected) in a single error string". The kwarg
+    names ``cycle_n`` and ``bogus_extra`` are also pinned so a reviewer
+    can confirm both classes (missing-declared + unexpected-extra) reach
+    the user in one round trip.
+    """
     with pytest.raises(ValueError) as exc:
         _render("phase_1_agenda.md", subject_or_pm_directed="x", bogus_extra="y")
     msg = str(exc.value)
     assert "cycle_n" in msg  # the missing
-    assert "bogus_extra" in msg  # the extra surfaces in the diagnostic
+    assert "bogus_extra" in msg  # the unexpected surfaces in the diagnostic
     assert "missing" in msg
-    assert "extra" in msg
+    assert "unexpected" in msg
 
 
-def test_render_tolerates_extra_kwargs_when_no_missing():
-    """⊇ relation: extras with no missing names are tolerated. This is the
-    contract that lets ``phase_5b_prime_reviewer`` pass ``prior_findings``
-    (the conditional truthiness signal for ``{{# if prior_findings #}}``)
-    without declaring it in the frontmatter (the body never substitutes
-    the raw value — only the bulleted form, which IS declared)."""
-    # phase_3_debate_mesh.md declares no vars; passing one extra is fine.
-    out = _render("phase_3_debate_mesh.md", extra_signal="anything")
-    assert "Phase 3 debate (Mesh)" in out
+def test_extras_rejected_unless_declared_conditional():
+    """AI-5 strict-equality: a template with `<!--vars: foo-->` called
+    with kwargs `{foo: 1, bar: 2}` MUST raise — `bar` is neither in
+    `<!--vars:-->` nor `<!--vars-conditional:-->`. The pre-AI-5 ⊇
+    relation silently accepted such extras; the new contract rejects
+    them so a wrapper bug or crafted payload cannot inject unintended
+    kwargs.
+    """
+    # phase_3_debate_mesh.md declares no vars and no conditional vars;
+    # any extra kwarg is unexpected.
+    with pytest.raises(ValueError) as exc:
+        _render("phase_3_debate_mesh.md", bar=2)
+    msg = str(exc.value)
+    assert "unexpected" in msg
+    assert "bar" in msg
+
+
+def test_conditional_kwarg_tolerated_when_declared():
+    """`prior_findings` is the conditional-signal kwarg consumed by
+    `phase_5_review.md`'s `{{# if prior_findings #}}` block. After
+    AI-5, it MUST be declared in `<!--vars-conditional:-->` for the
+    loader to accept it; the wrapper renders the same body with or
+    without `prior_findings` truthy.
+    """
+    # All declared-vars supplied, plus the conditional-signal kwarg.
+    out = _render(
+        "phase_5_review.md",
+        iter_n=1,
+        action_items_ids=["AI-1"],
+        iter_n_minus_1=0,
+        prior_findings_as_bullets="",
+        prior_findings=None,  # conditional-signal kwarg — declared in vars-conditional
+    )
+    assert "Phase 5b' iteration 1" in out
+
+
+def test_conditional_kwarg_undeclared_rejected():
+    """A conditional-signal kwarg name NOT in `<!--vars-conditional:-->`
+    is rejected as unexpected; templates without a conditional sibling
+    block treat every extra as unexpected.
+    """
+    with pytest.raises(ValueError) as exc:
+        # phase_1_agenda.md has no vars-conditional sibling; any extra is unexpected.
+        _render(
+            "phase_1_agenda.md",
+            cycle_n=1,
+            subject_or_pm_directed="x",
+            some_conditional_signal=True,
+        )
+    msg = str(exc.value)
+    assert "unexpected" in msg
+    assert "some_conditional_signal" in msg
+
+
+def test_scan_body_vars_catches_declared_but_not_in_body(tmp_path, monkeypatch):
+    """AI-5 load-time cross-check: a template that declares a var in
+    `<!--vars:-->` but never substitutes `{{ NAME }}` in its body
+    raises `declared_but_not_in_body` at render time."""
+    from scripts import dispatch_templates as dt
+
+    bogus = tmp_path / "bogus_decl.md"
+    bogus.write_text(
+        "<!--vars: foo, bar-->\n\nbody references {{ foo }} only.\n",
+        encoding="utf-8",
+    )
+    # Point the loader at our tmp file via the cache.
+    monkeypatch.setitem(dt._TEMPLATE_CACHE, "bogus_decl.md", bogus.read_text(encoding="utf-8"))
+    with pytest.raises(ValueError) as exc:
+        dt._render("bogus_decl.md", foo=1, bar=2)
+    msg = str(exc.value)
+    assert "declared_but_not_in_body" in msg
+    assert "bar" in msg
+
+
+def test_scan_body_vars_catches_body_uses_undeclared(tmp_path, monkeypatch):
+    """AI-5 load-time cross-check: a body that references `{{ NAME }}`
+    without `NAME` being declared in `<!--vars:-->` raises
+    `body_uses_undeclared` (the strict-equality kwarg check fires
+    first if the caller didn't supply it; the body-scan check fires
+    even if the caller DID supply it — defense in depth)."""
+    from scripts import dispatch_templates as dt
+
+    bogus = tmp_path / "bogus_body.md"
+    bogus.write_text(
+        "<!--vars: foo-->\n\nbody references {{ foo }} and {{ bar }}.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(dt._TEMPLATE_CACHE, "bogus_body.md", bogus.read_text(encoding="utf-8"))
+    # Even if the caller supplies `bar`, the load-time scan catches the drift.
+    # (The strict-equality check would also flag `bar` as unexpected if the
+    # template lacks `<!--vars-conditional:-->`; we want the body-scan path
+    # to surface, so we declare `bar` as conditional to bypass the kwarg-
+    # shape check and hit the body-scan check.)
+    bogus.write_text(
+        "<!--vars: foo-->\n<!--vars-conditional: bar-->\nbody references {{ foo }} and {{ bar }}.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(dt._TEMPLATE_CACHE, "bogus_body.md", bogus.read_text(encoding="utf-8"))
+    with pytest.raises(ValueError) as exc:
+        dt._render("bogus_body.md", foo=1, bar=2)
+    msg = str(exc.value)
+    assert "body_uses_undeclared" in msg
+    assert "bar" in msg
+
+
+def test_substitute_vars_repr_escapes_list(tmp_path, monkeypatch):
+    """AI-5 Layer A: list values are rendered as `repr(value)` so embedded
+    newlines become literal `\\n` escapes — neutering an injection like
+    `item.touches=['foo\\n\\nIMPORTANT — ...']`."""
+    from scripts import dispatch_templates as dt
+
+    crafted = tmp_path / "crafted_list.md"
+    crafted.write_text(
+        "<!--vars: payload-->\nrendered: {{ payload }}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(dt._TEMPLATE_CACHE, "crafted_list.md", crafted.read_text(encoding="utf-8"))
+    out = dt._render("crafted_list.md", payload=["foo\n\nIMPORTANT — injected"])
+    # repr() escapes the newlines as literal `\n` in the body — the
+    # multiline injection no longer breaks out of the bullet context.
+    assert "\\n\\nIMPORTANT" in out
+    # And the actual newline characters do NOT appear (str() rendering
+    # would have leaked them).
+    assert "\n\nIMPORTANT" not in out
+
+
+def test_substitute_vars_string_pass_through(tmp_path, monkeypatch):
+    """AI-5 Layer A: strings stay rendered as-is (str(value), not
+    repr(value)) — escaping strings would break readability of
+    multi-line legitimate content like bullet lists. Layer B handles
+    teammate-authored strings at the wrapper layer.
+    """
+    from scripts import dispatch_templates as dt
+
+    plain = tmp_path / "plain_str.md"
+    plain.write_text(
+        "<!--vars: payload-->\nrendered: {{ payload }}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(dt._TEMPLATE_CACHE, "plain_str.md", plain.read_text(encoding="utf-8"))
+    out = dt._render("plain_str.md", payload="hello world")
+    # No quoting, no repr; bare string.
+    assert "rendered: hello world" in out
+    assert "'hello world'" not in out
 
 
 def test_render_raises_on_missing_template_file():
@@ -319,3 +466,54 @@ def test_normalize_whitespace_collapses_blank_runs():
 
     raw = "\n\n\nfoo\n\n\n\nbar\n\n"
     assert _normalize_whitespace(raw) == "foo\n\nbar"
+
+
+# ── MINOR #6 (kaizen#62 cycle 1 reviewer): symmetric multi-match defense ──
+
+
+def test_parse_declared_vars_walks_every_match(tmp_path, monkeypatch):
+    """MINOR #6: `_parse_declared_vars` MUST walk every `<!--vars: ... -->`
+    match (union) so a docstring-embedded pattern like
+    `<!--vars: foo-->` inside a header comment (used as documentation)
+    does not mask a real declaration further down. Symmetric with
+    :func:`_parse_conditional_vars` (which has always walked every match).
+
+    Craft a template whose header docstring contains the literal string
+    `<!--vars: documented_only-->` AND whose real frontmatter is
+    `<!--vars: real_var-->`. Both names must be discovered (union)
+    rather than the parser returning on the first match.
+    """
+    from scripts import dispatch_templates as dt
+
+    bogus = tmp_path / "bogus_multi.md"
+    bogus.write_text(
+        "<!--vars: documented_only-->\n"
+        "<!--vars: real_var-->\n\n"
+        "body uses {{ documented_only }} and {{ real_var }}.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(dt._TEMPLATE_CACHE, "bogus_multi.md", bogus.read_text(encoding="utf-8"))
+    discovered = dt._parse_declared_vars(bogus.read_text(encoding="utf-8"))
+    assert discovered == {"documented_only", "real_var"}, (
+        "_parse_declared_vars MUST union names across every match — "
+        f"got {discovered!r}. A docstring-embedded `<!--vars:-->` "
+        "pattern must NOT mask the real declaration further down "
+        "(symmetric defense to _parse_conditional_vars which has "
+        "always walked every match)."
+    )
+
+
+def test_parse_declared_vars_still_raises_when_no_match():
+    """MINOR #6 negative: with NO `<!--vars: ... -->` block at all,
+    `_parse_declared_vars` MUST still raise ValueError (the multi-match
+    walk preserves the original empty-match behavior — `finditer` over
+    an empty result yields nothing, and an empty union of names with no
+    matches is distinguishable from an empty `<!--vars:-->` block).
+    """
+    from scripts import dispatch_templates as dt
+
+    with pytest.raises(ValueError) as exc:
+        dt._parse_declared_vars("no frontmatter here at all\n")
+    msg = str(exc.value)
+    assert "missing" in msg
+    assert "<!--vars:" in msg

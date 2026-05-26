@@ -33,7 +33,11 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-from scripts.dispatch_templates import TEAMMATE_REPLY_RULE
+from scripts.dispatch_templates import (
+    _REPLY_RULE,
+    _SHUTDOWN_RULE,
+    TEAMMATE_REPLY_RULE,
+)
 
 _TRAILER_PATH = (
     Path(__file__).resolve().parent.parent / "internal" / "cycle" / "templates" / "_trailer.md"
@@ -92,3 +96,56 @@ def test_trailer_md_body_equals_teammate_reply_rule_byte_for_byte():
             "is the live wire-protocol source today; AI-3 will swap "
             "that direction once the loader rewire lands)."
         )
+
+
+def test_trailer_md_body_contains_reply_rule_subconstant_verbatim():
+    """Level 2 (sub-constant pin): the `_REPLY_RULE` Python constant
+    appears as a byte-identical span inside the rendered `_trailer.md`
+    body.
+
+    Why this exists on top of the full-body parity test (Level 1):
+    `TEAMMATE_REPLY_RULE = _REPLY_RULE + _SHUTDOWN_RULE`. A future
+    refactor that splits or re-merges the two sub-constants — or that
+    rebalances bytes between them — would keep the concatenated
+    `TEAMMATE_REPLY_RULE` identical while silently shifting the
+    boundary. This test pins each sub-constant as a substring of the
+    on-disk trailer so the boundary itself is byte-frozen.
+    """
+    md_body = _trailer_body()
+    needle = _REPLY_RULE.lstrip()
+    assert needle in md_body, (
+        "F7 sub-constant drift: `_REPLY_RULE` (lstripped) is not a "
+        "byte-identical substring of `_trailer.md` rendered body. "
+        f"Files:\n  md: {_TRAILER_PATH}\n"
+        "  py: scripts/dispatch_templates.py::_REPLY_RULE\n"
+        f"_REPLY_RULE.lstrip()[:80] = {needle[:80]!r}"
+    )
+
+
+def test_trailer_md_body_contains_shutdown_rule_subconstant_verbatim():
+    """Level 2 (sub-constant pin): the `_SHUTDOWN_RULE` Python constant
+    appears as a byte-identical span inside the rendered `_trailer.md`
+    body. See sibling `_REPLY_RULE` test for rationale — both sub-
+    constants are pinned independently so a future split / re-merge
+    cannot shift the boundary undetected.
+    """
+    md_body = _trailer_body()
+    needle = _SHUTDOWN_RULE.lstrip()
+    assert needle in md_body, (
+        "F7 sub-constant drift: `_SHUTDOWN_RULE` (lstripped) is not a "
+        "byte-identical substring of `_trailer.md` rendered body. "
+        f"Files:\n  md: {_TRAILER_PATH}\n"
+        "  py: scripts/dispatch_templates.py::_SHUTDOWN_RULE\n"
+        f"_SHUTDOWN_RULE.lstrip()[:80] = {needle[:80]!r}"
+    )
+
+
+def test_trailer_subconstants_concatenate_to_full_teammate_reply_rule():
+    """Sanity pin: `_REPLY_RULE + _SHUTDOWN_RULE == TEAMMATE_REPLY_RULE`.
+
+    This is the wire-protocol invariant that justifies the two Level-2
+    sub-constant pins above. If a refactor moves bytes between the two
+    constants (or splits one of them further), Level 2 catches the
+    on-disk drift; this test catches the in-memory drift symmetrically.
+    """
+    assert _REPLY_RULE + _SHUTDOWN_RULE == TEAMMATE_REPLY_RULE

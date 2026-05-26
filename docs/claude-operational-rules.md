@@ -144,6 +144,21 @@ The DAG is the load-bearing artifact. Without it, "spawn in parallel" degrades i
 
 **See also.** `docs/design/kaizen-phase-redesign-design.md` §"Wave dispatch"; F9 (reviewer parallelism is the highest-value parallel slot).
 
+### F14 — Dispatch-template frontmatter contract
+
+**Rule.** Dispatch templates obey four invariants:
+
+1. **Frontmatter declarations.** Each template declares its substituted kwargs in a `<!--vars: name1, name2, ... -->` block (rendered via `{{ NAME }}` in the body) and its truthiness signals in a sibling `<!--vars-conditional: name1, name2, ... -->` block (consumed only by `{{# if NAME #}}` blocks).
+2. **Strict equality.** The loader computes `set(ctx.keys()) == declared | conditional`; any kwarg in neither set is rejected with a diagnostic that names both `missing` and `unexpected`. The prior `⊇` relation silently tolerated extras, which made it possible for a wrapper bug or a crafted payload to inject unintended kwargs.
+3. **Layer A — repr-escape containers.** Values whose type is `list`, `dict`, `tuple`, or `set` are rendered as `repr(value)` rather than `str(value)`, so embedded newlines become literal `\n` escapes in the wire body. This neutralizes a crafted `item.touches=["foo\n\nIMPORTANT — ..."]` injection where `str(list)` would emit the newlines as-is and re-prioritize attacker-controlled prose.
+4. **Layer B — blockquote teammate strings.** Wrapper functions (`phase_2_preanalysis`, `phase_3_open`, `phase_5b_prime_reviewer`, `phase_5b_prime_pm_acceptance`) wrap teammate-authored content via `textwrap.indent(..., '> ')` so injected directives render as visibly-quoted Markdown blockquote prose. Layer B blockquotes **multi-line strings only** — single-line content passes through unchanged because blockquoting one-liners harms the readability of legitimate short items. The single-line backstop is the canonical untrusted-input boundary clause appearing AFTER the substitution placeholder in the .md body (or, for the inline `phase_5b_prime_pm_acceptance` wrapper, bookending the teammate-authored finding list): even if a single-line injection slips through, the boundary clause is the prompt's last instruction.
+
+**Why.** Three layers of defense against a known prompt-injection vector — teammate-authored LLM output (proposals, agenda items, findings) flowing into another teammate's prompt. The strict-equality kwarg check closes the wrapper-bug avenue; Layer A closes the list-newline-smuggling avenue; Layer B closes the multi-line-prose-prefix avenue; the positional backstop closes the single-line residual.
+
+**Originating incident.** kaizen#62 — AI-2 (frontmatter declared-vars contract), AI-3 (.md loader rewire), AI-5 (strict-equality + Layer A + Layer B). The Layer-B-multi-line-only gap was surfaced by an independent reviewer in cycle 1 of run 39 (this PR); the documented backstop reconciles the gap rather than blockquoting single-line content (which the ai-ethicist prompt-design ordering argument rejects on readability grounds).
+
+**See also.** `scripts/dispatch_templates.py` docstrings for `phase_2_preanalysis`, `phase_3_open`, `phase_5b_prime_reviewer`, `phase_5b_prime_pm_acceptance`; the `<!--vars: ... -->` / `<!--vars-conditional: ... -->` frontmatter blocks in every `internal/cycle/templates/*.md` file.
+
 ---
 
 ## Post-cycle

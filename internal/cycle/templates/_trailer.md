@@ -8,15 +8,15 @@ teammate-bound dispatch template includes this file by reference via:
     {{ include: _trailer.md }}
 
 Wiring of the include directive into the actual prompt-render path is
-performed by `scripts/dispatch_templates.py` (today's source of truth
-for the rendered strings; AI-4 in wave 2 will rewire that module to
-load these .md files directly so this partial becomes the live byte
-source). Until that wiring lands, the Python constants
-`_REPLY_RULE` / `_SHUTDOWN_RULE` / `TEAMMATE_REPLY_RULE` in
+performed by `scripts/dispatch_templates.py` via the `_render()`
+pipeline's `_resolve_includes` step — this .md partial IS the live byte
+source for every teammate-bound dispatch body. Splitting the prose into
+a Python constant (`TEAMMATE_REPLY_RULE`) is deferred to this follow-up
+issue (kaizen#62); until that split lands, the constants `_REPLY_RULE`
+/ `_SHUTDOWN_RULE` / `TEAMMATE_REPLY_RULE` in
 `scripts/dispatch_templates.py` must be kept byte-identical to the
-prose below — the byte-identity test in
-`tests/test_dispatch_templates_byte_identity.py` is the enforcing
-contract.
+prose below — the parity test in
+`tests/test_trailer_md_parity.py` is the enforcing contract.
 
 Cog-sci Concern 1: keep the trailer in ONE file so an edit to the
 reply contract or the shutdown handshake updates every phase at once;

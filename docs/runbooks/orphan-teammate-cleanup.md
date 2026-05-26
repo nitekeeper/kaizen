@@ -57,16 +57,25 @@ sqlite3 .ai/bridge.db "SELECT run_id, json_extract(response_json, '\$.team_id') 
 
 …to see which kaizen runs created them.
 
-## Recovery — post-GAP-7 (PRs ≥ #37)
+## Recovery — post-GAP-7 (PRs ≥ #37) + kaizen#68 belt-and-suspenders
 
-**Should be automatic.** `team_cycle_executor`'s finally block fires `send_message_many(shutdown_request × N)` against every active teammate BEFORE `team_delete`. The handshake terminates each Claude process via CC's protocol layer; process exit closes the pane; `team_delete` removes the config. All three layers cleaned in order.
+**Should be automatic.** `team_cycle_executor`'s finally block runs two-stage cleanup:
 
-Smoke #4 (run 27, PR#38) empirically validated the happy path: 1 shutdown_request fired → architect terminated → no idle_notification → no orphan pane → `TeamDelete` clean.
+1. **CC-protocol stage (GAP-7):** `send_message_many(shutdown_request × N)` against every active teammate. If the handshake works, each Claude process terminates via CC's protocol layer; process exit closes the pane.
+2. **OS-level stage (kaizen#68):** `_cleanup_team_artifacts(team_name)` then runs four layers BEFORE `team_delete`:
+   - **L1 — verify:** ~2.5s grace, then `pgrep -f '--agent-id .*@<team>'`. Any survivors escalate to L2.
+   - **L2 — escalate:** `pkill -TERM`, ~5s grace, re-pgrep, `pkill -KILL` any survivors.
+   - **L3 — panes:** enumerate `tmux list-panes -a` and kill any pane whose `pane_pid` (or argv via `ps -o args=`) matches our team. The orchestrator's own pane (`$TMUX_PANE`) is explicitly excluded.
+   - **L4 — config dir fallback:** after `team_delete`, verify `~/.claude/teams/<team>/` is gone; `shutil.rmtree` it if `team_delete` left it behind.
 
-**If you find orphans on a post-GAP-7 run, something is broken.** Likely causes:
-- `send_message_many` raised before all members received `shutdown_request` (best-effort handshake — the warning `"GAP-7 shutdown send_message_many failed for team …"` should be in the log)
-- A teammate failed to respond `{"approve": true}` (literal-minded teammates may misformat `request_id` — see `feedback-cc-team-mode-async-pattern.md` pitfalls)
-- `active_members` was empty because the cycle aborted in Phase 1 before any `send_message` succeeded (expected — nothing to shut down)
+Cleanup is best-effort: missing tmux server, missing `pgrep`/`pkill`/`ps`, or hung subprocess all degrade gracefully to a no-op for that layer. A bug in cleanup never blocks `team_delete`.
+
+Smoke #4 (run 27, PR#38) empirically validated the GAP-7 happy path. The kaizen#68 belt-and-suspenders layers are the recovery path when the handshake returns success at the tool layer but the actual process keeps running (run 35 cycle 3 postmortem).
+
+**If you find orphans on a post-kaizen#68 run, something is broken.** Likely causes:
+- `send_message_many` raised before all members received `shutdown_request` AND a subsequent pkill/tmux call also failed (look for `[kaizen-cleanup] layer N: …` stderr lines).
+- A teammate spawned in a session OTHER than the orchestrator's (cross-session orphan) — `TeamDelete` is per-session-scoped, so use the manual filesystem recipe below.
+- `active_members` was empty because the cycle aborted in Phase 1 before any `send_message` succeeded (expected — nothing to shut down).
 
 Capture the bridge log and the run's leaked_teams.json before manual recovery; the leak is a regression worth filing.
 

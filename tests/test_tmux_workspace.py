@@ -1055,3 +1055,136 @@ def test_autouse_tmux_pane_isolation_is_load_bearing(monkeypatch):
         "%2": "be-1",
         "%3": "sdet-1",
     }, f"outer-tmux TMUX_PANE may have leaked into the test; got: {result}"
+
+
+# ── kaizen#68 iter 3 — @kaizen_team_id pane tagging ───────────────────────
+
+
+def test_tag_pane_team_id_sets_per_pane_user_option(monkeypatch):
+    """``tag_pane_team_id`` writes the team_id under
+    ``@kaizen_team_id`` via ``tmux set-option -p -t <pane>``.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.tag_pane_team_id("%5", "team-aaa-aaa")
+    assert calls == [
+        [
+            "tmux",
+            "set-option",
+            "-p",
+            "-t",
+            "%5",
+            _tmux_workspace.KAIZEN_TEAM_ID_OPTION,
+            "team-aaa-aaa",
+        ]
+    ]
+
+
+def test_tag_pane_team_id_empty_is_noop(monkeypatch):
+    """Empty team_id is refused (no tmux call) — untagged panes are
+    intentionally untouched by cleanup, so writing the empty string
+    would be misleading."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.tag_pane_team_id("%5", "")
+    assert calls == []
+
+
+def test_tag_pane_team_id_tolerates_no_server(monkeypatch):
+    """Tag is soft-fail when tmux server is not running."""
+
+    def fake_run(argv, **kwargs):
+        return _mk_proc(1, "", "no server running on /tmp/tmux-1000/default")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    # Must not raise.
+    _tmux_workspace.tag_pane_team_id("%5", "team-x")
+
+
+def test_apply_workspace_layout_tags_every_pane_with_team_id(monkeypatch):
+    """When ``team_id`` is supplied, every mapped teammate pane is
+    tagged with ``@kaizen_team_id=<team_id>`` via set-option.
+    """
+    set_option_calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        if "list-panes" in argv:
+            return _mk_proc(0, "%1\n%2\n%3\n")
+        if "set-option" in argv and "@kaizen_team_id" in argv:
+            set_option_calls.append(list(argv))
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.apply_workspace_layout(
+        workspace_name="w",
+        ordered_agents=["arch-1", "be-1", "sdet-1"],
+        team_id="team-zzz-zzz",
+    )
+    # Three set-option calls, one per mapped pane.
+    panes_tagged = sorted(call[call.index("-t") + 1] for call in set_option_calls)
+    assert panes_tagged == ["%1", "%2", "%3"]
+    # Each tag carries the same team_id.
+    team_ids = {call[-1] for call in set_option_calls}
+    assert team_ids == {"team-zzz-zzz"}
+
+
+def test_apply_workspace_layout_no_team_id_no_tag(monkeypatch):
+    """Backwards compat: when ``team_id`` is omitted (legacy callers),
+    no @kaizen_team_id tag is written.
+    """
+    set_option_calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        if "list-panes" in argv:
+            return _mk_proc(0, "%1\n%2\n")
+        if "set-option" in argv and "@kaizen_team_id" in argv:
+            set_option_calls.append(list(argv))
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.apply_workspace_layout(
+        workspace_name="w",
+        ordered_agents=["arch-1", "be-1"],
+        # team_id omitted intentionally.
+    )
+    assert set_option_calls == []
+
+
+def test_apply_workspace_layout_does_not_tag_orchestrator_pane(monkeypatch):
+    """The orchestrator's own pane (``TMUX_PANE``) is excluded from the
+    tagging loop — the orchestrator outlives the team it created.
+    """
+    monkeypatch.setenv("TMUX_PANE", "%9")
+    set_option_calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        if "list-panes" in argv:
+            # list-panes already excludes %9 (the orchestrator) — see
+            # _list_pane_ids. So pane_to_agent will only contain %1+%2.
+            return _mk_proc(0, "%1\n%2\n")
+        if "set-option" in argv and "@kaizen_team_id" in argv:
+            set_option_calls.append(list(argv))
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.apply_workspace_layout(
+        workspace_name="w",
+        ordered_agents=["arch-1", "be-1"],
+        team_id="team-z",
+    )
+    panes_tagged = sorted(call[call.index("-t") + 1] for call in set_option_calls)
+    # %9 (orchestrator) is NOT in the list — it was excluded at source
+    # by _list_pane_ids and the tagging loop also defends against any
+    # future leak via the explicit `if pid == lead_pane_id: continue`.
+    assert "%9" not in panes_tagged
+    assert panes_tagged == ["%1", "%2"]

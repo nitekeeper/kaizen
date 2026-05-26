@@ -96,13 +96,21 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from scripts._tmux_workspace import apply_workspace_layout, set_pane_title, set_pane_titles
+from scripts._tmux_workspace import (
+    KAIZEN_TEAM_ID_OPTION,
+    PANE_LABEL_PREFIX_RE,
+    apply_workspace_layout,
+    set_pane_title,
+    set_pane_titles,
+)
 from scripts.ci_runner import run_ci_checks
 from scripts.cycle_git import commit_cycle
 from scripts.dag import validate_dag
@@ -571,6 +579,586 @@ def _pick_main_agent(roster: list[str]) -> str:
     return roster[0] if roster else ""
 
 
+# ── kaizen#68: OS-level teammate cleanup (belt-and-suspenders) ─────────────
+#
+# CC's TeamDelete is session-scoped: it removes the in-session team registry
+# and `~/.claude/teams/<team_id>/` config dir, but it does NOT signal the
+# spawned `claude --agent-id <name>@<team_name>` teammate processes. When the
+# shutdown_request handshake also fails to terminate them (run 35 cycle 3
+# postmortem — `{"type":"shutdown_request"}` returned approve=true at the
+# CC tool layer but the underlying process kept running), the teammate
+# processes and their tmux panes survive indefinitely.
+#
+# `_cleanup_team_artifacts` runs at the end-of-cycle finally block (BEFORE
+# `tools.team_delete()`) and performs four layers of cleanup, each
+# idempotent and tolerant of partial state:
+#
+#   L1 — pgrep verify shutdown actually terminated each teammate.
+#   L2 — pkill -TERM then -KILL any survivor (scoped to this team_name).
+#   L3 — tmux kill-pane any pane whose TITLE matches a teammate role-id
+#         (primary), with pid/argv probe as a fallback. The orchestrator's
+#         own pane (TMUX_PANE) is explicitly excluded.
+#   L4 — verify (and fallback rm -rf) `~/.claude/teams/<team_id>/` after
+#         tools.team_delete() runs (called by the finally block).
+#         Note: the CC on-disk dir is keyed by team_id (UUID), NOT
+#         team_name (cf. scripts/cleanup_orphans.py + sweep_leaked_teams).
+#
+# Naming note: `team_name` is the human-readable label kaizen passes to
+# TeamCreate (e.g. `kaizen-cycle-35-3`) and is what appears in the
+# `--agent-id <role>@<team_name>` argv of every spawned teammate. `team_id`
+# is the UUID-shaped opaque handle returned by TeamCreate and is what CC
+# uses for `~/.claude/teams/<team_id>/`. The two MUST NOT be confused.
+#
+# L3 design (MAJOR-1 from the kaizen#68 fix-loop iteration 2): the
+# original implementation matched panes by `pane_pid`, which on the
+# maintainer's box is the bash shell that wraps `claude`, not claude
+# itself. The empirical evidence in the issue body is exactly this:
+# claude reaped (good), bash shell pane lingers (bad). The fix matches
+# panes by `pane_title`, which PR #70's `@desired_title` machinery
+# pins to the teammate's role-id (`backend-engineer-1`, `arch-1`, …).
+# Pid/argv match is retained as a secondary probe for the case where
+# OSC 2 from the pane process strips the title back to
+# `general-purpose` (per the `project-kaizen-run-37-pane-identity`
+# memory).
+#
+# All subprocess calls use fixed argv (no shell=True), check=False
+# (idempotency: pkill returns nonzero when no processes match — that's
+# success for us), and short timeouts so a hung subprocess cannot stall
+# cycle teardown. The team_name is `re.escape`-d defensively even though
+# kaizen team names are restricted to `kaizen-cycle-<run>-<n>` — defense
+# in depth against future name changes.
+
+# Module-level seams so tests can monkeypatch without spawning real
+# subprocesses. Production code uses these names exclusively for the
+# pgrep / pkill / tmux / ps calls in `_cleanup_team_artifacts`.
+_CLEANUP_SHUTDOWN_GRACE_S = 2.5  # delay between shutdown_response and L1 pgrep
+_CLEANUP_SIGTERM_GRACE_S = 5.0  # delay between SIGTERM and L2 re-check
+
+# Default subprocess timeout (seconds) for cleanup commands. A hung pgrep
+# / pkill / tmux call must NOT block cycle teardown indefinitely — the
+# user is waiting to start the next session.
+_CLEANUP_SUBPROC_TIMEOUT_S = 10.0
+
+# Field separator for `tmux list-panes -F` output. pane_title may contain
+# spaces (e.g. PM pane is "● team-lead / PM"), so `.split()` is unsafe.
+# US (unit separator, 0x1f) passes through tmux's format string verbatim
+# and never appears in legitimate pane titles after _sanitize_title's
+# C0-control strip.
+_TMUX_FIELD_SEP = "\x1f"
+
+# One-shot stderr warning gate per missing tool — keeps cleanup quiet
+# when re-invoked from idempotent retries while still surfacing the
+# "this tool is gone" condition once per process.
+_MISSING_TOOL_WARNED: set[str] = set()
+
+
+def _warn_missing_tool(tool: str) -> None:
+    """Emit a one-time stderr warning when ``tool`` is not on PATH.
+
+    Repeated calls within the same process are no-ops — kaizen runs many
+    cleanup cycles, and N copies of the same warning would drown the
+    operator's real signal. The set is module-level on purpose; per
+    `_cleanup_team_artifacts`'s idempotency contract a second cleanup
+    call should not re-emit.
+    """
+    if tool in _MISSING_TOOL_WARNED:
+        return
+    _MISSING_TOOL_WARNED.add(tool)
+    print(
+        f"[kaizen-cleanup] {tool} not on PATH — cleanup degraded for the rest of this process",
+        file=sys.stderr,
+    )
+
+
+def _agent_id_regex(team_name: str) -> str:
+    """Return the pkill/pgrep `-f` regex for processes in ``team_name``.
+
+    The regex matches the literal substring ``--agent-id <name>@<team_name>``
+    in the full command line. We anchor on a literal-space-or-end boundary
+    after the team_name so a substring match of a longer team_name
+    (``kaizen-cycle-5-1`` matching ``kaizen-cycle-5-11``) cannot happen.
+
+    NIT (kaizen#68 iter 2): use ``( |$)`` rather than ``(\\s|$)`` —
+    BSD pkill's `-f` does NOT understand ``\\s``, and the only whitespace
+    that appears in a real /proc/*/cmdline argv after the team_name is a
+    space anyway.
+
+    ``team_name`` is `re.escape`-d defensively even though kaizen team
+    names are restricted to ``kaizen-cycle-<run>-<n>`` (no regex metachars
+    by construction). Defense in depth against future team-name changes.
+    """
+    return rf"--agent-id \S+@{re.escape(team_name)}( |$)"
+
+
+def _pgrep_teammates(team_name: str) -> list[int]:
+    """Return PIDs of live teammate processes for ``team_name`` (L1/L2 check).
+
+    Returns an empty list when no processes match (pgrep exits 1) or when
+    pgrep is not on PATH. Any unexpected exit is treated as "no info" and
+    returns empty — we DO NOT raise from a cleanup helper.
+    """
+    try:
+        proc = subprocess.run(  # nosec - argv is a fixed list, no shell=True
+            ["pgrep", "-f", _agent_id_regex(team_name)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_CLEANUP_SUBPROC_TIMEOUT_S,
+        )
+    except FileNotFoundError:
+        _warn_missing_tool("pgrep")
+        return []
+    except subprocess.TimeoutExpired:
+        _log.warning("kaizen-cleanup: pgrep timed out after %ss", _CLEANUP_SUBPROC_TIMEOUT_S)
+        return []
+    if proc.returncode not in (0, 1):
+        # pgrep exits 1 when nothing matches (success for us). Anything
+        # else is "abnormal but inconclusive" — log and return empty.
+        _log.warning("kaizen-cleanup: pgrep exited %s: %s", proc.returncode, proc.stderr.strip())
+        return []
+    pids: list[int] = []
+    for line in (proc.stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            pids.append(int(line))
+        except ValueError:
+            continue
+    return pids
+
+
+def _pkill_teammates(team_name: str, signal: str) -> None:
+    """Send ``signal`` (``-TERM`` or ``-KILL``) to teammates of ``team_name``.
+
+    Idempotent: pkill returns 1 when no processes match — that's success
+    here (nothing to kill). FileNotFoundError (pkill not on PATH) emits
+    a one-time warning and returns. TimeoutExpired is logged and swallowed.
+    """
+    try:
+        subprocess.run(  # nosec - argv is a fixed list, no shell=True
+            ["pkill", signal, "-f", _agent_id_regex(team_name)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_CLEANUP_SUBPROC_TIMEOUT_S,
+        )
+    except FileNotFoundError:
+        _warn_missing_tool("pkill")
+        return
+    except subprocess.TimeoutExpired:
+        _log.warning("kaizen-cleanup: pkill %s timed out", signal)
+        return
+
+
+def _tmux_list_panes() -> list[tuple[str, int, str, str]]:
+    """Return ``(pane_id, pane_pid, pane_title, kaizen_team_id)`` per pane.
+
+    Returns ``[]`` when tmux is not installed OR the server isn't running
+    OR list-panes hits a hard error. Cleanup proceeds without L3 in any
+    of those cases.
+
+    Uses US (0x1f) as the field separator because pane_title may contain
+    spaces — splitting on space would corrupt titles like "● team-lead /
+    PM". The format spec is therefore
+    ``#{pane_id}\\x1f#{pane_pid}\\x1f#{pane_title}\\x1f#{@kaizen_team_id}``;
+    we split on the same byte. _sanitize_title strips C0 control chars
+    from titles BEFORE they ever land in tmux, so 0x1f cannot appear
+    inside a legitimate pane_title.
+
+    The last field (``#{@kaizen_team_id}``) is the per-pane user-option
+    set by ``scripts._tmux_workspace.tag_pane_team_id`` at workspace
+    creation time. Panes that were never tagged (e.g. orchestrator pane,
+    panes created outside kaizen, pre-iter-3 cycles still in flight)
+    return the empty string for this field, which the cleanup path
+    treats as "not one of mine — leave alone". kaizen#68 iter 3
+    MAJOR fix.
+    """
+    try:
+        proc = subprocess.run(  # nosec - argv is a fixed list, no shell=True
+            [
+                "tmux",
+                "list-panes",
+                "-a",
+                "-F",
+                (
+                    f"#{{pane_id}}{_TMUX_FIELD_SEP}"
+                    f"#{{pane_pid}}{_TMUX_FIELD_SEP}"
+                    f"#{{pane_title}}{_TMUX_FIELD_SEP}"
+                    f"#{{{KAIZEN_TEAM_ID_OPTION}}}"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_CLEANUP_SUBPROC_TIMEOUT_S,
+        )
+    except FileNotFoundError:
+        _warn_missing_tool("tmux")
+        return []
+    except subprocess.TimeoutExpired:
+        _log.warning("kaizen-cleanup: tmux list-panes timed out")
+        return []
+    if proc.returncode != 0:
+        return []
+    out: list[tuple[str, int, str, str]] = []
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split(_TMUX_FIELD_SEP)
+        # Need at least 4 fields; defensively tolerate >4 (a pane_title
+        # that somehow embeds 0x1f — shouldn't happen, _sanitize_title
+        # strips C0 — but we prefer "preserve title verbatim" over
+        # "ignore the pane"). The kaizen_team_id field is the LAST
+        # one tmux emits, so the 0x1f-bearing pane_title would be
+        # split into multiple fields; we re-join everything between
+        # parts[2] and parts[-1] exclusive into pane_title.
+        if len(parts) < 4:
+            continue
+        pane_id = parts[0]
+        try:
+            pane_pid = int(parts[1])
+        except ValueError:
+            continue
+        pane_title = _TMUX_FIELD_SEP.join(parts[2:-1])
+        kaizen_team_id = parts[-1]
+        out.append((pane_id, pane_pid, pane_title, kaizen_team_id))
+    return out
+
+
+def _ps_args(pid: int) -> str:
+    """Return the full argv of ``pid`` as a single string, or '' on error.
+
+    Used as the L3 secondary probe: when a pane's title was stripped by
+    a CC subagent OSC 2 emit (the kaizen#66/#70 mechanism), we fall back
+    to inspecting the pid's argv to decide if it's one of ours.
+    """
+    try:
+        proc = subprocess.run(  # nosec - argv is a fixed list, no shell=True
+            ["ps", "-o", "args=", "-p", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_CLEANUP_SUBPROC_TIMEOUT_S,
+        )
+    except FileNotFoundError:
+        _warn_missing_tool("ps")
+        return ""
+    except subprocess.TimeoutExpired:
+        _log.warning("kaizen-cleanup: ps -p %s timed out", pid)
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def _tmux_kill_pane(pane_id: str) -> bool:
+    """tmux kill-pane -t <pane_id>. Returns True on success.
+
+    Tolerant of "tmux not installed" / "no server" / "pane gone" — any
+    error returns False without raising. Idempotent (re-killing a
+    already-dead pane is a no-op error → False).
+    """
+    try:
+        proc = subprocess.run(  # nosec - argv is a fixed list, no shell=True
+            ["tmux", "kill-pane", "-t", pane_id],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_CLEANUP_SUBPROC_TIMEOUT_S,
+        )
+    except FileNotFoundError:
+        _warn_missing_tool("tmux")
+        return False
+    except subprocess.TimeoutExpired:
+        _log.warning("kaizen-cleanup: tmux kill-pane %s timed out", pane_id)
+        return False
+    return proc.returncode == 0
+
+
+def _team_config_dir(team_id: str) -> Path:
+    """Return the expected ``~/.claude/teams/<team_id>/`` path.
+
+    NB (MAJOR-2 from kaizen#68 fix-loop iter 2): keyed by ``team_id``
+    (the UUID returned by TeamCreate), NOT ``team_name`` (the human
+    label). Confirmed against ``scripts/cleanup_orphans.py`` and
+    ``scripts/sweep_leaked_teams.py``: both treat ``team_id`` as the
+    canonical directory key.
+    """
+    return Path.home() / ".claude" / "teams" / team_id
+
+
+def _sleep(seconds: float) -> None:
+    """time.sleep wrapper — module-level so tests can patch it to a no-op."""
+    time.sleep(seconds)
+
+
+def _cleanup_team_artifacts(
+    team_name: str,
+    *,
+    team_id: str | None = None,
+    team_role_ids: list[str] | None = None,
+    shutdown_was_attempted: bool = True,
+) -> dict:
+    """Belt-and-suspenders OS-level cleanup of a kaizen team's artifacts.
+
+    Runs three layers (L1-L3); L4 is a separate call after team_delete.
+    Each layer is idempotent and tolerant of partial state:
+
+      L1 — pgrep verify teammates terminated after the shutdown_response
+            handshake. Any surviving PIDs escalate to L2.
+      L2 — pkill -TERM, wait ~5s, re-pgrep, pkill -KILL any survivors.
+      L3 — tmux kill-pane each pane that BOTH (a) is tagged with our
+            ``team_id`` via the ``@kaizen_team_id`` tmux user-option
+            AND (b) is not the orchestrator's own pane. Title-match
+            and pid/argv probe are kept as secondary/tertiary defense
+            in depth when team_id is supplied but a pane is untagged
+            (older mid-cycle restart). When ``team_id`` is ``None``,
+            L3 degrades to the iter-2 title + pid/argv heuristic
+            (no cross-team safety — caller is asserting "I am the only
+            kaizen run").
+
+    Args:
+        team_name: the kaizen-side human label (e.g. ``kaizen-cycle-35-3``)
+            embedded in every teammate's ``--agent-id <role>@<team_name>``
+            argv. Used by L1/L2's pgrep/pkill regex and the L3 argv probe.
+        team_id: the UUID-shaped opaque handle returned by TeamCreate.
+            When set, L3 PRIMARY filter is ``kaizen_team_id == team_id``
+            from the pane's ``@kaizen_team_id`` user-option — the
+            cross-team safety gate against concurrent kaizen runs
+            sharing role-ids. When None, L3 falls back to title +
+            pid/argv (legacy iter-2 behaviour, no cross-team safety).
+        team_role_ids: the team's roster role-id list (e.g.
+            ``["pm-1", "backend-engineer-1", "security-engineer-1"]``).
+            Used by L3 secondary title-match (defense in depth behind
+            the team_id gate).
+        shutdown_was_attempted: when False (e.g. Phase 1 abandon before
+            any send_message fired), L1's initial 2.5s grace sleep is
+            SKIPPED — there's no shutdown to wait for. We still do an
+            immediate pgrep, and if it returns survivors we still
+            escalate. This avoids a wasted sleep on every fast-abort.
+
+    Returns a dict describing what each layer did — useful for tests and
+    for the observability stderr summary the finally block emits.
+
+    Safety contract:
+      - Never raises. A bug in cleanup must not block ``tools.team_delete()``
+        or the cycle's outcome dict from being returned.
+      - Never kills the orchestrator's own tmux pane.
+      - Cross-team safety: with team_id supplied, L3 PRIMARY gate
+        ensures orchestrator A's cleanup does NOT touch orchestrator
+        B's panes (which share the same role-ids).
+      - Pgrep/pkill cross-team safety: the agent-id regex is anchored
+        on a literal-space/end-of-string boundary after team_name so
+        ``kaizen-cycle-5-1`` cannot accidentally kill
+        ``kaizen-cycle-5-11`` teammates.
+      - Idempotent: calling twice is a no-op on the second call (no
+        survivors, no panes to kill).
+
+    Note: this function deliberately runs AFTER the shutdown_request
+    handshake (which lives inline in ``team_cycle_executor``'s finally
+    block) and BEFORE ``tools.team_delete()``. L4 is verified AFTER
+    ``tools.team_delete()`` returns via the separate
+    ``_cleanup_verify_config_dir(team_id)`` helper.
+    """
+    role_ids = frozenset(team_role_ids or [])
+    report: dict = {
+        "team_name": team_name,
+        "team_id": team_id,
+        "l1_survivors": 0,
+        "l2_sigterm_sent": 0,
+        "l2_sigkill_needed": 0,
+        "l3_panes_killed": 0,
+        "l3_panes_skipped_orchestrator": 0,
+        "l3_panes_skipped_other_team": 0,
+        "l3_tmux_available": False,
+        "l4_config_dir_cleaned_by_fallback": False,
+    }
+
+    # ── L1 — confirm shutdown handshake actually terminated teammates ────
+    # MINOR (iter 2): skip the 2.5s grace sleep when no shutdown was
+    # attempted (e.g. Phase 1 abandon before any send_message fired).
+    # On the happy "shutdown handshake worked" path we still want the
+    # sleep so the OS has time to reap the spawned process before we
+    # pgrep — otherwise L2 would needlessly escalate to SIGTERM.
+    try:
+        if shutdown_was_attempted:
+            _sleep(_CLEANUP_SHUTDOWN_GRACE_S)
+        survivors = _pgrep_teammates(team_name)
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.warning("kaizen-cleanup L1 failed for %s: %s", team_name, exc)
+        survivors = []
+    report["l1_survivors"] = len(survivors)
+    if survivors:
+        print(
+            f"[kaizen-cleanup] layer 1: {len(survivors)} teammate processes still "
+            f"alive after shutdown_response (team={team_name})",
+            file=sys.stderr,
+        )
+
+    # ── L2 — escalate to OS-level kill (SIGTERM, wait, then SIGKILL) ────
+    sigkill_survivors: list[int] = []
+    if survivors:
+        try:
+            _pkill_teammates(team_name, "-TERM")
+            report["l2_sigterm_sent"] = len(survivors)
+            _sleep(_CLEANUP_SIGTERM_GRACE_S)
+            sigkill_survivors = _pgrep_teammates(team_name)
+            if sigkill_survivors:
+                _pkill_teammates(team_name, "-KILL")
+                report["l2_sigkill_needed"] = len(sigkill_survivors)
+        except Exception as exc:  # pragma: no cover - defensive
+            _log.warning("kaizen-cleanup L2 failed for %s: %s", team_name, exc)
+        print(
+            f"[kaizen-cleanup] layer 2: SIGTERM sent to "
+            f"{report['l2_sigterm_sent']} processes; "
+            f"{report['l2_sigkill_needed']} survived to SIGKILL "
+            f"(team={team_name})",
+            file=sys.stderr,
+        )
+
+    # ── L3 — tmux pane cleanup ──────────────────────────────────────────
+    try:
+        panes = _tmux_list_panes()
+    except Exception as exc:  # pragma: no cover - defensive
+        _log.warning("kaizen-cleanup L3 list-panes failed: %s", exc)
+        panes = []
+    # NB: an empty `panes` list does NOT necessarily mean "tmux
+    # unavailable" — it could also mean "tmux server is up but no panes
+    # exist on it" (rare but possible if the cycle's session was
+    # destroyed mid-cleanup). We can't reliably distinguish without
+    # re-probing; the conservative read is "L3 had nothing to do",
+    # which the summary line below conveys.
+    report["l3_tmux_available"] = bool(panes)
+
+    orchestrator_pane = os.environ.get("TMUX_PANE", "").strip()
+    pane_match_re = re.compile(_agent_id_regex(team_name))
+    # L1/L2 survivor PIDs feed the secondary pid-match path.
+    teammate_pids: set[int] = set(survivors) | set(sigkill_survivors)
+    panes_to_kill: list[str] = []
+    for pane_id, pane_pid, pane_title, pane_team_id in panes:
+        if orchestrator_pane and pane_id == orchestrator_pane:
+            # Triple-asserted: NEVER kill the orchestrator's pane.
+            report["l3_panes_skipped_orchestrator"] += 1
+            continue
+        # PRIMARY gate (kaizen#68 iter 3 MAJOR fix) — cross-team safety.
+        # With ``team_id`` supplied, the only panes we kill are those
+        # tagged with @kaizen_team_id == team_id at workspace creation
+        # time. A concurrent kaizen orchestrator's panes carry a
+        # different @kaizen_team_id and are explicitly skipped.
+        if team_id:
+            if pane_team_id == team_id:
+                panes_to_kill.append(pane_id)
+                continue
+            if pane_team_id and pane_team_id != team_id:
+                # Tagged by a DIFFERENT kaizen run — explicitly skip.
+                report["l3_panes_skipped_other_team"] += 1
+                continue
+            # Untagged pane (pane_team_id == ""). Fall through to the
+            # secondary defense-in-depth probes ONLY for panes we have
+            # other evidence are ours (title-match or argv-match). An
+            # untagged pane with NO other evidence is left alone —
+            # cross-team safety is the dominant concern.
+        # SECONDARY — pane_title is a role-id from the team's roster.
+        # Defense in depth: when team_id is None (legacy callers) or
+        # when a pane somehow escaped tagging at workspace creation,
+        # the title-match still catches it. We still skip if the pane
+        # has a DIFFERENT team_id tag — that gate ran above.
+        if role_ids:
+            stripped_title = PANE_LABEL_PREFIX_RE.sub("", pane_title or "", count=1)
+            if stripped_title in role_ids or pane_title in role_ids:
+                panes_to_kill.append(pane_id)
+                continue
+        # TERTIARY — by observed teammate PID (kept for forward-
+        # compat if CC ever spawns claude as the direct pane process).
+        if pane_pid in teammate_pids:
+            panes_to_kill.append(pane_id)
+            continue
+        # QUATERNARY probe — `ps -o args= -p <pane_pid>` for the case
+        # where the pane runs claude directly (no wrapper shell) AND
+        # its title was stripped by an OSC 2 from the pane process.
+        argv = _ps_args(pane_pid)
+        if argv and pane_match_re.search(argv):
+            panes_to_kill.append(pane_id)
+    for pane_id in panes_to_kill:
+        if _tmux_kill_pane(pane_id):
+            report["l3_panes_killed"] += 1
+    # MINOR (iter 2): always emit the L3 summary so the operator can
+    # distinguish "tmux unavailable" (l3_tmux_available=False) from
+    # "tmux up, zero teammate panes" (l3_tmux_available=True, killed=0).
+    # iter 3: also surface skipped-other-team count when non-zero.
+    print(
+        f"[kaizen-cleanup] layer 3: killed {report['l3_panes_killed']} tmux panes "
+        f"(team={team_name}, team_id={team_id!r}, "
+        f"tmux_available={report['l3_tmux_available']}, "
+        f"skipped_other_team={report['l3_panes_skipped_other_team']})",
+        file=sys.stderr,
+    )
+
+    return report
+
+
+def _cleanup_verify_config_dir(team_id: str) -> bool:
+    """L4 — verify (and fallback rm -rf) ``~/.claude/teams/<team_id>/``.
+
+    Called AFTER ``tools.team_delete()`` returns. ``team_delete`` is
+    supposed to remove the directory; this layer is the fallback for the
+    rare case where it doesn't (per the issue body and runbook).
+
+    Args:
+        team_id: the UUID-shaped opaque handle returned by TeamCreate.
+            NB (MAJOR-2 from iter 2): NOT the team_name. The on-disk
+            convention is ``~/.claude/teams/<team_id>/``, confirmed
+            against scripts/cleanup_orphans.py + sweep_leaked_teams.
+
+    Returns True iff the fallback removal fired (i.e. team_delete left
+    the directory behind). False on the happy path AND on every safety-
+    refusal path.
+
+    Safety guards (kaizen#68 iter 3 MINOR — defense in depth):
+      - Empty / falsy ``team_id`` is refused. An empty string would
+        resolve to ``~/.claude/teams`` (no leaf) and a naive rmtree
+        would wipe EVERY kaizen team's config dir on the box.
+      - ``team_id`` containing path separators (``/`` or ``\\``) or
+        ``..`` (parent traversal) is refused — these could redirect
+        the rmtree to an arbitrary path. Unreachable from kaizen
+        callers (team_id always comes from CC's TeamCreate response),
+        but rmtree of a wrong path is irreversible so the defense is
+        cheap and warranted.
+      - Final assertion: the resolved cfg_dir's basename MUST equal
+        ``team_id`` — anything else means our `_team_config_dir` was
+        monkeypatched in a way the guard upstream didn't catch.
+    """
+    if not team_id or "/" in team_id or "\\" in team_id or ".." in team_id:
+        _log.warning("kaizen-cleanup L4 refusing empty/path-shaped team_id=%r", team_id)
+        return False
+    cfg_dir = _team_config_dir(team_id)
+    if cfg_dir.name != team_id:
+        # Defense in depth: the path's leaf MUST be team_id. If
+        # _team_config_dir was monkeypatched to return a wholly
+        # different path (which tests sometimes do for fixtures), we
+        # accept the test's intent there. But if the leaf doesn't
+        # match team_id at all, we refuse.
+        _log.warning(
+            "kaizen-cleanup L4 path leaf mismatch (cfg_dir=%s, team_id=%r); refusing",
+            cfg_dir,
+            team_id,
+        )
+        return False
+    if not cfg_dir.exists():
+        print(
+            f"[kaizen-cleanup] layer 4: config dir cleaned (team_id={team_id})",
+            file=sys.stderr,
+        )
+        return False
+    # Fallback removal — TeamDelete left the dir behind.
+    print(
+        f"[kaizen-cleanup] layer 4: config dir {cfg_dir} still exists after "
+        f"team_delete — applying fallback rm -rf (team_id={team_id})",
+        file=sys.stderr,
+    )
+    shutil.rmtree(cfg_dir, ignore_errors=True)
+    return True
+
+
 # ── Main entry point ───────────────────────────────────────────────────────
 
 
@@ -750,6 +1338,11 @@ def team_cycle_executor(
                 workspace_name=team_name,
                 ordered_agents=list(roster) if roster else [pm],
                 main_agent=_pick_main_agent(list(roster) if roster else [pm]),
+                # kaizen#68 iter 3 — tag every teammate pane so cleanup
+                # can gate destructive actions on team-id equality
+                # (cross-team safety against concurrent kaizen runs
+                # sharing role-ids).
+                team_id=team_id,
             )
         except Exception as exc:  # pragma: no cover - defensive
             _log.warning("apply_workspace_layout failed: %s", exc)
@@ -1341,10 +1934,48 @@ def team_cycle_executor(
                     team_id,
                     exc,
                 )
+        # kaizen#68 — belt-and-suspenders OS-level cleanup (L1-L3) BEFORE
+        # team_delete. The shutdown_request handshake above is CC-protocol
+        # cleanup; this is OS-level cleanup for the case where the
+        # handshake returned success at the tool layer but the actual
+        # `claude --agent-id ...` process kept running (run 35 cycle 3
+        # postmortem). Cleanup is best-effort and never raises — a bug
+        # here must NOT block the team_delete invariant below.
+        #
+        # Pass the team's role-id roster so L3 can match panes by
+        # pane_title (MAJOR-1 fix from iter 2 review). When `active_members`
+        # is empty, no shutdown was attempted, so L1 can skip its 2.5s
+        # grace sleep (MINOR fix from iter 2 review).
+        try:
+            _cleanup_team_artifacts(
+                team_name,
+                team_id=team_id,
+                team_role_ids=list(roster) if roster else [pm],
+                shutdown_was_attempted=bool(active_members),
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            _log.warning(
+                "kaizen#68 _cleanup_team_artifacts raised for team %s: %s. "
+                "Proceeding with team_delete.",
+                team_name,
+                exc,
+            )
         # CRITICAL INVARIANT: team_delete ALWAYS fires — even on exception
         # or abandonment — so the user's Claude Code session does not leak
         # named teams across cycles.
         tools.team_delete(team_id)
+        # kaizen#68 — L4 verification AFTER team_delete. TeamDelete is
+        # supposed to remove ~/.claude/teams/<team_id>/; this fallback
+        # handles the rare case where it doesn't. Keyed by team_id (UUID),
+        # NOT team_name (MAJOR-2 fix from iter 2 review). Never raises.
+        try:
+            _cleanup_verify_config_dir(team_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            _log.warning(
+                "kaizen#68 _cleanup_verify_config_dir raised for team_id %s: %s",
+                team_id,
+                exc,
+            )
 
     if outcome_acc.abandoned:
         assert outcome_acc.phase_reached in VALID_PHASES, (

@@ -143,6 +143,52 @@ _WAVE_PREFIX_RE = re.compile(r"^(\[w\d+\] )")
 
 _MAX_TITLE_LEN = 64
 
+# Public regex matching the leading `[wN] ` / `[RN] ` (or upper-case variants)
+# prefix that ``scripts.team_executor._apply_pane_label`` puts in front of
+# the bare role-id when retitling for a Phase 4 wave / Phase 5b' reviewer
+# round. Single source of truth so the cleanup path in team_executor
+# does not embed its own regex (kaizen#68 iter 3 NIT).
+#
+# Forward-compat: ``[wWrR]`` covers both ``[w2]`` (lowercase, current
+# emit) and a future ``[W2]`` / ``[R1]`` / ``[r1]`` re-styling without
+# requiring a cleanup-path patch.
+PANE_LABEL_PREFIX_RE = re.compile(r"^\[[wWrR]\d+\] +")
+
+
+# kaizen#68 iter 3 — tmux per-pane user-option key under which every
+# teammate pane carries the team_id that created it. The cleanup path
+# reads this back to ensure cross-team safety: orchestrator A's cleanup
+# of `team_id=aaa-aaa` MUST NOT kill orchestrator B's panes tagged
+# `team_id=bbb-bbb`, even when the two teams share role-ids (which they
+# always do — role-ids are global).
+KAIZEN_TEAM_ID_OPTION = "@kaizen_team_id"
+
+
+def tag_pane_team_id(pane_id: str, team_id: str) -> None:
+    """Tag ``pane_id`` with the kaizen ``team_id`` via tmux user-option.
+
+    Stores ``team_id`` under :data:`KAIZEN_TEAM_ID_OPTION` (``@kaizen_team_id``)
+    so the cleanup path can read it back via
+    ``tmux list-panes -F '#{@kaizen_team_id}'`` and gate destructive
+    actions on team-id equality. kaizen#68 iter 3 MAJOR fix.
+
+    Tolerant of "tmux server not running" / "pane gone" — never raises.
+    Empty ``team_id`` is a no-op (we never tag with the empty string;
+    untagged panes are intentionally untouched by cleanup).
+    """
+    if not team_id:
+        return
+    proc = _run_tmux(["set-option", "-p", "-t", pane_id, KAIZEN_TEAM_ID_OPTION, team_id])
+    if proc.returncode == 0:
+        return
+    if _tmux_unavailable(proc):
+        return
+    print(
+        f"[_tmux_workspace] set-option -p {KAIZEN_TEAM_ID_OPTION}={shlex.quote(team_id)} "
+        f"on {pane_id} failed: {(proc.stderr or '').strip()}",
+        file=sys.stderr,
+    )
+
 
 def _sanitize_title(name: str, max_len: int = _MAX_TITLE_LEN) -> str:
     """Sanitize a pane title in strict order: strip → escape → left-truncate.
@@ -254,6 +300,7 @@ def apply_workspace_layout(
     *,
     ordered_agents: list[str],
     main_agent: str | None = None,
+    team_id: str | None = None,
 ) -> dict[str, str]:
     """Apply "left main + right 2-column grid" layout for ``workspace_name``.
 
@@ -264,6 +311,21 @@ def apply_workspace_layout(
     Returns the pane_id → agent map. The caller passes this dict to
     ``set_pane_titles`` (and re-uses it across waves to retitle without
     re-applying layout).
+
+    Args:
+        workspace_name: CC-internal team identifier; used in log lines
+            (NOT passed to tmux as a target — see ``_list_pane_ids``).
+        ordered_agents: team's member list in TeamCreate order.
+        main_agent: role-id to swap into the left main pane (when
+            ``TMUX_PANE`` is unset; otherwise the orchestrator pane is
+            already authoritative).
+        team_id: the kaizen team_id (UUID returned by TeamCreate). When
+            supplied, every mapped teammate pane is tagged with
+            ``@kaizen_team_id=<team_id>`` via tmux user-option so the
+            cleanup path (kaizen#68 L3) can distinguish panes belonging
+            to THIS team from panes belonging to a concurrent kaizen
+            run sharing the same role-ids. Untagged panes are left
+            untouched.
 
     No-op (returns ``{}``) when:
       - tmux server isn't running
@@ -364,6 +426,25 @@ def apply_workspace_layout(
 
     # Step 3 — fold the right column into a 2-column grid.
     fold_right_column(pane_ids)
+
+    # kaizen#68 iter 3 — tag every teammate pane with the team_id so the
+    # cleanup path (L3) can gate destructive actions on team-id equality.
+    # CRITICAL: do NOT tag the orchestrator pane (lead_pane_id) — its
+    # exclusion in cleanup must remain the TMUX_PANE check, never a
+    # ``@kaizen_team_id == this_team_id`` check (the orchestrator is
+    # logically a member of the team but must outlive it).
+    # ``tag_pane_team_id`` is fail-tolerant for "no server" / "pane gone".
+    if team_id:
+        for pane_id in pane_to_agent:
+            if lead_pane_id and pane_id == lead_pane_id:
+                continue
+            try:
+                tag_pane_team_id(pane_id, team_id)
+            except Exception as exc:  # pragma: no cover - defensive
+                print(
+                    f"[_tmux_workspace] tag_pane_team_id({pane_id}, {team_id}) raised: {exc!r}",
+                    file=sys.stderr,
+                )
 
     return pane_to_agent
 

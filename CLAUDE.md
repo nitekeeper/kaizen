@@ -55,7 +55,7 @@ This is the only user-invocable command. All other operations live in `internal/
 
 ## Working rules
 
-1. **User-initiated only.** No agent may invoke `kaizen:improve` from another skill or script. Kaizen is run by humans.
+1. **Invocation.** `kaizen:improve` may be invoked by a human user OR by Claude Code when the current work matches kaizen's scope (any fix/upgrade to an app repo). Claude must confirm the subject/scope with the user before invoking, since the run is non-trivial (cycles, branch, bundled PR). Other agents/skills/scripts MUST NOT auto-invoke `kaizen:improve` as a side effect — the trigger is always either a human or Claude Code in direct dialogue with the user.
 2. **Bundled PR per run.** All cycles in one `kaizen:improve` invocation produce a single PR — successful cycles as commits, abandoned cycles as report references in the PR body.
 3. **Skip-and-continue on abandonment.** A cycle that cannot reach completion (no consensus, all destructive rejected, tests unrecoverable, etc.) produces a formal report and the next cycle still runs.
 4. **The clone is the work area.** All git operations happen in `experiment/<owner>-<repo>/`. The clone is destroyed after the PR opens, whether cycles succeeded or were all abandoned.

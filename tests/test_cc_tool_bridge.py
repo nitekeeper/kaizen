@@ -802,6 +802,76 @@ def test_cycle_wall_constant_default():
     assert QueueBridgeWrapper.CYCLE_WALL_S == 3600.0
 
 
+# ── KAIZEN_CYCLE_WALL_S env-override (run-33 operator escape hatch) ─────
+#
+# Phase-3 mesh agreement caveat C2: defensive parsing — malformed env vars
+# MUST NOT abort a cycle. Four-branch coverage below pins the contract.
+
+
+def test_resolve_cycle_wall_s_default_when_unset(monkeypatch):
+    """Branch 1: KAIZEN_CYCLE_WALL_S unset → default 3600.0."""
+    monkeypatch.delenv("KAIZEN_CYCLE_WALL_S", raising=False)
+    assert bridge_mod._resolve_cycle_wall_s() == 3600.0
+
+
+def test_resolve_cycle_wall_s_default_when_empty(monkeypatch):
+    """Branch 1 (continued): empty string treated identically to unset."""
+    monkeypatch.setenv("KAIZEN_CYCLE_WALL_S", "")
+    assert bridge_mod._resolve_cycle_wall_s() == 3600.0
+
+
+def test_resolve_cycle_wall_s_warns_and_defaults_on_non_numeric(monkeypatch, capsys):
+    """Branch 2: non-numeric value → stderr warning + default fallback,
+    no exception raised (a malformed env var MUST NOT abort a cycle)."""
+    monkeypatch.setenv("KAIZEN_CYCLE_WALL_S", "garbage")
+    value = bridge_mod._resolve_cycle_wall_s()
+    assert value == 3600.0
+    captured = capsys.readouterr()
+    assert "KAIZEN_CYCLE_WALL_S" in captured.err
+    assert "'garbage'" in captured.err
+    assert "not numeric" in captured.err
+
+
+def test_resolve_cycle_wall_s_warns_and_defaults_on_zero(monkeypatch, capsys):
+    """Branch 3: numeric but <= 0 → stderr warning + default fallback."""
+    monkeypatch.setenv("KAIZEN_CYCLE_WALL_S", "0")
+    value = bridge_mod._resolve_cycle_wall_s()
+    assert value == 3600.0
+    captured = capsys.readouterr()
+    assert "KAIZEN_CYCLE_WALL_S" in captured.err
+    assert "must be" in captured.err
+
+
+def test_resolve_cycle_wall_s_warns_and_defaults_on_negative(monkeypatch, capsys):
+    """Branch 3 (continued): negative values follow the <= 0 path."""
+    monkeypatch.setenv("KAIZEN_CYCLE_WALL_S", "-10")
+    value = bridge_mod._resolve_cycle_wall_s()
+    assert value == 3600.0
+    captured = capsys.readouterr()
+    assert "KAIZEN_CYCLE_WALL_S" in captured.err
+
+
+def test_resolve_cycle_wall_s_uses_positive_value(monkeypatch, capsys):
+    """Branch 4: numeric and > 0 → use it, no warning, no upper clamp.
+
+    The operator escape hatch trusts the operator — a 24-hour override
+    must round-trip unaltered.
+    """
+    monkeypatch.setenv("KAIZEN_CYCLE_WALL_S", "7200")
+    assert bridge_mod._resolve_cycle_wall_s() == 7200.0
+
+    monkeypatch.setenv("KAIZEN_CYCLE_WALL_S", "86400")
+    assert bridge_mod._resolve_cycle_wall_s() == 86400.0
+
+    monkeypatch.setenv("KAIZEN_CYCLE_WALL_S", "0.5")
+    assert bridge_mod._resolve_cycle_wall_s() == 0.5
+
+    captured = capsys.readouterr()
+    assert captured.err == "", (
+        f"positive values must not emit a warning; got stderr: {captured.err!r}"
+    )
+
+
 def test_cycle_wall_clock_exceeded_raises_bridge_stall_error(bridge_path, monkeypatch):
     """Issue #42: when the per-cycle outer wall-clock budget is exceeded,
     the next ``_request()`` call raises ``BridgeStallError`` carrying

@@ -31,7 +31,9 @@ Per the python-cc-tool-bridge design (Rev 4):
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -71,7 +73,54 @@ STALE_ROW_S: float = 900.0
 # = 8h). 3600s is generous for legitimate multi-wave cycles but bounds the
 # pathological case. Tripped via `BridgeStallError("cycle wall-clock exceeded")`.
 # Issue #42 / PR review round 1 (architect MINOR finding).
-CYCLE_WALL_S: float = 3600.0
+#
+# Operator escape hatch: set ``KAIZEN_CYCLE_WALL_S=<seconds>`` in the
+# environment to override the default. Added in response to run 33
+# (project-kaizen-run-33-portability-bundle) where cycle 1 cleared
+# 0-BLOCKING reviewers but the 3600s cycle wall expired before
+# commit/push, forcing hand-finish as PR #56. Parsing is defensive —
+# malformed env vars MUST NOT abort a cycle.
+_DEFAULT_CYCLE_WALL_S: float = 3600.0
+
+
+def _resolve_cycle_wall_s() -> float:
+    """Resolve the per-cycle wall-clock budget from ``KAIZEN_CYCLE_WALL_S``.
+
+    Contract (Phase-3 mesh agreement, backend-engineer-1 caveat C2):
+
+      * unset or empty string → ``_DEFAULT_CYCLE_WALL_S``
+      * non-numeric           → warn to stderr, fall back to default
+      * numeric and <= 0      → warn to stderr, fall back to default
+      * numeric and > 0       → use it (no upper clamp — operator escape
+        hatch, trust the operator)
+
+    Resolution happens at module import time; subsequent in-process env
+    mutation does not take effect (matches the existing pattern of
+    overriding ``wrapper.CYCLE_WALL_S`` per-instance for tests).
+    """
+    raw = os.environ.get("KAIZEN_CYCLE_WALL_S")
+    if raw is None or raw == "":
+        return _DEFAULT_CYCLE_WALL_S
+    try:
+        value = float(raw)
+    except ValueError:
+        print(
+            f"[kaizen.cc_tool_bridge] KAIZEN_CYCLE_WALL_S={raw!r} is not "
+            f"numeric; falling back to default {_DEFAULT_CYCLE_WALL_S}s.",
+            file=sys.stderr,
+        )
+        return _DEFAULT_CYCLE_WALL_S
+    if value <= 0:
+        print(
+            f"[kaizen.cc_tool_bridge] KAIZEN_CYCLE_WALL_S={value} must be "
+            f"> 0; falling back to default {_DEFAULT_CYCLE_WALL_S}s.",
+            file=sys.stderr,
+        )
+        return _DEFAULT_CYCLE_WALL_S
+    return value
+
+
+CYCLE_WALL_S: float = _resolve_cycle_wall_s()
 
 # Module-level table of per-run "last python heartbeat" monotonic timestamps.
 # Keyed by run_id (multiple QueueBridgeWrapper instances in one process may

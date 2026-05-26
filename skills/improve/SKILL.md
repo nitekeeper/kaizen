@@ -152,6 +152,13 @@ When Step 3 (subagent mode) or Step 3b (team mode) returns, surface the summary 
 
 ## Reference
 
+### Environment variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` | (unset) | Required (`=1`) when `--mode team`. Run aborts before any clone if absent. |
+| `KAIZEN_CYCLE_WALL_S` | `3600` | Per-cycle outer wall-clock budget in seconds, applied by `scripts/cc_tool_bridge.py`'s `QueueBridgeWrapper`. Bounds worst-case bridge time at `CYCLE_WALL_S` regardless of how many dispatches a cycle issues. Operator escape hatch added after run 33 (cycle 1 cleared 0-BLOCKING reviewers but the 3600s wall expired before commit/push, forcing hand-finish as PR #56). Parsing is defensive: unset/empty → default; non-numeric or `<= 0` → stderr warning + default fallback (a malformed env var MUST NOT abort a cycle); positive values are used as-is with no upper clamp (trust the operator). Read once at module import time. |
+
 ### Team mode bridge protocol (only when `--mode team`)
 
 After Step 3b's create-run-only returns `run_id` and Step 3b spawns Python detached, you (the orchestrating Claude session) enter the bridge poll loop. Python is in its own process; you communicate only via `$KAIZEN_ROOT/.ai/bridge.db`.

@@ -125,9 +125,13 @@ def test_phase_3_close_golden():
         "(list[str]), reads (list[str]), depends_on (list[str]), "
         "wave (int), owner (str role id). "
         "Prefix 'ABANDON:' if no DAG can be agreed. "
-        "For each file in `touches`, include any corresponding test file "
-        "in `reads` (e.g. `tests/test_X.py` for `src/X.py` or "
-        "`scripts/X.py`)." + _UNTRUSTED_INPUT + _RULE
+        "Test files this cycle will CREATE belong in `touches`, not "
+        "`reads`; only put a file in `reads` if it already exists in "
+        "the target repo or will be produced by an earlier wave in this "
+        "DAG. Example: a wave-1 Action Item that creates `src/foo.py` "
+        "and `tests/test_foo.py` together MUST list both in `touches`, "
+        "with `reads` empty (or referencing only pre-existing "
+        "dependencies like `scripts/util.py`)." + _UNTRUSTED_INPUT + _RULE
     )
 
 

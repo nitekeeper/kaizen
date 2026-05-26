@@ -561,15 +561,23 @@ def test_phase_5b_prime_fix_mentions_pytest_status():
     assert "pytest" in msg
 
 
-def test_phase_3_close_asks_for_test_files_in_reads():
-    """F8: each touched file's corresponding test file must be in `reads`
-    so the implementer can update tests in the same Phase 4 commit."""
+def test_phase_3_close_puts_test_files_in_touches_not_reads():
+    """kaizen#69: test files this cycle will CREATE belong in `touches`,
+    not `reads`. The prior guidance ("corresponding test file in `reads`")
+    caused run 36 to abandon because the DAG validator rejects a `reads`
+    entry that neither pre-exists nor is produced by an earlier wave.
+    The corrected wording aligns the architect's brief with the
+    validator's contract (`scripts.dag.UnsatisfiableReadsError`)."""
     msg = phase_3_close(
         proposals=[{"agent": "be-1", "raw": "p"}],
         agreements=[{"agent": "be-1", "raw": "a"}],
     )
-    assert "corresponding test file" in msg
-    assert "tests/test_X.py" in msg
+    # Negative: the legacy phrasing must be gone.
+    assert "corresponding test file in `reads`" not in msg
+    # Positive: the corrected guidance must be explicit.
+    assert "in `touches`, not `reads`" in msg
+    # Example mentions a co-produced test file in `touches`.
+    assert "tests/test_foo.py" in msg
 
 
 def test_phase_4_implementer_brief_directs_neighbor_file_reading():

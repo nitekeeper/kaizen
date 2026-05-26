@@ -296,6 +296,91 @@ def test_border_renders_desired_title_after_pane_title_override(routed_persist_t
     )
 
 
+def test_border_format_falls_back_to_pane_title_for_non_kaizen_panes(routed_persist_tmux):
+    """kaizen#72.3: pane-border-format must NOT clobber operator's pane_title.
+
+    The fallback ``#{?@desired_title,#{@desired_title},#{pane_title}}``
+    is designed so that panes WITHOUT ``@desired_title`` set (e.g. the
+    operator's plain shell panes that share the same tmux server but
+    are not part of the kaizen team workspace) render their native
+    ``pane_title`` unchanged.
+
+    Setup mirrors a shared tmux session: two panes, one titled by
+    kaizen (gets ``@desired_title``), one titled the regular way
+    (``select-pane -T``, leaves ``@desired_title`` unset). The format
+    must render each pane's intended label without collision.
+    """
+    pane_ids = _spawn_session(n_panes=2)
+    assert len(pane_ids) == 2
+    kaizen_pane, operator_pane = pane_ids
+
+    # Install the agent-teams pane-border-format on this server (mirrors
+    # what scripts/setup.py writes to ~/.tmux.conf via apply_config_block).
+    _tmux(
+        "set-option",
+        "-g",
+        "pane-border-format",
+        "#{?@desired_title,#{@desired_title},#{pane_title}}",
+    )
+
+    # 1. kaizen-managed pane: production path sets BOTH @desired_title
+    #    and pane_title.
+    _tmux_workspace.set_pane_title(kaizen_pane, "[w1] backend-engineer-1")
+
+    # 2. operator-managed pane: regular tmux title — NO @desired_title
+    #    user-option (the operator never asked kaizen to manage it).
+    _tmux("select-pane", "-t", operator_pane, "-T", "operator-shell")
+    # Defensive: explicitly ensure @desired_title is unset on this pane
+    # (in case any test order pollution sets it).
+    _tmux("set-option", "-pu", "-t", operator_pane, "@desired_title", check=False)
+    time.sleep(0.05)
+
+    # Sanity precondition: @desired_title is set on the kaizen pane
+    # only.
+    kaizen_desired = _tmux(
+        "show-options", "-p", "-t", kaizen_pane, "-v", "@desired_title"
+    ).stdout.strip()
+    assert kaizen_desired == "[w1] backend-engineer-1", (
+        f"setup precondition: kaizen pane should have @desired_title set, got: {kaizen_desired!r}"
+    )
+    operator_desired = _tmux(
+        "show-options", "-p", "-t", operator_pane, "-v", "@desired_title", check=False
+    ).stdout.strip()
+    assert operator_desired == "", (
+        "setup precondition: operator pane should NOT have @desired_title set, "
+        f"got: {operator_desired!r}"
+    )
+
+    # Render the border format for each pane.
+    kaizen_rendered = _tmux(
+        "display-message",
+        "-p",
+        "-t",
+        kaizen_pane,
+        "#{?@desired_title,#{@desired_title},#{pane_title}}",
+    ).stdout.strip()
+    operator_rendered = _tmux(
+        "display-message",
+        "-p",
+        "-t",
+        operator_pane,
+        "#{?@desired_title,#{@desired_title},#{pane_title}}",
+    ).stdout.strip()
+
+    # The kaizen pane shows the @desired_title value.
+    assert kaizen_rendered == "[w1] backend-engineer-1", (
+        f"kaizen pane should render @desired_title; got: {kaizen_rendered!r}"
+    )
+    # The operator pane shows its regular pane_title — NOT clobbered.
+    assert operator_rendered == "operator-shell", (
+        "kaizen#72.3 regression: operator pane (no @desired_title) "
+        "should render its native pane_title via the fallback, but got: "
+        f"{operator_rendered!r}. Confirm the format string is "
+        "#{?@desired_title,#{@desired_title},#{pane_title}} — a missing "
+        "fallback would clobber non-kaizen panes."
+    )
+
+
 def test_set_pane_title_persists_across_pane_activation(routed_persist_tmux):
     """End-to-end: after select-pane (activation), @desired_title still holds.
 

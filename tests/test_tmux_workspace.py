@@ -12,7 +12,28 @@ from __future__ import annotations
 
 import subprocess as real_subprocess
 
+import pytest
+
 from scripts import _tmux_workspace
+
+
+@pytest.fixture(autouse=True)
+def _isolate_tmux_pane(monkeypatch):
+    """Ensure TMUX_PANE is unset for every test in this module by default.
+
+    Otherwise a developer running pytest from inside a real tmux session
+    sees the outer-pane id collide with mocked ids (e.g. %1). Concretely:
+    if ``TMUX_PANE=%1`` is inherited from the outer terminal,
+    ``_list_pane_ids`` would drop ``%1`` from the mocked list-panes
+    output, the positional zip against ``ordered_agents`` would silently
+    drop a real teammate, and tests that compare against a fixed
+    pane→agent map would fail non-deterministically.
+
+    Tests that need TMUX_PANE set (the kaizen#66 orchestrator-exclusion
+    tests) re-set it via ``monkeypatch.setenv("TMUX_PANE", ...)`` — that
+    overrides this autouse delenv. See kaizen#72 item 1.
+    """
+    monkeypatch.delenv("TMUX_PANE", raising=False)
 
 
 def _mk_proc(returncode: int = 0, stdout: str = "", stderr: str = ""):
@@ -826,3 +847,211 @@ def test_orchestrator_pane_id_returns_strip_value(monkeypatch):
 def test_orchestrator_pane_id_treats_empty_as_unset(monkeypatch):
     monkeypatch.setenv("TMUX_PANE", "")
     assert _tmux_workspace._orchestrator_pane_id() is None
+
+
+# ── kaizen#71 — pin fires even when _list_pane_ids returns empty ──────────
+#
+# Latent bug surfaced by sdet-1 during PR #70 review: the early-return
+# ``if pane_ids is None or not pane_ids: return {}`` fires BEFORE the
+# ``pin_orchestrator_title(lead_pane_id)`` call. If kaizen ever calls the
+# layout helper before any teammates are spawned (dry-run, probe, or a
+# future code path that wires layout earlier), the orchestrator title
+# would not be pinned even when TMUX_PANE is set and tmux is up.
+#
+# Fix: pin is independent of teammate count — move it ABOVE the empty-
+# list guard so it always fires when TMUX_PANE is set.
+
+
+def test_apply_workspace_layout_pins_orchestrator_when_pane_ids_empty(monkeypatch):
+    """kaizen#71: pin fires when list-panes returns empty but TMUX_PANE is set."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv:
+            # list-panes succeeds but returns no panes — simulates a
+            # dry-run / probe before any teammate panes are present.
+            return _mk_proc(0, "")
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    monkeypatch.delenv("KAIZEN_PM_PANE_GLYPH", raising=False)
+
+    result = _tmux_workspace.apply_workspace_layout(
+        workspace_name="w",
+        ordered_agents=["arch-1", "be-1"],
+    )
+    assert result == {}  # no teammate panes → empty map (unchanged contract)
+
+    # The PM pin MUST still have fired — target the orchestrator's pane
+    # (%1) with the reserved title regardless of teammate count.
+    pm_calls = [
+        c
+        for c in calls
+        if "select-pane" in c
+        and "-t" in c
+        and c[c.index("-t") + 1] == "%1"
+        and "-T" in c
+        and "team-lead / PM" in c[c.index("-T") + 1]
+    ]
+    assert len(pm_calls) >= 1, (
+        "kaizen#71: orchestrator title was NOT pinned when list-panes "
+        f"returned empty (pin fires after the empty-list guard); calls: {calls}"
+    )
+
+
+# ── kaizen#72 item 2 — layout completes when pin_orchestrator_title raises
+#
+# pin_orchestrator_title is built on _persist_desired_title + set_pane_title,
+# both fail-tolerant. But the sequence "pin fails first → continue to
+# select-layout / join-pane / set_pane_titles" isn't directly exercised.
+# This test pins that contract: a buggy pin must NOT abort the layout.
+
+
+def test_apply_workspace_layout_continues_when_pin_orchestrator_title_raises(monkeypatch):
+    """kaizen#72.2: a raise from pin_orchestrator_title must NOT abort layout."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv:
+            return _mk_proc(0, "%1\n%2\n%3\n")
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    monkeypatch.setenv("TMUX_PANE", "%1")
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated pin failure (kaizen#72.2)")
+
+    monkeypatch.setattr(_tmux_workspace, "pin_orchestrator_title", boom)
+
+    # Must NOT raise — layout must complete with the post-exclusion
+    # positional map. If pin's exception escapes, the whole layout helper
+    # aborts and pane→agent mapping is lost.
+    result = _tmux_workspace.apply_workspace_layout(
+        workspace_name="w",
+        ordered_agents=["be-1", "sdet-1"],
+    )
+    # %1 (orchestrator) is excluded; %2/%3 zip with be-1/sdet-1.
+    assert result == {"%2": "be-1", "%3": "sdet-1"}, (
+        f"kaizen#72.2: layout did not complete after pin raised; got: {result}"
+    )
+    # select-layout main-vertical MUST have fired (proves we passed the
+    # pin call site without aborting).
+    layout_calls = [c for c in calls if "select-layout" in c]
+    assert len(layout_calls) == 1, (
+        "kaizen#72.2: select-layout did not fire after pin raised — "
+        f"the exception escaped apply_workspace_layout. calls: {calls}"
+    )
+
+
+# ── kaizen#72 item 2 (helper-side) — pin_orchestrator_title's own
+# "never raises" contract.
+#
+# apply_workspace_layout wraps pin_orchestrator_title in a try/except as
+# belt-and-suspenders (see test_apply_workspace_layout_continues_when_
+# pin_orchestrator_title_raises above), but the authoritative contract
+# lives on pin_orchestrator_title itself — its docstring states "Tolerant
+# of 'tmux server not running' / 'pane gone' — never raises." This test
+# pins that contract directly at the source: if either internal helper
+# (_persist_desired_title or set_pane_title) drops its fail-tolerance in
+# the future, THIS test fails first — closer to the cause than the
+# caller-side test, and survives even if a future refactor removes the
+# caller-side try/except.
+#
+# software-architect-1 reviewer note (PR #70 follow-up): the regression
+# for #72.2 should live on the helper, not just the caller.
+
+
+def test_pin_orchestrator_title_never_raises_when_helpers_fail(monkeypatch):
+    """kaizen#72.2 (helper-side): pin contract is "never raises".
+
+    Exercises the two failure modes the internal helpers
+    (``_persist_desired_title`` and ``set_pane_title``) are documented
+    to absorb: tmux returning a hard error returncode (pane gone /
+    other) and tmux being unavailable (no server). pin's docstring
+    contract is "never raises"; this test pins that contract at the
+    helper level so a future refactor that removes the helpers'
+    returncode tolerance fires HERE first — closer to the source than
+    the caller-side ``apply_workspace_layout`` test.
+    """
+
+    # ── Scenario 1: tmux subprocess returns hard error (pane gone) ──
+    # Both ``_persist_desired_title`` (set-option) and ``set_pane_title``
+    # (select-pane) hit subprocess errors. Helpers must swallow + emit
+    # a stderr warning; pin must NOT raise.
+    def fake_run_hard_error(argv, **kwargs):
+        return _mk_proc(1, "", "can't find pane: %9")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run_hard_error)
+    result = _tmux_workspace.pin_orchestrator_title("%9")
+    # The helper returns None (no-return function). Pinning the current
+    # return shape here means a future signature change that adds a
+    # raise-on-error return becomes a test failure rather than silent
+    # behavioral drift.
+    assert result is None, (
+        f"pin_orchestrator_title should return None on hard tmux error; got: {result!r}"
+    )
+
+    # ── Scenario 2: tmux server unavailable (soft "no server") ──────
+    # The other path the helpers defend against — distinct from a
+    # hard returncode error, routed through ``_tmux_unavailable``.
+    def fake_run_no_server(argv, **kwargs):
+        return _mk_proc(1, "", "no server running on /tmp/tmux-1000/default")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run_no_server)
+    result2 = _tmux_workspace.pin_orchestrator_title("%9")
+    assert result2 is None, (
+        f"pin_orchestrator_title should return None when tmux server is missing; got: {result2!r}"
+    )
+
+
+# ── kaizen#72 item 1 — autouse fixture is load-bearing ────────────────────
+#
+# Proves the module-level autouse ``_isolate_tmux_pane`` fixture prevents
+# a real failure: if TMUX_PANE leaks from the developer's outer terminal
+# and happens to match a mocked pane id, the positional zip drops a real
+# teammate. This test simulates that scenario (without the autouse
+# fixture, it would fail).
+#
+# This test deliberately does NOT setenv TMUX_PANE — it relies on the
+# autouse delenv. We assert the resulting pane→agent map contains every
+# teammate (i.e., none was dropped by an outer-tmux %1 collision).
+
+
+def test_autouse_tmux_pane_isolation_is_load_bearing(monkeypatch):
+    """kaizen#72.1: the autouse delenv must keep TMUX_PANE unset.
+
+    Without the fixture, a developer with ``TMUX_PANE=%1`` in their
+    environment would see ``_list_pane_ids`` drop ``%1`` from the mocked
+    output, the positional zip would collapse the agent list by one, and
+    the assertion below would fail. The fixture's removal would
+    reproduce that failure mode.
+    """
+    # Sanity: the autouse fixture is in effect — TMUX_PANE is unset.
+    import os
+
+    assert "TMUX_PANE" not in os.environ, (
+        "autouse fixture did not unset TMUX_PANE — test pollution risk"
+    )
+
+    def fake_run(argv, **kwargs):
+        if "list-panes" in argv:
+            return _mk_proc(0, "%1\n%2\n%3\n")
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    result = _tmux_workspace.apply_workspace_layout(
+        workspace_name="w",
+        ordered_agents=["arch-1", "be-1", "sdet-1"],
+    )
+    # All three teammates present — %1 was NOT dropped as a fake-
+    # orchestrator. If a stale TMUX_PANE=%1 had leaked, ``arch-1`` would
+    # be missing from this map.
+    assert result == {
+        "%1": "arch-1",
+        "%2": "be-1",
+        "%3": "sdet-1",
+    }, f"outer-tmux TMUX_PANE may have leaked into the test; got: {result}"

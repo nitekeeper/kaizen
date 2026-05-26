@@ -278,6 +278,39 @@ def apply_workspace_layout(
         return {}
 
     pane_ids = _list_pane_ids(workspace_name)
+
+    # kaizen#66 — pin the orchestrator's pane title to a reserved literal
+    # once at workspace boot. ``_list_pane_ids`` already drops the
+    # orchestrator pane_id from the returned list (so it does not appear in
+    # ``pane_to_agent``); this call targets the pane by its global pane_id
+    # so it works regardless of which window is current.
+    #
+    # kaizen#71 — pin BEFORE the empty-list guard. Pinning is independent
+    # of teammate count: if kaizen invokes the layout helper before any
+    # teammates are spawned (dry-run, probe, or a future code path that
+    # wires layout earlier), the PM pane must still get its reserved
+    # title. The call is fail-tolerant (pin_orchestrator_title swallows
+    # "no server" / "pane gone") so this cannot abort the layout when
+    # tmux is missing or unhealthy.
+    lead_pane_id = _orchestrator_pane_id()
+    if lead_pane_id:
+        try:
+            pin_orchestrator_title(lead_pane_id)
+        except Exception as exc:
+            # kaizen#72 item 2 — pin_orchestrator_title is already
+            # fail-tolerant for tmux's "no server" / "pane gone" paths
+            # via its _persist_desired_title + set_pane_title helpers.
+            # This catch is belt-and-suspenders against a future helper
+            # change that drops the soft-fail: a buggy pin must NOT
+            # abort the rest of the layout (select-layout, join-pane,
+            # set_pane_titles), which is what the operator actually
+            # sees on screen.
+            print(
+                f"[_tmux_workspace] pin_orchestrator_title({lead_pane_id}) raised "
+                f"unexpectedly; continuing with layout: {exc!r}",
+                file=sys.stderr,
+            )
+
     if pane_ids is None or not pane_ids:
         return {}
 
@@ -286,15 +319,6 @@ def apply_workspace_layout(
     pane_to_agent: dict[str, str] = {
         pane_ids[i]: ordered_agents[i] for i in range(min(len(pane_ids), len(ordered_agents)))
     }
-
-    # kaizen#66 — pin the orchestrator's pane title to a reserved literal
-    # once at workspace boot. ``_list_pane_ids`` already drops the
-    # orchestrator pane_id from the returned list (so it does not appear in
-    # ``pane_to_agent``); this call targets the pane by its global pane_id
-    # so it works regardless of which window is current.
-    lead_pane_id = _orchestrator_pane_id()
-    if lead_pane_id:
-        pin_orchestrator_title(lead_pane_id)
 
     # Step 1 — main-vertical (1 wide left + N stacked right). Same kaizen#61
     # reasoning as ``_list_pane_ids``: target the orchestrator's current

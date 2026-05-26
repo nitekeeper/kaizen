@@ -102,7 +102,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from scripts._tmux_workspace import apply_workspace_layout, set_pane_titles
+from scripts._tmux_workspace import apply_workspace_layout, set_pane_title, set_pane_titles
 from scripts.ci_runner import run_ci_checks
 from scripts.cycle_git import commit_cycle
 from scripts.dag import validate_dag
@@ -509,6 +509,55 @@ def _diff_ci_results(
 _MAIN_AGENT_PREFERENCE = ("agent-systems-architect-1", "software-architect-1", "pm-1")
 
 
+def _apply_pane_label(
+    recipient: str,
+    desired_title: str,
+    current_title: dict[str, str],
+    pane_to_agent: dict[str, str],
+) -> bool:
+    """Idempotent per-pane retitle, gated on whether the desired label changed.
+
+    Returns ``True`` iff a tmux retitle call was actually issued. The
+    decision predicate is "the recipient's last-applied label is NOT
+    equal to ``desired_title``" — so a Phase 5b' reviewer respawn whose
+    pane is currently labeled ``[w3] sdet-1`` retitles to
+    ``[R2] sdet-1`` even though the recipient is "already in" the
+    layout's initial role-name dictionary.
+
+    This replaces the older one-shot ``titled_recipients: set[str]``
+    pattern (R1-2 fix, kaizen#61): under the prior pattern, any
+    recipient added to the set at layout time would silently skip every
+    subsequent retitle even if the desired label changed across wave /
+    reviewer iterations. The dict-of-labels form lets the predicate
+    look at the actual currently-applied label rather than a binary
+    "have we ever titled this pane" flag.
+
+    Tolerances (mirror :func:`scripts._tmux_workspace.set_pane_title`):
+      - empty ``pane_to_agent`` → return False (tmux unavailable or
+        layout hasn't been applied yet);
+      - recipient absent from ``pane_to_agent`` → return False
+        (positional zip mismatched the roster, or CC reordered panes);
+      - ``set_pane_title`` itself soft-fails on no-server tmux, so the
+        update to ``current_title`` is best-effort but never raises.
+
+    The ``current_title`` dict is mutated in place when a retitle call
+    is issued — the caller MUST pass the same dict across all
+    invocations within one cycle so the label-change predicate sees a
+    consistent view.
+    """
+    if current_title.get(recipient) == desired_title:
+        return False
+    if not pane_to_agent:
+        return False
+    agent_to_pane = {agent: pid for pid, agent in pane_to_agent.items()}
+    pid = agent_to_pane.get(recipient)
+    if pid is None:
+        return False
+    set_pane_title(pid, desired_title)
+    current_title[recipient] = desired_title
+    return True
+
+
 def _pick_main_agent(roster: list[str]) -> str:
     """Return the first agent from ``_MAIN_AGENT_PREFERENCE`` in ``roster``.
 
@@ -646,6 +695,9 @@ def team_cycle_executor(
         def send_message(self, team_id: str, to: str, message: str) -> str:
             resp = self._inner.send_message(team_id, to, message)
             active_members.add(to)
+            # kaizen#61 — per-spawn retitle hook. Apply tmux layout +
+            # title this recipient's pane on first observation.
+            _retitle_on_first_send(to)
             return resp
 
         def send_message_many(self, messages: list[dict]) -> list[str]:
@@ -656,6 +708,9 @@ def team_cycle_executor(
             # `to` in the batch is active.
             for m in messages:
                 active_members.add(m["to"])
+                # kaizen#61 — retitle each batch recipient on first
+                # observation. Set-membership keeps repeats cheap.
+                _retitle_on_first_send(m["to"])
             return resps
 
         def team_delete(self, team_id: str) -> None:
@@ -666,14 +721,30 @@ def team_cycle_executor(
 
     team_id = tools.team_create(team_name, members=list(roster) if roster else [pm])
 
-    # Tmux workspace setup — populated once, after Phase 2 fan-out
-    # materialises every teammate's pane. See _MAIN_AGENT_PREFERENCE
-    # comment block above for the design rationale.
+    # Tmux workspace setup — populated lazily as teammates are spawned by
+    # SendMessage (CC's team-mode spawn is lazy, not at TeamCreate time).
+    # See _MAIN_AGENT_PREFERENCE comment block above for the layout
+    # rationale.
     pane_to_agent: dict[str, str] = {}
+    # kaizen#61 / R1-2 (Phase 5b' major): replace the prior one-shot
+    # ``titled_recipients: set[str]`` with a label-tracking dict so the
+    # retitle predicate compares the CURRENT pane label against the
+    # desired one. The earlier set form silently swallowed every retitle
+    # request for a recipient that had ever been labeled — Phase 5b'
+    # reviewer respawns would keep their Phase 4 ``[w{n}]`` label (or
+    # bare role for non-implementer reviewers) so the operator could
+    # not visually distinguish a fix-loop iteration from a past wave.
+    # See :func:`scripts.team_executor._apply_pane_label` for the
+    # decision predicate.
+    current_title: dict[str, str] = {}
+    # One-shot "did I fold yet" flag (Phase 4 wave dispatch retitles but
+    # MUST NOT re-fold — re-folding would undo earlier join-pane work).
+    layout_applied: list[bool] = [False]
 
     def _setup_tmux_layout_once() -> None:
-        if pane_to_agent:
-            return  # already applied this cycle
+        if layout_applied[0]:
+            return
+        layout_applied[0] = True
         try:
             result = apply_workspace_layout(
                 workspace_name=team_name,
@@ -686,11 +757,38 @@ def team_cycle_executor(
         pane_to_agent.update(result)
         if pane_to_agent:
             # Pre-wave initial titles: bare role names, no wave prefix
-            # yet. Phase 4 overwrites these with ``[w{n}] {role}`` per wave.
+            # yet. Phase 4 overwrites these with ``[w{n}] {role}`` per wave;
+            # Phase 5b' overwrites with ``[R{iter_n}] {role}`` per round.
             try:
                 set_pane_titles(team_name, dict(pane_to_agent))
             except Exception as exc:  # pragma: no cover - defensive
                 _log.warning("initial set_pane_titles failed: %s", exc)
+            # Record each role's CURRENT label (bare role name) so the
+            # next retitle predicate can compare against the desired
+            # label and decide whether a tmux call is needed.
+            for role in pane_to_agent.values():
+                current_title[role] = role
+
+    def _retitle_on_first_send(recipient: str) -> None:
+        """Apply layout (if not yet) and label the recipient's pane.
+
+        Called after every successful ``send_message`` /
+        ``send_message_many`` from ``_TrackedTools``. The label-change
+        predicate inside :func:`_apply_pane_label` makes this cheap
+        on repeat calls — a recipient already labeled with its bare
+        role name is a one-comparison no-op.
+
+        Phase 4 and Phase 5b' wrap a different desired label
+        (``[w{n}] {role}`` / ``[R{iter_n}] {role}``) so the per-spawn
+        bare-role label here is only authoritative until the first
+        wave/iter dispatch overrides it.
+        """
+        if not layout_applied[0]:
+            _setup_tmux_layout_once()
+        try:
+            _apply_pane_label(recipient, recipient, current_title, pane_to_agent)
+        except Exception as exc:  # pragma: no cover - defensive
+            _log.warning("per-spawn retitle for %s failed: %s", recipient, exc)
 
     try:
         # ── Phase 1 — Agenda (PM) ─────────────────────────────────────────
@@ -890,19 +988,25 @@ def team_cycle_executor(
                 # retitle the wave's owners' panes (issue kaizen#55).
                 # Tolerant of "no server running" / missing pane — never raises.
                 _setup_tmux_layout_once()
-                if pane_to_agent:
-                    agent_to_pane = {agent: pid for pid, agent in pane_to_agent.items()}
+                # R1-2: route the wave-prefix retitle through the same
+                # `_apply_pane_label` predicate the per-spawn hook uses,
+                # so the `current_title` dict stays the single source of
+                # truth for "what label is on each pane right now."
+                for name in wave_owners:
                     try:
-                        set_pane_titles(
-                            team_name,
-                            {
-                                agent_to_pane[name]: f"[w{wave_n}] {name}"
-                                for name in wave_owners
-                                if name in agent_to_pane
-                            },
+                        _apply_pane_label(
+                            name,
+                            f"[w{wave_n}] {name}",
+                            current_title,
+                            pane_to_agent,
                         )
                     except Exception as tmux_exc:  # pragma: no cover - defensive
-                        _log.warning("set_pane_titles for wave %s failed: %s", wave_n, tmux_exc)
+                        _log.warning(
+                            "wave-%s retitle for %s failed: %s",
+                            wave_n,
+                            name,
+                            tmux_exc,
+                        )
                 wave_abandoned = False
                 for ai_id in wave_ids:
                     item = items_by_id[ai_id]
@@ -1008,6 +1112,30 @@ def team_cycle_executor(
                         # rather than a fresh scan (Major 3).
                         prior = state.history[-1] if state.history else None
                         findings: list[Finding] = []
+                        # R1-2: retitle reviewer panes to ``[R{iter_n}] {role}``
+                        # so the operator can visually distinguish a
+                        # fix-loop iteration from a past Phase 4 wave.
+                        # Without this, a reviewer that wasn't a Phase 4
+                        # implementer keeps its bare role-name label; a
+                        # reviewer that WAS keeps its last ``[w{wave_n}]``
+                        # label (both confusing). The `_apply_pane_label`
+                        # predicate fires the retitle iff the desired
+                        # label actually differs from the current one.
+                        for reviewer in reviewers:
+                            try:
+                                _apply_pane_label(
+                                    reviewer,
+                                    f"[R{iter_n}] {reviewer}",
+                                    current_title,
+                                    pane_to_agent,
+                                )
+                            except Exception as tmux_exc:  # pragma: no cover - defensive
+                                _log.warning(
+                                    "Phase 5b' iter-%s reviewer retitle for %s failed: %s",
+                                    iter_n,
+                                    reviewer,
+                                    tmux_exc,
+                                )
                         # GAP-4: batch-dispatch reviewer briefs in parallel
                         # (was sequential; with 3 reviewers and ~60s/reply
                         # this was ~3x the necessary wall-clock per round).
@@ -1037,6 +1165,20 @@ def team_cycle_executor(
                         # Ask the PM whether the remaining findings are
                         # acceptable for this cycle. PM-acceptance is a
                         # legit exit per SKILL contract (Major 2).
+                        # R1-2: retitle PM pane with the iter label so
+                        # the operator sees ``[R{n}] pm-1`` while the
+                        # acceptance prompt is in flight.
+                        try:
+                            _apply_pane_label(
+                                pm,
+                                f"[R{iter_n}] {pm}",
+                                current_title,
+                                pane_to_agent,
+                            )
+                        except Exception as tmux_exc:  # pragma: no cover - defensive
+                            _log.warning(
+                                "Phase 5b' iter-%s PM retitle failed: %s", iter_n, tmux_exc
+                            )
                         pm_resp = tools.send_message(
                             team_id,
                             to=pm,
@@ -1064,6 +1206,25 @@ def team_cycle_executor(
                         fix_loop_aborted = False
                         for finding in latest_blockers:
                             fix_owner = _find_owner_for_finding(finding, file_to_owner, pm)
+                            # R1-2: retitle the fix recipient to the
+                            # current iteration label. A teammate that
+                            # was last labeled as Phase 4 implementer
+                            # (``[w{n}] {role}``) now reads ``[R{n}] {role}``
+                            # while the fix dispatch is in flight.
+                            try:
+                                _apply_pane_label(
+                                    fix_owner,
+                                    f"[R{iter_n}] {fix_owner}",
+                                    current_title,
+                                    pane_to_agent,
+                                )
+                            except Exception as tmux_exc:  # pragma: no cover - defensive
+                                _log.warning(
+                                    "Phase 5b' iter-%s fix retitle for %s failed: %s",
+                                    iter_n,
+                                    fix_owner,
+                                    tmux_exc,
+                                )
                             fix_resp = tools.send_message(
                                 team_id,
                                 to=fix_owner,

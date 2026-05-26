@@ -53,6 +53,7 @@ not have a tmux server up).
 
 from __future__ import annotations
 
+import re
 import shlex
 import subprocess
 import sys
@@ -63,6 +64,73 @@ _NO_SERVER_HINTS = (
     "can't find session",
     "no such session",
 )
+
+# Pane title sanitizer constants (kaizen#61 — Mesh T3 union sanitizer).
+#
+# strip → escape → left-truncate (64 chars). Pure function, no I/O.
+#
+# Strip set:
+#   - C0 control range (0x00-0x1f, includes ESC \x1b)
+#   - DEL (0x7f)
+#   - Unicode bidi controls (U+202A-U+202E, U+2066-U+2069) — security-eng's
+#     concern: a bidi-injected title can mis-render in the tmux status bar
+#     and disguise the active role.
+# CSI / OSC initiators are sequences (ESC + bracket / ESC + ]) — once ESC
+# itself is stripped, the rest of the sequence becomes inert text that
+# stays printable; no separate CSI/OSC handling is required.
+# Bidi-control codepoints we strip. Expressed as numeric ``chr()`` so the
+# literal codepoints never appear in this source file — bandit B613
+# (TrojanSource) would otherwise flag the literals, and more importantly
+# THIS file is the sanitizer for bidi-control injection so it must not
+# embed them in the first place. The numeric ranges:
+#   - U+202A..U+202E: LRE, RLE, PDF, LRO, RLO  (legacy embedding/override)
+#   - U+2066..U+2069: LRI, RLI, FSI, PDI       (modern isolates)
+_BIDI_CONTROL_CODEPOINTS = tuple(list(range(0x202A, 0x202E + 1)) + list(range(0x2066, 0x2069 + 1)))
+_BIDI_CONTROLS = frozenset(chr(cp) for cp in _BIDI_CONTROL_CODEPOINTS)
+_STRIP_CHARS = frozenset({chr(i) for i in range(0x20)} | {"\x7f"}) | _BIDI_CONTROLS
+
+# Recognises a leading "[wN] " or "[wNN] " wave prefix so it is preserved
+# verbatim by left-truncation (the wave number is the high-information
+# bit alongside the role-id tail).
+_WAVE_PREFIX_RE = re.compile(r"^(\[w\d+\] )")
+
+_MAX_TITLE_LEN = 64
+
+
+def _sanitize_title(name: str, max_len: int = _MAX_TITLE_LEN) -> str:
+    """Sanitize a pane title in strict order: strip → escape → left-truncate.
+
+    Returns ``"?"`` if the input is empty/None or the result reduces to
+    empty after stripping. The function is pure (no I/O) and idempotent
+    on already-clean inputs of bounded length.
+
+    Truncation is left-side (keeps the meaningful suffix — role-id tail —
+    plus a leading ellipsis). If the title carries a leading ``[wN] ``
+    wave prefix, the prefix is preserved verbatim and the truncation eats
+    from the middle so a glance at the title still shows the wave number.
+    """
+    if not name:
+        return "?"
+    # 1. Strip — drop every control / bidi char in one O(n) pass.
+    cleaned = "".join(ch for ch in str(name) if ch not in _STRIP_CHARS)
+    if not cleaned:
+        return "?"
+    # 2. Escape tmux format meta. Single `#` introduces a format spec
+    # (e.g. `#H`, `#W`, `#{...}`); doubling it produces a literal `#`.
+    cleaned = cleaned.replace("#", "##")
+    # 3. Left-truncate. Fast path: already short enough.
+    if len(cleaned) <= max_len:
+        return cleaned
+    # 3a. Wave-prefix preservation. Keep "[wN] " + ellipsis + suffix.
+    m = _WAVE_PREFIX_RE.match(cleaned)
+    if m and len(m.group(1)) + 2 < max_len:
+        prefix = m.group(1)
+        # 1 char reserved for the ellipsis.
+        budget = max_len - len(prefix) - 1
+        return prefix + "…" + cleaned[-budget:]
+    # 3b. No prefix (or prefix alone exhausts the budget) — simple
+    # left-truncate with a leading ellipsis.
+    return "…" + cleaned[-(max_len - 1) :]
 
 
 def _run_tmux(argv: list[str]) -> subprocess.CompletedProcess:
@@ -101,8 +169,16 @@ def _list_pane_ids(workspace_name: str) -> list[str] | None:
 
     None is returned when tmux is unavailable OR list-panes hits a hard
     error; the helpers above use None as the "abandon this hook" signal.
+
+    NB (kaizen#61): ``workspace_name`` is intentionally NOT passed to tmux
+    as a target — it is a CC-internal team identifier, not a tmux
+    session/window name. CC's team-mode panes are created inside the
+    orchestrator's current tmux window (the same window the
+    ``kaizen:improve`` invocation runs in), so the default ``current``
+    target is what we want. The parameter is retained for log lines and
+    for future use if CC ever exposes a real session name.
     """
-    proc = _run_tmux(["list-panes", "-t", workspace_name, "-F", "#{pane_id}"])
+    proc = _run_tmux(["list-panes", "-F", "#{pane_id}"])
     if _tmux_unavailable(proc):
         return None
     if proc.returncode != 0:
@@ -153,8 +229,10 @@ def apply_workspace_layout(
         pane_ids[i]: ordered_agents[i] for i in range(min(len(pane_ids), len(ordered_agents)))
     }
 
-    # Step 1 — main-vertical (1 wide left + N stacked right).
-    layout_proc = _run_tmux(["select-layout", "-t", workspace_name, "main-vertical"])
+    # Step 1 — main-vertical (1 wide left + N stacked right). Same kaizen#61
+    # reasoning as ``_list_pane_ids``: target the orchestrator's current
+    # window via tmux's default, not the CC-internal team_name.
+    layout_proc = _run_tmux(["select-layout", "main-vertical"])
     if _tmux_unavailable(layout_proc):
         return pane_to_agent
     if layout_proc.returncode != 0:
@@ -187,10 +265,27 @@ def apply_workspace_layout(
                 if relisted is not None and relisted:
                     pane_ids = relisted
 
-    # Step 3 — fold the right column into a 2-column grid. pane_ids[0] is
-    # the main pane (left); pane_ids[1:] is the right column from top to
-    # bottom. Pair (1+2), (3+4), (5+6), ... by joining the second of each
-    # pair into the first via a horizontal split.
+    # Step 3 — fold the right column into a 2-column grid.
+    fold_right_column(pane_ids)
+
+    return pane_to_agent
+
+
+def fold_right_column(pane_ids: list[str]) -> None:
+    """Fold a top-to-bottom right column into a 2-column grid via join-pane.
+
+    ``pane_ids[0]`` is the main pane (left); ``pane_ids[1:]`` is the right
+    column from top to bottom. Pair (1+2), (3+4), (5+6), ... by joining
+    the second of each pair into the first via a horizontal split.
+
+    Designed to be called ONCE per cycle — the caller holds the
+    "did I fold yet" flag (e.g. ``layout_applied`` in
+    ``scripts.team_executor.team_cycle_executor``). Re-folding would
+    undo earlier joins, so this helper does not self-gate.
+
+    Tolerant of "no tmux server" / individual join failures: surfaces a
+    single stderr warning per failed pair and proceeds.
+    """
     right_panes = pane_ids[1:]
     for i in range(0, len(right_panes) - 1, 2):
         target = right_panes[i]
@@ -203,7 +298,33 @@ def apply_workspace_layout(
                 file=sys.stderr,
             )
 
-    return pane_to_agent
+
+def set_pane_title(pane_id: str, title: str) -> None:
+    """Set the title of one pane by global pane_id. Sanitized + idempotent.
+
+    Uses ``select-pane -t %N -T <sanitized>`` which targets the pane
+    globally (pane_ids are unique across sessions on a tmux server), so
+    this works regardless of which window/session is "current."
+
+    The title is run through :func:`_sanitize_title` before being passed
+    to tmux — strips control / bidi chars, escapes ``#`` to ``##`` (so
+    tmux does not interpret format specifiers), and left-truncates to
+    the 64-char tmux soft limit. A ``[wN] `` wave prefix is preserved.
+
+    Tolerant of "tmux server not running" / "pane gone": no exception is
+    raised; a single stderr warning is emitted on hard failures.
+    """
+    sanitized = _sanitize_title(title)
+    proc = _run_tmux(["select-pane", "-t", pane_id, "-T", sanitized])
+    if proc.returncode == 0:
+        return
+    if _tmux_unavailable(proc):
+        return
+    print(
+        f"[_tmux_workspace] select-pane -T {shlex.quote(sanitized)} on {pane_id} failed: "
+        f"{(proc.stderr or '').strip()}",
+        file=sys.stderr,
+    )
 
 
 def set_pane_titles(workspace_name: str, pane_to_title: dict[str, str]) -> None:
@@ -226,13 +347,16 @@ def set_pane_titles(workspace_name: str, pane_to_title: dict[str, str]) -> None:
     """
     del workspace_name  # currently unused; see docstring
     for pane_id, title in pane_to_title.items():
-        proc = _run_tmux(["select-pane", "-t", pane_id, "-T", title])
+        sanitized = _sanitize_title(title)
+        proc = _run_tmux(["select-pane", "-t", pane_id, "-T", sanitized])
         if proc.returncode == 0:
             continue
         if _tmux_unavailable(proc):
+            # Short-circuit: server is gone — no point continuing through
+            # the rest of the dict.
             return
         print(
-            f"[_tmux_workspace] select-pane -T {shlex.quote(title)} on {pane_id} failed: "
+            f"[_tmux_workspace] select-pane -T {shlex.quote(sanitized)} on {pane_id} failed: "
             f"{(proc.stderr or '').strip()}",
             file=sys.stderr,
         )

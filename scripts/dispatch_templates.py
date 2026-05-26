@@ -1,32 +1,59 @@
 """SendMessage dispatch templates for team agent mode.
 
-Each template is a pure function that takes explicit context kwargs and returns
-the message string the orchestrating agent's TeamTools.send_message wrapper
-delivers to a team member. Required kwargs are validated at call time — a
-missing required kwarg raises ValueError immediately so the dispatch failure
-is loud and local, not silent and downstream.
+The prose body of every Phase 1-7 dispatch template lives in
+``internal/cycle/templates/*.md`` — a maintainer-readable substrate
+with one file per dispatch point and a shared ``_trailer.md`` partial
+that every teammate-bound template includes via the
+``{{ include: _trailer.md }}`` directive.
 
-Templates correspond 1:1 with the Phase 1-5c dispatch points in
-scripts/team_executor.py. The executor imports and uses them; the wire
-protocol is documented in team_executor.py's module docstring.
+The pure-Python functions exported from this module compute the
+auxiliary names declared in each template's
+``<!--vars: ... -->`` frontmatter, then call :func:`_render` to load
+the .md file, validate the kwarg shape, substitute placeholders, and
+return the rendered string. There is NO inline prose in this module
+for templates that have a .md substrate — the .md is the single
+source of truth (AI-3 / kaizen#62 fourth major).
 
-The 10 templates:
-  - phase_1_agenda(subject, cycle_n) -> str
-  - phase_2_preanalysis(agenda_items, participant) -> str
-  - phase_3_open(proposals) -> str
-  - phase_3_debate() -> str
-  - phase_3_close(proposals, agreements) -> str
-  - phase_4_implementer(item, wave_n) -> str
-  - phase_5b_ci_failure(wave_n, failed_checks) -> str   # NEW, was inlined
-  - phase_5b_prime_reviewer(iter_n, action_items, prior_findings=None) -> str
-  - phase_5b_prime_fix(finding) -> str
-  - phase_5b_prime_pm_acceptance(findings, iter_n) -> str
+The eight templates that have a .md substrate (and therefore are
+rendered via :func:`_render`):
+
+  - phase_1_agenda            → ``phase_1_agenda.md``
+  - phase_2_preanalysis       → ``phase_2_audit.md``
+  - phase_3_open              → ``phase_3_synthesis_star.md``
+  - phase_3_debate            → ``phase_3_debate_mesh.md``
+  - phase_3_close             → ``phase_3_close_star.md``
+  - phase_4_implementer       → ``phase_4_implementation.md``
+  - phase_5b_prime_reviewer   → ``phase_5_review.md``
+  - phase_5b_prime_fix        → ``phase_5b_reviewer_fix.md``
+
+The three templates that DO NOT have a .md substrate and are emitted
+inline:
+
+  - phase_5b_ci_failure          — abandonment-outcome detail formatter
+                                   (not a teammate-bound SendMessage body)
+  - phase_5b_prime_pm_acceptance — no .md file exists; emitted inline
+                                   (could be migrated by a future cycle)
+  - phase_5d_shutdown            — STRUCTURED-JSON protocol payload;
+                                   TEAMMATE_REPLY_RULE must NOT ride on it
+
+Each .md-backed function also runs an explicit ``_require()`` validation
+pass at call time so callers see a clear ValueError on missing /
+wrong-type / empty-container kwargs, matching the prior behavior
+relied on by the empty-container rejection tests.
+
+The shared ``_trailer.md`` partial is byte-mirrored by the
+:data:`TEAMMATE_REPLY_RULE` Python constant — F7 invariant per
+``tests/test_trailer_md_parity.py``. The constant remains in this
+module unchanged so the parity contract continues to enforce
+hand-edits never drift between the two locations.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import uuid
+from pathlib import Path
 from typing import Any
 
 from scripts.fix_loop import Finding
@@ -124,9 +151,14 @@ TEAMMATE_REPLY_RULE = _REPLY_RULE + _SHUTDOWN_RULE
 
 # F9 (audit cleanup): per-phase reply-format suffix used by the two templates
 # whose replies REALLY need to surface test/lint status before team-lead can
-# proceed (phase_4_implementer and phase_5b_prime_fix). Kept as a separate
-# suffix so the global TEAMMATE_REPLY_RULE stays unchanged and the byte-
-# identity goldens for the other 8 templates keep passing.
+# proceed (phase_4_implementer and phase_5b_prime_fix). The .md substrate
+# for those two templates embeds this prose verbatim at the bottom of the
+# rendered body, so AI-3 (.md loader rewire) no longer concatenates a
+# Python suffix — the suffix flows from the .md file itself. The constant
+# remains exported here so the audit-side tests
+# (`test_F9_suffix_not_appended_to_other_phase_templates`,
+# `test_global_TEAMMATE_REPLY_RULE_unchanged_by_F9_suffix`) can pin its
+# string identity.
 _TESTS_STATUS_REPLY_SUFFIX = (
     "\n\nIMPORTANT — Reply format: your SendMessage body MUST begin with "
     "either `OK:` (change applied cleanly) or `BLOCKED:` (you could not "
@@ -135,6 +167,9 @@ _TESTS_STATUS_REPLY_SUFFIX = (
     "passes locally after your edit (use `not-run` only if running pytest "
     "is impossible from where you sit)."
 )
+
+
+# ── kwarg validator ───────────────────────────────────────────────────────
 
 
 def _require(name: str, value: Any, type_: type) -> None:
@@ -161,105 +196,289 @@ def _require(name: str, value: Any, type_: type) -> None:
         )
 
 
+# ── Stdlib .md renderer (AI-3 / kaizen#62) ────────────────────────────────
+#
+# The renderer is a minimal, dependency-free engine just expressive enough
+# for the dispatch templates we ship. It deliberately does NOT support
+# arbitrary expression evaluation, partial nesting deeper than one level,
+# or generic Jinja-like control flow — every additional feature is a
+# place a future template author can shoot themselves in the foot.
+#
+# Supported directives:
+#   {{ NAME }}                — substitute ctx[NAME] (str(value))
+#   {{ NAME.attr }}           — dotted name — keys ARE the literal "NAME.attr"
+#                               string in ctx (NOT attribute lookup on a Python
+#                               object). The frontmatter `<!--vars: ... -->`
+#                               declares them by their literal dotted form.
+#   {{ include: FILENAME }}   — splice in the comment-stripped body of
+#                               `internal/cycle/templates/FILENAME`
+#   {{# if NAME #}} ... {{# endif #}}
+#                             — conditional block (kept iff ctx[NAME] is truthy)
+#   {{# any other text #}}    — standalone comment marker; stripped from output
+#
+# HTML comments (`<!-- ... -->`) are stripped before substitution. The
+# `<!--vars: ... -->` frontmatter IS an HTML comment, so it gets stripped
+# from output too — but it is parsed FIRST to validate kwargs.
+#
+# Whitespace normalization: leading/trailing whitespace stripped; 3+
+# consecutive newlines collapsed to 2 — this produces stable, readable
+# rendered bodies regardless of where the stripped comments and stripped
+# conditionals leave blank lines.
+
+_TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "internal" / "cycle" / "templates"
+
+_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_FRONTMATTER_RE = re.compile(r"<!--vars:\s*([^>]*?)\s*-->", re.DOTALL)
+_INCLUDE_RE = re.compile(r"\{\{\s*include:\s*(\S+?)\s*\}\}")
+_CONDITIONAL_RE = re.compile(
+    r"\{\{#\s*if\s+([A-Za-z_]\w*)\s*#\}\}(.*?)\{\{#\s*endif\s*#\}\}",
+    re.DOTALL,
+)
+_STANDALONE_COMMENT_RE = re.compile(r"\{\{#[^#]*#\}\}")
+# Substitution placeholder: NAME may contain dotted segments (item.id). The
+# trailing closing `}}` is part of the match; a placeholder like
+# `{{ include: ... }}` does NOT match because the `:` is not in the name
+# class, and `{{# if ... #}}` does not match because `#` is not either.
+_VAR_RE = re.compile(r"\{\{\s*([A-Za-z_][\w.]*)\s*\}\}")
+# Whitespace normalization: collapse 3+ newlines to exactly 2.
+_TRIPLE_NEWLINE_RE = re.compile(r"\n{3,}")
+
+# Lazy per-process cache. The cache lives at module scope so a single
+# process reads each .md file at most once; tests that need to read a
+# fresh copy can ``_TEMPLATE_CACHE.clear()`` before the next call.
+_TEMPLATE_CACHE: dict[str, str] = {}
+
+
+def _read_template(name: str) -> str:
+    """Load ``internal/cycle/templates/<name>``; cached per process."""
+    if name not in _TEMPLATE_CACHE:
+        _TEMPLATE_CACHE[name] = (_TEMPLATE_DIR / name).read_text(encoding="utf-8")
+    return _TEMPLATE_CACHE[name]
+
+
+def _strip_html_comments(s: str) -> str:
+    """Remove every ``<!-- ... -->`` block (DOTALL, non-greedy)."""
+    return _HTML_COMMENT_RE.sub("", s)
+
+
+def _parse_declared_vars(raw: str) -> set[str]:
+    """Parse the ``<!--vars: name1, name2, ... -->`` frontmatter block.
+
+    Returns the set of declared variable names. Empty list (``<!--vars:-->``)
+    yields an empty set. Raises ValueError if no frontmatter block is found
+    so the loader can fail loud on a template missing its declared-vars
+    schema.
+    """
+    m = _FRONTMATTER_RE.search(raw)
+    if m is None:
+        raise ValueError(
+            "dispatch_templates: template missing `<!--vars: name1, name2, ... -->` "
+            "frontmatter block; AI-3 loader requires every template to declare "
+            "its kwarg schema."
+        )
+    raw_list = m.group(1).strip()
+    if not raw_list:
+        return set()
+    return {n.strip() for n in raw_list.split(",") if n.strip()}
+
+
+def _resolve_includes(s: str) -> str:
+    """Replace every ``{{ include: <filename> }}`` directive with the
+    target partial's comment-stripped, whitespace-stripped body.
+
+    The included file is itself comment-stripped before splicing so the
+    partial's header docstring + any frontmatter does not bleed into the
+    rendered output.
+    """
+
+    def sub(m: re.Match) -> str:
+        partial_name = m.group(1)
+        raw = _read_template(partial_name)
+        return _strip_html_comments(raw).strip()
+
+    return _INCLUDE_RE.sub(sub, s)
+
+
+def _apply_conditionals(s: str, ctx: dict[str, Any]) -> str:
+    """Process ``{{# if NAME #}} ... {{# endif #}}`` blocks.
+
+    Block is kept iff ``ctx.get(NAME)`` is truthy; otherwise the entire
+    block (markers AND content) is removed. After conditional blocks are
+    processed, any leftover ``{{# ... #}}`` standalone comment markers
+    are stripped (templates use these for human-readable inline notes
+    like ``{{# iteration 2+ only — omit entire block on iteration 1 #}}``).
+    """
+
+    def cond_sub(m: re.Match) -> str:
+        name = m.group(1)
+        inner = m.group(2)
+        return inner if ctx.get(name) else ""
+
+    s = _CONDITIONAL_RE.sub(cond_sub, s)
+    s = _STANDALONE_COMMENT_RE.sub("", s)
+    return s
+
+
+def _substitute_vars(s: str, ctx: dict[str, Any]) -> str:
+    """Replace every ``{{ NAME }}`` placeholder with ``str(ctx[NAME])``.
+
+    Dotted names (e.g. ``item.id``) are looked up by the literal
+    dotted-string key in ``ctx`` — the caller supplies the resolved
+    values as kwargs whose keys exactly match the body's placeholder
+    names. This keeps the renderer dumb: no attribute walking, no
+    Python expression evaluation.
+
+    Raises ``KeyError`` if the body references a placeholder absent
+    from ``ctx``; the upstream :func:`_render` runs the frontmatter
+    cross-check first, so this branch is reserved for genuine drift
+    between the frontmatter and the body (which the AI-2 frontmatter
+    test would also catch).
+    """
+
+    def sub(m: re.Match) -> str:
+        name = m.group(1)
+        if name not in ctx:
+            raise KeyError(
+                f"dispatch_templates: template body references {{ {name} }} "
+                f"but ctx has no key {name!r}. This indicates frontmatter ↔ "
+                "body drift; run the AI-2 frontmatter test for details."
+            )
+        return str(ctx[name])
+
+    return _VAR_RE.sub(sub, s)
+
+
+def _normalize_whitespace(s: str) -> str:
+    """Strip leading/trailing whitespace; collapse 3+ newlines to 2."""
+    s = _TRIPLE_NEWLINE_RE.sub("\n\n", s)
+    return s.strip()
+
+
+def _render(template_name: str, **ctx: Any) -> str:
+    """Load + render ``internal/cycle/templates/<template_name>``.
+
+    Pipeline:
+      1. Read the .md file (cached).
+      2. Parse the ``<!--vars: ... -->`` frontmatter — declared kwarg set.
+      3. Validate ``set(ctx.keys()) == declared`` — raise ValueError on
+         missing OR extra keys, naming both sides.
+      4. Strip HTML comments.
+      5. Resolve ``{{ include: ... }}`` directives.
+      6. Apply ``{{# if NAME #}} ... {{# endif #}}`` conditional blocks.
+      7. Substitute ``{{ NAME }}`` placeholders from ctx.
+      8. Normalize whitespace (strip + collapse blank-line runs).
+
+    The result is the byte-exact dispatch body for the named template.
+    """
+    raw = _read_template(template_name)
+    declared = _parse_declared_vars(raw)
+    provided = set(ctx.keys())
+    missing = declared - provided
+    extra = provided - declared
+    # Per AI-3 scope: `set(ctx.keys()) ⊇ set(declared_vars)`. Missing
+    # declared keys is a fatal mismatch (the body's `{{ NAME }}`
+    # substitution would KeyError downstream). Extras are tolerated and
+    # surfaced in the error message ONLY when accompanied by a missing
+    # — extras alone are legal so callers can pass conditional-signal
+    # kwargs (`prior_findings` for the `{{# if prior_findings #}}`
+    # block in `phase_5_review.md`) without polluting the frontmatter
+    # with a name the body never substitutes.
+    if missing:
+        raise ValueError(
+            f"dispatch_templates: {template_name} kwarg mismatch — "
+            f"missing={sorted(missing)}, extra={sorted(extra)}. "
+            "Declared kwargs come from the `<!--vars: ... -->` frontmatter; "
+            "fix by aligning the call site with the frontmatter (or "
+            "vice-versa)."
+        )
+    body = _strip_html_comments(raw)
+    body = _resolve_includes(body)
+    body = _apply_conditionals(body, ctx)
+    body = _substitute_vars(body, ctx)
+    return _normalize_whitespace(body)
+
+
+# ── Phase functions ───────────────────────────────────────────────────────
+
+
 def phase_1_agenda(*, subject: str | None, cycle_n: int) -> str:
     """Phase 1 PM agenda brief. `subject` may be None (PM-directed)."""
     _require("cycle_n", cycle_n, int)
-    # subject can be None — represents "PM-directed" cycles.
-    return (
-        f"Kaizen cycle {cycle_n} — Phase 1 (Agenda). "
-        f"Subject: {subject or 'PM-directed'}. "
-        "Propose 1-5 agenda items, one per line. Prefix 'ABANDON:' if you "
-        "cannot in good faith produce any useful agenda for this cycle."
-    ) + TEAMMATE_REPLY_RULE
+    # subject may be None — represents "PM-directed" cycles.
+    subject_or_pm_directed = subject or "PM-directed"
+    return _render(
+        "phase_1_agenda.md",
+        cycle_n=cycle_n,
+        subject_or_pm_directed=subject_or_pm_directed,
+    )
 
 
 def phase_2_preanalysis(*, agenda_items: list[str], participant: str) -> str:
     """Phase 2 pre-analysis brief for one non-PM participant."""
     _require("agenda_items", agenda_items, list)
     _require("participant", participant, str)
-    bullets = "\n".join(f"- {item}" for item in agenda_items)
-    return (
-        f"Phase 2 (Pre-analysis). You are {participant}. "
-        f"Agenda from PM:\n{bullets}\n\n"
-        "Produce a short proposal touching each item from your domain lens. "
-        "Prefix 'ABANDON:' to opt out."
-    ) + TEAMMATE_REPLY_RULE
+    agenda_items_as_bullets = "\n".join(f"- {item}" for item in agenda_items)
+    return _render(
+        "phase_2_audit.md",
+        participant=participant,
+        agenda_items_as_bullets=agenda_items_as_bullets,
+    )
 
 
 def phase_3_open(*, proposals: list[dict]) -> str:
     """Phase 3 Star open: broadcast every Phase-2 proposal to a participant."""
     _require("proposals", proposals, list)
     summary_lines = [f"- {p['agent']}: {p['raw'][:200]}" for p in proposals]
-    body = "\n".join(summary_lines) if summary_lines else "(no proposals collected)"
-    return (
-        "Phase 3 open (Synthesis meeting — Star). All Phase-2 proposals "
-        f"below; read them and prepare your debate position:\n{body}"
-    ) + TEAMMATE_REPLY_RULE
+    proposals_as_bullets = "\n".join(summary_lines) if summary_lines else "(no proposals collected)"
+    return _render(
+        "phase_3_synthesis_star.md",
+        proposals_as_bullets=proposals_as_bullets,
+    )
 
 
 def phase_3_debate() -> str:
     """Phase 3 Mesh debate brief. Stateless — no kwargs."""
-    return (
-        "Phase 3 debate (Mesh). State your remaining concerns and your "
-        "agreed scope for this cycle. Prefix 'ABANDON:' if no consensus "
-        "is reachable from your seat."
-    ) + TEAMMATE_REPLY_RULE
+    return _render("phase_3_debate_mesh.md")
 
 
 def phase_3_close(*, proposals: list[dict], agreements: list[dict]) -> str:
     """Phase 3 Star close: PM consolidates into the Action Items DAG."""
     _require("proposals", proposals, list)
     _require("agreements", agreements, list)
-    return (
-        "Phase 3 close (Star). Consolidate the proposals and the agreed "
-        f"scope into a single Action Items DAG. Proposals: {len(proposals)}; "
-        f"agreements: {len(agreements)}. "
-        "Reply with one fenced ```json``` block containing a JSON list of "
-        "Action Item dicts. Each dict must have keys: id (str), touches "
-        "(list[str]), reads (list[str]), depends_on (list[str]), "
-        "wave (int), owner (str role id). "
-        "Prefix 'ABANDON:' if no DAG can be agreed. "
-        # F8 (audit cleanup): for each file in `touches`, include the
-        # corresponding test file in `reads` so implementers in Phase 4
-        # can update tests in the same change (mocks-must-match-reality
-        # rule: a touched contract must travel with its tests).
-        "For each file in `touches`, include any corresponding test file "
-        "in `reads` (e.g. `tests/test_X.py` for `src/X.py` or "
-        "`scripts/X.py`)."
-    ) + TEAMMATE_REPLY_RULE
+    return _render(
+        "phase_3_close_star.md",
+        proposals_count=len(proposals),
+        agreements_count=len(agreements),
+    )
 
 
 def phase_4_implementer(*, item: dict, wave_n: int) -> str:
     """Phase 4 brief for the owner of one Action Item in wave `wave_n`."""
     _require("item", item, dict)
     _require("wave_n", wave_n, int)
-    return (
-        (
-            f"Phase 4 wave {wave_n} — implement Action Item {item['id']}. "
-            f"You own this item. Touches: {item.get('touches')}; "
-            f"reads: {item.get('reads')}. Apply the change to disk in the "
-            "clone and reply with a one-line summary of what you did. "
-            "Prefix 'ABANDON:' if the change cannot be applied. "
-            # F7 (audit cleanup): tell the implementer to list the parent
-            # directory and read any prefix/suffix neighbour so the change
-            # matches surrounding style (numbered migration files etc).
-            "Before editing, list the directory containing each `touches` "
-            "path. Read any neighbor file that shares a prefix or suffix "
-            "with your target (e.g. `001_*.sql`, `002_*.sql` when touching "
-            "`003_*.sql`) so your change matches existing style."
-        )
-        + TEAMMATE_REPLY_RULE
-        + _TESTS_STATUS_REPLY_SUFFIX
+    # The .md frontmatter declares the dotted-key variants; we expand the
+    # item dict accordingly. ``.get()`` preserves the prior null-tolerant
+    # behavior — `touches=None` and `reads=None` previously rendered as
+    # the bare word ``None`` and we preserve that to avoid silent breakage
+    # in callers that haven't yet started passing the fields.
+    return _render(
+        "phase_4_implementation.md",
+        wave_n=wave_n,
+        **{
+            "item.id": item["id"],
+            "item.touches": item.get("touches"),
+            "item.reads": item.get("reads"),
+        },
     )
 
 
 def phase_5b_ci_failure(*, wave_n: int, failed_checks: list[str]) -> str:
     """Phase 5b CI-failure routing detail message used in abandonment.
 
-    Extracted from the inline CI-failure abandonment branch in
-    team_executor.py Phase 4. The returned string is byte-identical to
-    cycle 1's inline emission ``f"CI failed after wave {wave_n}: {failed}"``
-    so the wire protocol does not drift.
+    This template is the abandonment-outcome ``detail`` string when CI
+    fails mid-cycle — NOT a teammate-bound SendMessage body — so it has
+    no .md substrate and emits its single-line form inline. Byte-identical
+    to cycle 1's prior inline emission so the wire protocol is stable.
     """
     _require("wave_n", wave_n, int)
     _require("failed_checks", failed_checks, list)
@@ -287,47 +506,40 @@ def phase_5b_prime_reviewer(
             "dispatch_templates: kwarg 'prior_findings' must be list or None, "
             f"got {type(prior_findings).__name__}"
         )
-    ids = [item["id"] for item in action_items]
-    base = (
-        f"Phase 5b' iteration {iter_n} — independent review. "
-        f"Review the implemented Action Items: {ids}. Reply with either "
-        "'NO ISSUES' (case-insensitive) OR one finding per line in the "
-        "format: [severity] file:line — text  "
-        "(severity ∈ blocker|major|minor|nit)."
+    action_items_ids = [item["id"] for item in action_items]
+    if prior_findings:
+        prior_findings_as_bullets = "\n".join(
+            f"  - {f.finding_id} [{f.severity}] {f.reviewer} @ {f.file_line}: {f.finding}"
+            for f in prior_findings
+        )
+    else:
+        prior_findings_as_bullets = ""
+    # `prior_findings` rides as the truthiness signal for the .md
+    # template's ``{{# if prior_findings #}}`` conditional. It is NOT
+    # declared in the frontmatter (the body never substitutes the raw
+    # value — only the bulleted form), but the renderer's kwarg-shape
+    # check uses a ⊇ relation so extras are tolerated.
+    return _render(
+        "phase_5_review.md",
+        iter_n=iter_n,
+        action_items_ids=action_items_ids,
+        iter_n_minus_1=iter_n - 1,
+        prior_findings_as_bullets=prior_findings_as_bullets,
+        prior_findings=prior_findings,
     )
-    if not prior_findings:
-        return base + TEAMMATE_REPLY_RULE
-    # Render the carry-forward block so iteration 2+ reviewers can do
-    # incremental review against the previous round's surviving findings.
-    prior_lines = [
-        f"  - {f.finding_id} [{f.severity}] {f.reviewer} @ {f.file_line}: {f.finding}"
-        for f in prior_findings
-    ]
-    prior_block = "\n".join(prior_lines)
-    return (
-        f"{base}\n\nPreviously unresolved findings (iteration {iter_n - 1}); "
-        f"verify whether the implementer's fix attempts resolved each:\n{prior_block}"
-    ) + TEAMMATE_REPLY_RULE
 
 
 def phase_5b_prime_fix(*, finding: Finding) -> str:
     """Phase 5b' fix brief: dispatch a single finding to its implementer."""
     _require("finding", finding, Finding)
-    return (
-        (
-            f"Phase 5b' fix — address finding {finding.finding_id} "
-            f"({finding.severity}) at {finding.file_line}: {finding.finding}. "
-            "Apply the fix and reply with a one-line confirmation. Prefix "
-            "'ABANDON:' if the fix cannot be applied. "
-            # F6 (audit cleanup): a finding-driven fix can change a contract
-            # that the tests assert on. The implementer must update those
-            # tests in the same change and report local pytest status.
-            "If your fix changes a contract that tests assert on, update "
-            "those tests in the same change. Report whether `pytest` still "
-            "passes locally."
-        )
-        + TEAMMATE_REPLY_RULE
-        + _TESTS_STATUS_REPLY_SUFFIX
+    return _render(
+        "phase_5b_reviewer_fix.md",
+        **{
+            "finding.finding_id": finding.finding_id,
+            "finding.severity": finding.severity,
+            "finding.file_line": finding.file_line,
+            "finding.finding": finding.finding,
+        },
     )
 
 
@@ -344,6 +556,10 @@ def phase_5b_prime_pm_acceptance(*, findings: list[Finding], iter_n: int) -> str
     for this round's remaining findings. If a participant truly needs to
     abandon the cycle, they do so via their Phase 1/2/3/4 message (where
     the ``ABANDON:`` protocol IS the cycle-abandonment signal).
+
+    This template has no .md substrate (an `<!--vars: ... -->`-frontmatted
+    file for it could be added by a follow-up cycle); it remains inline
+    so the rewire stays scoped to the eight templates kaizen#62 names.
     """
     _require("findings", findings, list)
     _require("iter_n", iter_n, int)

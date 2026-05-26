@@ -272,3 +272,263 @@ def test_set_pane_titles_keeps_going_on_per_pane_hard_error(monkeypatch):
     # Both panes were attempted (didn't bail on the first failure).
     select_calls = [c for c in calls if "select-pane" in c]
     assert len(select_calls) == 2
+
+
+# ── kaizen#61 regression — workspace_name MUST NOT leak into argv ─────────
+#
+# CC team-mode panes belong to the orchestrator's current tmux window,
+# NOT a session named after the team. The old code passed
+# ``team_name = f"kaizen-cycle-{run_id}-{cycle_n}"`` as ``-t`` to
+# list-panes / select-layout, which always hit "session not found" and
+# the no-server soft-fail path — so the layout was never applied. The
+# fix is to drop ``-t workspace_name`` from those two calls; the global
+# pane-id targeting on swap-pane / join-pane / select-pane is correct
+# and is retained.
+#
+# These tests are deliberately ARGV-shape assertions, NOT canned-mock
+# returns. The original bug shipped because the mock accepted any argv
+# unconditionally (mocks-must-match-reality, per the memory note).
+
+
+def test_list_panes_argv_does_not_contain_workspace_name(monkeypatch):
+    """Regression: ``-t <team_name>`` must NOT appear on list-panes (kaizen#61)."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv:
+            return _mk_proc(0, "%1\n%2\n")
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.apply_workspace_layout(
+        workspace_name="bogus-team-name-that-is-not-a-tmux-target",
+        ordered_agents=["a", "b"],
+    )
+    list_panes_calls = [c for c in calls if "list-panes" in c]
+    assert list_panes_calls, "list-panes was never called"
+    for c in list_panes_calls:
+        assert "bogus-team-name-that-is-not-a-tmux-target" not in c, (
+            f"list-panes argv leaked workspace_name (kaizen#61 regression): {c}"
+        )
+        # And the explicit shape: no ``-t`` flag at all on list-panes.
+        assert "-t" not in c, f"list-panes argv unexpectedly carries -t (kaizen#61): {c}"
+
+
+def test_select_layout_argv_does_not_contain_workspace_name(monkeypatch):
+    """Regression: ``-t <team_name>`` must NOT appear on select-layout (kaizen#61)."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv:
+            return _mk_proc(0, "%1\n%2\n%3\n%4\n")
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.apply_workspace_layout(
+        workspace_name="bogus-team-name-that-is-not-a-tmux-target",
+        ordered_agents=["a", "b", "c", "d"],
+    )
+    layout_calls = [c for c in calls if "select-layout" in c]
+    assert layout_calls, "select-layout was never called"
+    for c in layout_calls:
+        assert "bogus-team-name-that-is-not-a-tmux-target" not in c, (
+            f"select-layout argv leaked workspace_name (kaizen#61): {c}"
+        )
+        assert "-t" not in c, f"select-layout argv unexpectedly carries -t (kaizen#61): {c}"
+
+
+def test_swap_pane_join_pane_select_pane_still_use_global_pane_id(monkeypatch):
+    """Confirm the non-kaizen#61 calls keep their `-t %id` (pane-id is global)."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv:
+            return _mk_proc(0, "%1\n%2\n%3\n%4\n")
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.apply_workspace_layout(
+        workspace_name="w",
+        ordered_agents=["a", "b", "c", "d"],
+        main_agent="b",  # forces a swap-pane
+    )
+    swap_calls = [c for c in calls if "swap-pane" in c]
+    join_calls = [c for c in calls if "join-pane" in c]
+    assert swap_calls, "swap-pane was never called"
+    assert join_calls, "join-pane was never called"
+    for c in swap_calls + join_calls:
+        # Each call MUST carry ``-t %N`` (global pane-id), not a workspace target.
+        assert "-t" in c, f"global pane-id targeting was dropped: {c}"
+        target = c[c.index("-t") + 1]
+        assert target.startswith("%"), f"-t target should be a %N pane-id, got: {target!r}"
+
+
+# ── _sanitize_title — strip → escape → left-truncate ─────────────────────
+
+
+def test_sanitize_title_strips_control_chars():
+    """C0 controls (incl. ESC \\x1b) and DEL are removed."""
+    out = _tmux_workspace._sanitize_title("hello\x00world\x1b[31mred\x07\x7f")
+    assert "\x00" not in out and "\x1b" not in out and "\x07" not in out and "\x7f" not in out
+    # ESC[31m → "[31m" (the ESC byte removed; the remainder is now inert text).
+    assert out == "helloworld[31mred"
+
+
+def test_sanitize_title_strips_unicode_bidi_controls():
+    """Bidi controls U+202A-U+202E and U+2066-U+2069 are removed.
+
+    Bidi codepoints are constructed via ``chr()`` so the literal
+    Trojan-Source bytes don't appear anywhere in this source file
+    (bandit B613).
+    """
+    lre = chr(0x202A)  # LEFT-TO-RIGHT EMBEDDING
+    rlo = chr(0x202E)  # RIGHT-TO-LEFT OVERRIDE
+    fsi = chr(0x2068)  # FIRST STRONG ISOLATE
+    pdi = chr(0x2069)  # POP DIRECTIONAL ISOLATE
+    raw = f"back{lre}end-engineer{fsi}-1{pdi}{rlo}"
+    out = _tmux_workspace._sanitize_title(raw)
+    assert lre not in out
+    assert rlo not in out
+    assert fsi not in out
+    assert pdi not in out
+    assert out == "backend-engineer-1"
+
+
+def test_sanitize_title_escapes_hash_to_double_hash():
+    """Single # introduces a tmux format spec; doubling produces a literal."""
+    assert _tmux_workspace._sanitize_title("#H-host") == "##H-host"
+    assert _tmux_workspace._sanitize_title("a#{b}c") == "a##{b}c"
+
+
+def test_sanitize_title_returns_question_mark_on_empty():
+    """Empty / None / all-stripped inputs collapse to '?'."""
+    assert _tmux_workspace._sanitize_title("") == "?"
+    assert _tmux_workspace._sanitize_title(None) == "?"  # type: ignore[arg-type]
+    assert _tmux_workspace._sanitize_title("\x00\x01\x1b\x7f") == "?"
+
+
+def test_sanitize_title_left_truncates_with_ellipsis():
+    """Long titles keep the meaningful suffix; an ellipsis marks the cut."""
+    long = "a" * 100 + "role-id-1"
+    out = _tmux_workspace._sanitize_title(long, max_len=20)
+    assert len(out) == 20
+    assert out.endswith("role-id-1")
+    assert out.startswith("…")
+
+
+def test_sanitize_title_preserves_wave_prefix_under_truncation():
+    """[wN] prefix survives; truncation eats from the middle."""
+    raw = "[w3] " + ("x" * 200) + "backend-engineer-1"
+    out = _tmux_workspace._sanitize_title(raw, max_len=30)
+    assert out.startswith("[w3] ")
+    assert out.endswith("backend-engineer-1")
+    assert "…" in out
+    assert len(out) == 30
+
+
+def test_sanitize_title_short_input_passthrough():
+    """Already-clean, already-short titles are returned unchanged."""
+    assert _tmux_workspace._sanitize_title("backend-engineer-1") == "backend-engineer-1"
+    assert _tmux_workspace._sanitize_title("[w1] arch-1") == "[w1] arch-1"
+
+
+def test_sanitize_title_applies_in_strict_order(monkeypatch):
+    """End-to-end: a title with control + hash + length all get fixed correctly."""
+    rlo = chr(0x202E)  # RIGHT-TO-LEFT OVERRIDE
+    raw = f"\x1b[w2] arch#1{rlo}"
+    out = _tmux_workspace._sanitize_title(raw, max_len=64)
+    # ESC + bidi stripped, # escaped to ##, no truncation needed.
+    assert out == "[w2] arch##1"
+
+
+# ── set_pane_title (singular) ─────────────────────────────────────────────
+
+
+def test_set_pane_title_calls_select_pane_with_sanitized_title(monkeypatch):
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.set_pane_title("%5", "back#end-engineer-1\x1bhello")
+    assert len(calls) == 1
+    argv = calls[0]
+    # argv[0] is the "tmux" binary; argv[1] is the subcommand.
+    assert argv[0] == "tmux"
+    assert "select-pane" in argv
+    assert argv[argv.index("-t") + 1] == "%5"
+    # Title is sanitized: # → ##, ESC stripped.
+    assert argv[argv.index("-T") + 1] == "back##end-engineer-1hello"
+
+
+def test_set_pane_title_tolerates_no_server(monkeypatch):
+    def fake_run(argv, **kwargs):
+        return _mk_proc(1, "", "no server running on /tmp/tmux-1000/default")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    # Must NOT raise.
+    _tmux_workspace.set_pane_title("%1", "anything")
+
+
+def test_set_pane_titles_uses_sanitizer(monkeypatch):
+    """Bulk titler must also sanitize (regression — sanitizer was applied only in singular)."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.set_pane_titles(
+        "w",
+        {
+            "%1": "[w1] back#end-engineer-1",
+            "%2": "[w1] s\x1bdet-1",
+        },
+    )
+    titles = {c[c.index("-t") + 1]: c[c.index("-T") + 1] for c in calls if "select-pane" in c}
+    assert titles == {
+        "%1": "[w1] back##end-engineer-1",
+        "%2": "[w1] sdet-1",
+    }
+
+
+# ── fold_right_column ─────────────────────────────────────────────────────
+
+
+def test_fold_right_column_pairs_consecutive_right_panes(monkeypatch):
+    """Pair (1+2), (3+4) etc.; main pane at index 0 is untouched."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.fold_right_column(["%1", "%2", "%3", "%4", "%5"])
+    join_calls = [c for c in calls if "join-pane" in c]
+    assert len(join_calls) == 2
+    # First pair: %3 → %2; second pair: %5 → %4.
+    assert join_calls[0][join_calls[0].index("-s") + 1] == "%3"
+    assert join_calls[0][join_calls[0].index("-t") + 1] == "%2"
+    assert join_calls[1][join_calls[1].index("-s") + 1] == "%5"
+    assert join_calls[1][join_calls[1].index("-t") + 1] == "%4"
+
+
+def test_fold_right_column_noop_with_lt_two_right_panes(monkeypatch):
+    """0 or 1 right panes → no join-pane call."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.fold_right_column(["%1"])
+    _tmux_workspace.fold_right_column(["%1", "%2"])
+    assert [c for c in calls if "join-pane" in c] == []

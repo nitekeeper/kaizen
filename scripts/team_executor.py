@@ -102,7 +102,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from scripts._tmux_workspace import apply_main_vertical_layout, set_pane_title
+from scripts._tmux_workspace import apply_workspace_layout, set_pane_titles
 from scripts.ci_runner import run_ci_checks
 from scripts.cycle_git import commit_cycle
 from scripts.dag import validate_dag
@@ -486,47 +486,40 @@ def _diff_ci_results(
 
 # ── Post-spawn tmux helpers ────────────────────────────────────────────────
 #
-# T3/T4 (audit cleanup): kaizen launches teammates into a tmux workspace
-# via the Agent Teams API. The default tmux layout is "tiled" and panes
-# have anonymous titles, which makes it hard to follow a multi-wave cycle
-# at a glance. We apply main-vertical layout + per-pane titles ("[w1]
-# backend-engineer-1") once per wave so the visual surface mirrors the
-# logical structure.
+# kaizen launches teammates into a tmux workspace via the Agent Teams API.
+# CC titles every team-mode pane ``general-purpose`` (the default
+# subagent_type) and lays them out in the tiled layout — which makes
+# multi-wave cycles hard to follow at a glance. We reshape the workspace
+# into "main pane left + right-side 2-column grid" and retitle each pane
+# with its current wave + role.
 #
-# PER-WAVE: after every Agent.spawn batch (i.e. once team-mode actually
-# materialises the panes for the teammates we just SendMessage'd), call
-# `_post_spawn_tmux_setup(team_name, wave_n, agents)` once per wave to
-# promote the lead architect to the main pane and rename each teammate's
-# pane with its wave tag. The exact firing point may need refinement
-# once we see real CC team-mode spawn timing — for now we fire it once
-# per wave at the START of the wave, after the wave's dispatch loop
-# enters but BEFORE the first SendMessage. Tmux hooks tolerate the case
-# where the workspace doesn't exist yet (no-op on "no server running").
+# ONCE PER CYCLE: layout is applied a single time, right after the Phase 2
+# fan-out completes (when CC's lazy-spawn has materialised every
+# teammate's pane). Re-applying ``select-layout main-vertical`` would
+# undo the join-pane folding, so we gate the call on a one-shot flag.
+#
+# PER WAVE: only titles change. We re-use the pane_id → agent map
+# returned by ``apply_workspace_layout`` to retitle the wave's owners to
+# ``[w{wave_n}] {role}`` without touching pane geometry.
+#
+# Tmux interactions are best-effort: a "no server running" / missing
+# workspace returns an empty map and the cycle proceeds without any tmux
+# decoration. Issue kaizen#55 is the original report.
 
 _MAIN_AGENT_PREFERENCE = ("agent-systems-architect-1", "software-architect-1", "pm-1")
 
 
-def _post_spawn_tmux_setup(team_name: str, wave_n: int, agents: list[str]) -> None:
-    """Apply main-vertical layout + per-pane titles for the given wave.
+def _pick_main_agent(roster: list[str]) -> str:
+    """Return the first agent from ``_MAIN_AGENT_PREFERENCE`` in ``roster``.
 
-    Selects the first preferred main-agent that appears in ``agents`` so
-    the lead architect/PM ends up in the main pane. ``agents`` is the
-    list of role ids that just had a SendMessage delivered for this wave;
-    typically the owners of every Action Item in the wave.
-
-    Tolerant of "no tmux server running" / "workspace missing" — both
-    helpers return early in those cases without raising.
+    Falls back to the first roster member when none of the preferred
+    architect/PM roles are present. Returns ``""`` if ``roster`` is empty
+    — the layout helper treats that as "do not swap, leave default."
     """
-    main_agent = ""
     for candidate in _MAIN_AGENT_PREFERENCE:
-        if candidate in agents:
-            main_agent = candidate
-            break
-    if not main_agent and agents:
-        main_agent = agents[0]
-    apply_main_vertical_layout(workspace_name=team_name, main_agent=main_agent)
-    for name in agents:
-        set_pane_title(workspace_name=team_name, agent_name=name, wave_n=wave_n)
+        if candidate in roster:
+            return candidate
+    return roster[0] if roster else ""
 
 
 # ── Main entry point ───────────────────────────────────────────────────────
@@ -673,6 +666,32 @@ def team_cycle_executor(
 
     team_id = tools.team_create(team_name, members=list(roster) if roster else [pm])
 
+    # Tmux workspace setup — populated once, after Phase 2 fan-out
+    # materialises every teammate's pane. See _MAIN_AGENT_PREFERENCE
+    # comment block above for the design rationale.
+    pane_to_agent: dict[str, str] = {}
+
+    def _setup_tmux_layout_once() -> None:
+        if pane_to_agent:
+            return  # already applied this cycle
+        try:
+            result = apply_workspace_layout(
+                workspace_name=team_name,
+                ordered_agents=list(roster) if roster else [pm],
+                main_agent=_pick_main_agent(list(roster) if roster else [pm]),
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            _log.warning("apply_workspace_layout failed: %s", exc)
+            return
+        pane_to_agent.update(result)
+        if pane_to_agent:
+            # Pre-wave initial titles: bare role names, no wave prefix
+            # yet. Phase 4 overwrites these with ``[w{n}] {role}`` per wave.
+            try:
+                set_pane_titles(team_name, dict(pane_to_agent))
+            except Exception as exc:  # pragma: no cover - defensive
+                _log.warning("initial set_pane_titles failed: %s", exc)
+
     try:
         # ── Phase 1 — Agenda (PM) ─────────────────────────────────────────
         agenda_response = tools.send_message(
@@ -718,6 +737,9 @@ def team_cycle_executor(
                     for participant in phase_2_recipients
                 ]
                 phase_2_responses = tools.send_message_many(phase_2_messages)
+                # All teammate panes exist by now — apply the workspace
+                # layout once (issue kaizen#55).
+                _setup_tmux_layout_once()
                 for participant, resp in zip(phase_2_recipients, phase_2_responses, strict=True):
                     if _is_abandon(resp):
                         _abandon(
@@ -860,16 +882,27 @@ def team_cycle_executor(
         if not outcome_acc.abandoned and waves:
             items_by_id = {item["id"]: item for item in action_items}
             for wave_n, wave_ids in enumerate(waves, start=1):
-                # T4: collect the wave's owners up-front so the tmux hook
-                # can rename their panes and promote a main agent. Order
-                # mirrors wave_ids so the visual order matches the DAG order.
+                # Collect the wave's owners up-front so we can retitle
+                # their panes for this wave. Order mirrors wave_ids so
+                # the visual order matches the DAG order.
                 wave_owners = [items_by_id[ai_id].get("owner") or pm for ai_id in wave_ids]
-                # T3/T4: best-effort tmux layout/title hook. Tolerant of
-                # "no server running" — never raises. Fires once per wave.
-                try:
-                    _post_spawn_tmux_setup(team_name=team_name, wave_n=wave_n, agents=wave_owners)
-                except Exception as tmux_exc:  # pragma: no cover - defensive
-                    _log.warning("post-spawn tmux setup failed: %s", tmux_exc)
+                # Layout was applied once after Phase 2. Per wave we only
+                # retitle the wave's owners' panes (issue kaizen#55).
+                # Tolerant of "no server running" / missing pane — never raises.
+                _setup_tmux_layout_once()
+                if pane_to_agent:
+                    agent_to_pane = {agent: pid for pid, agent in pane_to_agent.items()}
+                    try:
+                        set_pane_titles(
+                            team_name,
+                            {
+                                agent_to_pane[name]: f"[w{wave_n}] {name}"
+                                for name in wave_owners
+                                if name in agent_to_pane
+                            },
+                        )
+                    except Exception as tmux_exc:  # pragma: no cover - defensive
+                        _log.warning("set_pane_titles for wave %s failed: %s", wave_n, tmux_exc)
                 wave_abandoned = False
                 for ai_id in wave_ids:
                     item = items_by_id[ai_id]

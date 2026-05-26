@@ -83,7 +83,12 @@ def test_apply_workspace_layout_runs_select_layout_and_join_panes(monkeypatch):
 
 
 def test_apply_workspace_layout_swaps_main_agent_to_position_zero(monkeypatch):
-    """If main_agent isn't pane_ids[0], swap-pane fires to promote it."""
+    """If main_agent isn't pane_ids[0], swap-pane fires to promote it.
+
+    NB: this exercises the non-tmux / no-TMUX_PANE fallback path (kaizen#66).
+    With TMUX_PANE set the orchestrator is excluded at source and no swap
+    is needed; that path is covered separately.
+    """
     calls: list[list[str]] = []
 
     def fake_run(argv, **kwargs):
@@ -93,6 +98,7 @@ def test_apply_workspace_layout_swaps_main_agent_to_position_zero(monkeypatch):
         return _mk_proc(0, "")
 
     monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    monkeypatch.delenv("TMUX_PANE", raising=False)
     _tmux_workspace.apply_workspace_layout(
         workspace_name="w",
         ordered_agents=["backend-engineer-1", "software-architect-1", "sdet-1"],
@@ -350,6 +356,7 @@ def test_swap_pane_join_pane_select_pane_still_use_global_pane_id(monkeypatch):
         return _mk_proc(0, "")
 
     monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    monkeypatch.delenv("TMUX_PANE", raising=False)
     _tmux_workspace.apply_workspace_layout(
         workspace_name="w",
         ordered_agents=["a", "b", "c", "d"],
@@ -532,3 +539,278 @@ def test_fold_right_column_noop_with_lt_two_right_panes(monkeypatch):
     _tmux_workspace.fold_right_column(["%1"])
     _tmux_workspace.fold_right_column(["%1", "%2"])
     assert [c for c in calls if "join-pane" in c] == []
+
+
+# ── kaizen#66 — orchestrator pane identity via TMUX_PANE ──────────────────
+#
+# Before this fix ``_list_pane_ids`` returned the orchestrator's own pane
+# alongside the teammate panes; the positional zip against ``ordered_agents``
+# then re-classified the PM as a teammate. A reactive swap-pane block
+# patched over it at the cost of a user-visible title-flicker race.
+#
+# The fix reads ``$TMUX_PANE`` at the source and excludes the orchestrator
+# pane_id from the returned list. ``TMUX_PANE`` is stable for the life of
+# the pane, so this is the authoritative "this is my own pane" signal.
+
+
+def test_list_pane_ids_excludes_orchestrator_when_tmux_pane_set(monkeypatch):
+    """kaizen#66: TMUX_PANE=orchestrator pid → orchestrator dropped from list."""
+
+    def fake_run(argv, **kwargs):
+        if "list-panes" in argv:
+            return _mk_proc(0, "%1\n%2\n%3\n%4\n")
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    out = _tmux_workspace._list_pane_ids("w")
+    assert out == ["%2", "%3", "%4"], (
+        f"orchestrator pane %1 must be dropped from list-panes output, got {out}"
+    )
+
+
+def test_list_pane_ids_full_list_when_tmux_pane_unset(monkeypatch):
+    """No TMUX_PANE (CI / headless) → full list returned, swap-pane fallback applies."""
+
+    def fake_run(argv, **kwargs):
+        if "list-panes" in argv:
+            return _mk_proc(0, "%1\n%2\n%3\n")
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    out = _tmux_workspace._list_pane_ids("w")
+    assert out == ["%1", "%2", "%3"]
+
+
+def test_list_pane_ids_full_list_when_tmux_pane_not_in_list(monkeypatch):
+    """TMUX_PANE set but pane not among list-panes output → list returned unchanged."""
+
+    def fake_run(argv, **kwargs):
+        if "list-panes" in argv:
+            return _mk_proc(0, "%5\n%6\n")
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    monkeypatch.setenv("TMUX_PANE", "%99")
+    out = _tmux_workspace._list_pane_ids("w")
+    assert out == ["%5", "%6"]
+
+
+def test_apply_workspace_layout_no_swap_pane_when_orchestrator_excluded(monkeypatch):
+    """kaizen#66: with TMUX_PANE excluding the orchestrator, no reactive swap-pane fires.
+
+    Three-snapshot invariant: the zip is correct by construction (positional),
+    so the swap-pane block must NOT fire when the orchestrator id is known.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv:
+            # %1 is the orchestrator; %2/%3/%4 are teammates.
+            return _mk_proc(0, "%1\n%2\n%3\n%4\n")
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    result = _tmux_workspace.apply_workspace_layout(
+        workspace_name="w",
+        ordered_agents=["backend-engineer-1", "software-architect-1", "sdet-1"],
+        main_agent="software-architect-1",
+    )
+    # %1 (orchestrator) MUST NOT appear in the pane→agent map.
+    assert "%1" not in result, f"orchestrator pane %1 leaked into map: {result}"
+    # Teammates are zipped positionally against the post-exclusion list.
+    assert result == {
+        "%2": "backend-engineer-1",
+        "%3": "software-architect-1",
+        "%4": "sdet-1",
+    }
+    # No swap-pane fired: orchestrator-aware exclusion makes it unnecessary.
+    swap_calls = [c for c in calls if "swap-pane" in c]
+    assert swap_calls == [], (
+        f"reactive swap-pane block fired despite TMUX_PANE being set "
+        f"(kaizen#66 regression): {swap_calls}"
+    )
+
+
+def test_apply_workspace_layout_swap_pane_fallback_when_no_tmux_pane(monkeypatch):
+    """kaizen#66: the swap-pane fallback still works when TMUX_PANE is unset."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv:
+            return _mk_proc(0, "%1\n%2\n%3\n")
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    _tmux_workspace.apply_workspace_layout(
+        workspace_name="w",
+        ordered_agents=["backend-engineer-1", "software-architect-1", "sdet-1"],
+        main_agent="software-architect-1",
+    )
+    swap_calls = [c for c in calls if "swap-pane" in c]
+    # Source = the architect's pane (%2), target = current main slot (%1).
+    assert len(swap_calls) == 1, f"expected 1 swap-pane in fallback path, got: {swap_calls}"
+    assert swap_calls[0][swap_calls[0].index("-s") + 1] == "%2"
+    assert swap_calls[0][swap_calls[0].index("-t") + 1] == "%1"
+
+
+def test_apply_workspace_layout_pins_orchestrator_title_at_boot(monkeypatch):
+    """kaizen#66: the orchestrator pane gets the reserved PM title at workspace setup."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv:
+            return _mk_proc(0, "%1\n%2\n%3\n")
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    monkeypatch.delenv("KAIZEN_PM_PANE_GLYPH", raising=False)
+    _tmux_workspace.apply_workspace_layout(
+        workspace_name="w",
+        ordered_agents=["arch-1", "be-1"],
+    )
+    # A select-pane -T call targeting the orchestrator with the reserved
+    # title must have fired exactly once during setup.
+    pm_calls = [
+        c
+        for c in calls
+        if "select-pane" in c
+        and "-t" in c
+        and c[c.index("-t") + 1] == "%1"
+        and "-T" in c
+        and "team-lead / PM" in c[c.index("-T") + 1]
+    ]
+    assert len(pm_calls) >= 1, f"orchestrator title not pinned at boot; calls: {calls}"
+    # Default glyph is U+25CF ●.
+    assert "● team-lead / PM" in pm_calls[0][pm_calls[0].index("-T") + 1]
+
+
+def test_pin_orchestrator_title_uses_kaizen_pm_pane_glyph_env(monkeypatch):
+    """kaizen#66: ``KAIZEN_PM_PANE_GLYPH`` env override is honored."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    monkeypatch.setenv("KAIZEN_PM_PANE_GLYPH", "*")
+    _tmux_workspace.pin_orchestrator_title("%7")
+    titles = [c[c.index("-T") + 1] for c in calls if "select-pane" in c and "-T" in c]
+    assert titles == ["* team-lead / PM"], f"expected ASCII glyph fallback, got: {titles}"
+
+
+def test_pin_orchestrator_title_handles_empty_glyph(monkeypatch):
+    """kaizen#66: empty glyph drops the leading separator — title is just ``team-lead / PM``."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    monkeypatch.setenv("KAIZEN_PM_PANE_GLYPH", "")
+    _tmux_workspace.pin_orchestrator_title("%7")
+    titles = [c[c.index("-T") + 1] for c in calls if "select-pane" in c and "-T" in c]
+    assert titles == ["team-lead / PM"], f"empty glyph should drop separator, got: {titles}"
+
+
+def test_three_snapshot_invariant_orchestrator_pane_stable(monkeypatch):
+    """kaizen#66: across teammate-spawn + teammate-exit, orchestrator pane is unchanged.
+
+    Simulates: initial list-panes returns [orchestrator, t1, t2]; a teammate-
+    spawn event re-lists [orchestrator, t1, t2, t3]; a teammate-exit event
+    re-lists [orchestrator, t1, t2]. Across all three snapshots, the
+    orchestrator pane_id is dropped, never reassigned to a teammate role,
+    and its title is never touched by the layout helper outside the boot
+    pin call.
+    """
+    snapshots = [
+        "%1\n%2\n%3\n",  # initial
+        "%1\n%2\n%3\n%4\n",  # after teammate spawn
+        "%1\n%2\n%3\n",  # after teammate exit
+    ]
+    snap_idx = [0]
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv:
+            out = snapshots[min(snap_idx[0], len(snapshots) - 1)]
+            return _mk_proc(0, out)
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    monkeypatch.setenv("TMUX_PANE", "%1")
+
+    # Three snapshots in sequence.
+    results = []
+    for i in range(3):
+        snap_idx[0] = i
+        out = _tmux_workspace._list_pane_ids("w")
+        results.append(out)
+    assert results == [
+        ["%2", "%3"],
+        ["%2", "%3", "%4"],
+        ["%2", "%3"],
+    ]
+    # The orchestrator pane (%1) is never in any snapshot.
+    for r in results:
+        assert "%1" not in r
+
+
+# ── pin_orchestrator_title — direct unit tests ────────────────────────────
+
+
+def test_pin_orchestrator_title_default_glyph(monkeypatch):
+    """Default glyph is U+25CF ●; title is ``● team-lead / PM``."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    monkeypatch.delenv("KAIZEN_PM_PANE_GLYPH", raising=False)
+    _tmux_workspace.pin_orchestrator_title("%3")
+    select_calls = [c for c in calls if "select-pane" in c]
+    assert len(select_calls) == 1
+    assert select_calls[0][select_calls[0].index("-T") + 1] == "● team-lead / PM"
+    assert select_calls[0][select_calls[0].index("-t") + 1] == "%3"
+
+
+def test_pin_orchestrator_title_explicit_glyph_arg(monkeypatch):
+    """Explicit ``glyph=`` kwarg beats the env."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    monkeypatch.setenv("KAIZEN_PM_PANE_GLYPH", "*")  # would lose to explicit arg
+    _tmux_workspace.pin_orchestrator_title("%3", glyph="+")
+    titles = [c[c.index("-T") + 1] for c in calls if "select-pane" in c]
+    assert titles == ["+ team-lead / PM"]
+
+
+def test_orchestrator_pane_id_returns_none_when_unset(monkeypatch):
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    assert _tmux_workspace._orchestrator_pane_id() is None
+
+
+def test_orchestrator_pane_id_returns_strip_value(monkeypatch):
+    monkeypatch.setenv("TMUX_PANE", "  %42  ")
+    assert _tmux_workspace._orchestrator_pane_id() == "%42"
+
+
+def test_orchestrator_pane_id_treats_empty_as_unset(monkeypatch):
+    monkeypatch.setenv("TMUX_PANE", "")
+    assert _tmux_workspace._orchestrator_pane_id() is None

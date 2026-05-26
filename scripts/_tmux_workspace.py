@@ -53,6 +53,7 @@ not have a tmux server up).
 
 from __future__ import annotations
 
+import os
 import re
 import shlex
 import subprocess
@@ -64,6 +65,52 @@ _NO_SERVER_HINTS = (
     "can't find session",
     "no such session",
 )
+
+# kaizen#66 — orchestrator pane identity.
+#
+# When kaizen runs in a tmux pane (the typical interactive case), tmux sets
+# ``TMUX_PANE`` in the orchestrator's environment to the pane_id (e.g. ``%3``).
+# That id is stable for the life of the pane, so it is the authoritative
+# "this is my own pane" signal. We use it to exclude the orchestrator's own
+# pane from ``_list_pane_ids`` (so the zip against the teammate roster does
+# not re-classify the PM as a teammate) and to pin the orchestrator's pane
+# title once at workspace setup time.
+#
+# The PM-pane title is a reserved literal so the rest of the codebase never
+# mistakes it for a wave/reviewer label. ``KAIZEN_PM_PANE_GLYPH`` lets the
+# user fall back to ``*`` or an empty string when the locale lacks UTF-8.
+
+_PM_PANE_GLYPH_DEFAULT = "●"  # U+25CF BLACK CIRCLE ●
+_PM_PANE_LABEL_SUFFIX = " team-lead / PM"
+
+
+def _pm_pane_title() -> str:
+    """Return the reserved orchestrator pane title.
+
+    Reads ``KAIZEN_PM_PANE_GLYPH`` once per call (env-only, no flag plumbing)
+    so the operator can downgrade to an ASCII glyph or empty string without
+    rebuilding kaizen. Default is ``●`` (U+25CF) which renders in every UTF-8
+    terminal we test against.
+    """
+    glyph = os.environ.get("KAIZEN_PM_PANE_GLYPH", _PM_PANE_GLYPH_DEFAULT)
+    if not glyph:
+        # Empty glyph → drop the leading space too so the title is just
+        # ``team-lead / PM``.
+        return _PM_PANE_LABEL_SUFFIX.lstrip()
+    return f"{glyph}{_PM_PANE_LABEL_SUFFIX}"
+
+
+def _orchestrator_pane_id() -> str | None:
+    """Return the orchestrator's own tmux pane_id, or ``None`` if not in tmux.
+
+    Reads ``$TMUX_PANE`` — set by tmux for any process inside a pane and
+    stable for the life of the pane. Returns ``None`` when the env var is
+    unset (CI / headless / non-tmux subagent runs) so callers can fall back
+    to the older reactive swap-pane path.
+    """
+    pid = os.environ.get("TMUX_PANE", "").strip()
+    return pid or None
+
 
 # Pane title sanitizer constants (kaizen#61 — Mesh T3 union sanitizer).
 #
@@ -188,7 +235,18 @@ def _list_pane_ids(workspace_name: str) -> list[str] | None:
             file=sys.stderr,
         )
         return None
-    return [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+    pane_ids = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+    # kaizen#66 — exclude the orchestrator's own pane at the source so the
+    # positional zip against ``ordered_agents`` does not re-classify the PM
+    # as a teammate. ``TMUX_PANE`` is set by tmux for every process running
+    # inside a pane and is stable for the life of the pane, making it the
+    # authoritative "this is my own pane" signal. When unset (CI / headless
+    # / non-tmux runs) we return the full list and the caller falls back to
+    # the older reactive swap-pane path.
+    lead_pane_id = _orchestrator_pane_id()
+    if lead_pane_id and lead_pane_id in pane_ids:
+        pane_ids = [pid for pid in pane_ids if pid != lead_pane_id]
+    return pane_ids
 
 
 def apply_workspace_layout(
@@ -229,6 +287,15 @@ def apply_workspace_layout(
         pane_ids[i]: ordered_agents[i] for i in range(min(len(pane_ids), len(ordered_agents)))
     }
 
+    # kaizen#66 — pin the orchestrator's pane title to a reserved literal
+    # once at workspace boot. ``_list_pane_ids`` already drops the
+    # orchestrator pane_id from the returned list (so it does not appear in
+    # ``pane_to_agent``); this call targets the pane by its global pane_id
+    # so it works regardless of which window is current.
+    lead_pane_id = _orchestrator_pane_id()
+    if lead_pane_id:
+        pin_orchestrator_title(lead_pane_id)
+
     # Step 1 — main-vertical (1 wide left + N stacked right). Same kaizen#61
     # reasoning as ``_list_pane_ids``: target the orchestrator's current
     # window via tmux's default, not the CC-internal team_name.
@@ -243,8 +310,14 @@ def apply_workspace_layout(
         )
         return pane_to_agent
 
-    # Step 2 — swap main_agent to position 0 if it isn't already there.
-    if main_agent:
+    # Step 2 — reactive swap-pane fallback for the non-tmux / no-TMUX_PANE
+    # path. When ``TMUX_PANE`` IS set (the typical interactive case)
+    # ``_list_pane_ids`` has already excluded the orchestrator at source so
+    # the zip is correct by construction and no swap is needed. The swap
+    # path is retained for CI / headless / non-tmux subagent runs where
+    # ``TMUX_PANE`` is unset and the orchestrator (if any) may still be
+    # interleaved with teammate panes in the list.
+    if lead_pane_id is None and main_agent:
         target_pane_id: str | None = next(
             (pid for pid, name in pane_to_agent.items() if name == main_agent),
             None,
@@ -297,6 +370,24 @@ def fold_right_column(pane_ids: list[str]) -> None:
                 f"{(join_proc.stderr or '').strip()}",
                 file=sys.stderr,
             )
+
+
+def pin_orchestrator_title(pane_id: str, glyph: str | None = None) -> None:
+    """Pin the orchestrator's pane title to the reserved PM literal.
+
+    Idempotent: calling twice with the same effective glyph is a no-op
+    from the user's perspective. ``glyph`` defaults to ``KAIZEN_PM_PANE_GLYPH``
+    (env), then ``"●"`` (U+25CF) — callers normally don't pass it.
+
+    The orchestrator pane is identified by ``$TMUX_PANE`` at the caller
+    (see :func:`_orchestrator_pane_id`); this helper just sets the title.
+    Tolerant of "tmux server not running" / "pane gone" — never raises.
+    """
+    if glyph is None:
+        title = _pm_pane_title()
+    else:
+        title = f"{glyph}{_PM_PANE_LABEL_SUFFIX}" if glyph else _PM_PANE_LABEL_SUFFIX.lstrip()
+    set_pane_title(pane_id, title)
 
 
 def set_pane_title(pane_id: str, title: str) -> None:

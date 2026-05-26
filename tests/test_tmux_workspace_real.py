@@ -96,8 +96,14 @@ def routed_tmux(monkeypatch):
     The production code calls ``_run_tmux`` without any socket flag,
     relying on tmux's default socket; this fixture transparently
     redirects every call to the dedicated test server.
+
+    Also clears ``TMUX_PANE`` (kaizen#66) — the developer's outer tmux pane
+    id has no meaning on the isolated ``-L kaizen-test`` socket, so leaking
+    it through would cause the orchestrator-exclusion logic to drop a
+    random teammate pane in the test session.
     """
     _kill_server()  # paranoia — kill any leftover from a prior crash
+    monkeypatch.delenv("TMUX_PANE", raising=False)
     try:
         original = _tmux_workspace._run_tmux
 
@@ -212,6 +218,7 @@ def test_apply_workspace_layout_no_tmux_server_returns_empty(monkeypatch):
     """When the dedicated server is NOT started, the helper returns ``{}``."""
     # Defensive: ensure no leftover socket.
     _kill_server()
+    monkeypatch.delenv("TMUX_PANE", raising=False)
     # Use a randomly-named socket that definitely has no server.
     bogus_socket = f"kaizen-test-bogus-{os.getpid()}"
     original = _tmux_workspace._run_tmux

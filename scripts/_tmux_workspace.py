@@ -58,6 +58,7 @@ import re
 import shlex
 import subprocess
 import sys
+from typing import Literal
 
 _NO_SERVER_HINTS = (
     "no server running",
@@ -295,6 +296,91 @@ def _list_pane_ids(workspace_name: str) -> list[str] | None:
     return pane_ids
 
 
+# kaizen#78 — operator-configurable right-area layout via KAIZEN_TEAMMATE_LAYOUT.
+#
+# Allowed values (post-``.strip().lower()`` normalisation):
+#
+#   * ``grid-2col`` — 2-column grid on the right (current behavior; calls
+#     ``fold_right_column`` after the main-vertical select-layout).
+#   * ``stripes``   — full-width horizontal stripes on the right (skips
+#     ``fold_right_column`` so the panes stay stacked top-to-bottom).
+#   * ``auto``      — apply the n-based default (N>=4 → grid-2col; N<=3 → stripes).
+#
+# Auto is the resolver's internal sentinel; ``_resolve_layout`` never returns
+# ``"auto"`` — the caller branches on a CONCRETE layout string only.
+#
+# Unknown values: log ONCE per process per normalised value to stderr, then
+# fall back to the auto-resolved layout. The warn-once-per-value invariant
+# is enforced by the module-level ``_warned_layout_values`` set; tests reset
+# it via ``monkeypatch.setattr(_tmux_workspace, "_warned_layout_values", set())``.
+#
+# Untrusted-input boundary: the env-var value is allowlist-validated BEFORE
+# any string interpolation into a tmux command. ``select-layout`` arguments
+# are ALWAYS the documented tmux primitives (``main-vertical`` /
+# ``even-vertical``); the raw env value is never passed through.
+_KAIZEN_TEAMMATE_LAYOUT_ALLOWED: frozenset[str] = frozenset({"grid-2col", "stripes", "auto"})
+_warned_layout_values: set[str] = set()
+
+
+def _resolve_layout(
+    n_right_panes: int,
+    raw_env: str | None,
+) -> Literal["grid-2col", "stripes"]:
+    """Resolve ``KAIZEN_TEAMMATE_LAYOUT`` to a concrete layout primitive.
+
+    Contract:
+
+      * Pure function — caller passes the raw env value (so tests can drive
+        every cell without polluting ``os.environ``).
+      * NEVER returns ``"auto"``. Auto is resolved internally to
+        ``"grid-2col"`` when ``n_right_panes >= 4`` and ``"stripes"`` when
+        ``n_right_panes <= 3``.
+      * Normalisation is ``.strip().lower()`` ONLY — no alnum-stripping.
+        ``" GRID-2COL "`` matches; ``"grid_2col"`` does NOT match (the
+        underscore is preserved, the allowlist check fails, the warn-once
+        + fallback path fires).
+      * Unknown values fire a single stderr warning per normalised value
+        per process (tracked in ``_warned_layout_values``) and then fall
+        back to the auto-resolved layout.
+      * ``raw_env=None`` and ``raw_env=""`` are treated as unset (→ auto).
+
+    Args:
+        n_right_panes: number of teammate panes in the right column. Used
+            only for the auto-resolve threshold; explicit ``grid-2col`` /
+            ``stripes`` overrides ignore it.
+        raw_env: the raw ``KAIZEN_TEAMMATE_LAYOUT`` value (or None).
+
+    Returns:
+        Either ``"grid-2col"`` or ``"stripes"``.
+    """
+    # Empty / unset → auto.
+    if raw_env is None or raw_env == "":
+        normalised: str = "auto"
+    else:
+        normalised = raw_env.strip().lower()
+
+    if normalised in _KAIZEN_TEAMMATE_LAYOUT_ALLOWED:
+        if normalised == "grid-2col":
+            return "grid-2col"
+        if normalised == "stripes":
+            return "stripes"
+        # normalised == "auto" → fall through to the auto-resolve below.
+    else:
+        # Unknown value — warn once per normalised value, then auto-resolve.
+        if normalised not in _warned_layout_values:
+            _warned_layout_values.add(normalised)
+            print(
+                f"[_tmux_workspace] KAIZEN_TEAMMATE_LAYOUT={raw_env!r} "
+                f"(normalised to {normalised!r}) not in "
+                f"{sorted(_KAIZEN_TEAMMATE_LAYOUT_ALLOWED)}; "
+                "falling back to auto.",
+                file=sys.stderr,
+            )
+
+    # Auto-resolve: N >= 4 → grid-2col; N <= 3 → stripes.
+    return "grid-2col" if n_right_panes >= 4 else "stripes"
+
+
 def apply_workspace_layout(
     workspace_name: str,
     *,
@@ -382,15 +468,24 @@ def apply_workspace_layout(
         pane_ids[i]: ordered_agents[i] for i in range(min(len(pane_ids), len(ordered_agents)))
     }
 
-    # Step 1 — main-vertical (1 wide left + N stacked right). Same kaizen#61
-    # reasoning as ``_list_pane_ids``: target the orchestrator's current
-    # window via tmux's default, not the CC-internal team_name.
-    layout_proc = _run_tmux(["select-layout", "main-vertical"])
+    # Step 1 — select the right-area layout primitive (kaizen#78).
+    #
+    # ``_resolve_layout`` reads ``KAIZEN_TEAMMATE_LAYOUT`` ONCE per call
+    # (cognitive-scientist's read-once contract) and returns either
+    # ``"grid-2col"`` (→ ``select-layout main-vertical`` + fold) or
+    # ``"stripes"`` (→ ``select-layout even-vertical`` + skip fold). The
+    # main-vertical default preserves the kaizen#61 reasoning for the
+    # grid-2col path (target the orchestrator's current window via tmux's
+    # default, not the CC-internal team_name).
+    n_right_panes = len(pane_ids)
+    layout_mode = _resolve_layout(n_right_panes, os.environ.get("KAIZEN_TEAMMATE_LAYOUT"))
+    layout_primitive: str = "main-vertical" if layout_mode == "grid-2col" else "even-vertical"
+    layout_proc = _run_tmux(["select-layout", layout_primitive])
     if _tmux_unavailable(layout_proc):
         return pane_to_agent
     if layout_proc.returncode != 0:
         print(
-            f"[_tmux_workspace] select-layout main-vertical for {workspace_name!r} "
+            f"[_tmux_workspace] select-layout {layout_primitive} for {workspace_name!r} "
             f"failed: {(layout_proc.stderr or '').strip()}",
             file=sys.stderr,
         )
@@ -424,8 +519,12 @@ def apply_workspace_layout(
                 if relisted is not None and relisted:
                     pane_ids = relisted
 
-    # Step 3 — fold the right column into a 2-column grid.
-    fold_right_column(pane_ids)
+    # Step 3 — apply the kaizen#78 right-area shape. ``grid-2col`` pairs
+    # the right-column panes into 2-col rows via ``fold_right_column``;
+    # ``stripes`` skips the fold so the (already-applied) ``even-vertical``
+    # primitive's full-width horizontal stripes remain intact.
+    if layout_mode == "grid-2col":
+        fold_right_column(pane_ids)
 
     # kaizen#68 iter 3 — tag every teammate pane with the team_id so the
     # cleanup path (L3) can gate destructive actions on team-id equality.

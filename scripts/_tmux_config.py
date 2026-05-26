@@ -28,7 +28,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-MARKER_VERSION = 2
+# MARKER_VERSION is the installed-config schema, NOT the tmux binary version.
+MARKER_VERSION = 3
 MARKER_START = "# >>> agent-teams v{} >>>"
 MARKER_END = "# <<< agent-teams v{} <<<"
 
@@ -45,10 +46,36 @@ MARKER_END = "# <<< agent-teams v{} <<<"
 # (which OSC 2 cannot touch) and rendering THAT in the border. ``pane_title``
 # may still flicker to ``general-purpose`` in tmux's internal state, but
 # the operator-visible border keeps the wave/role label.
-CONFIG_BLOCK = """# Pane border format — render @desired_title (set by app) with fallback to pane_title.
-# kaizen#64 — @desired_title is immune to OSC 2 overrides from the pane process.
+#
+# kaizen#76 (v3): the v2 render hid CC's OSC 2 activity glyph (the leading
+# ``*`` / Braille spinner char that signals idle vs busy) because the
+# format-string OVERRODE ``pane_title`` with ``@desired_title`` whenever the
+# latter was set. The dual-signal fix: COMPOSE both channels in
+# ``pane-border-format`` — ``#{=1:pane_title}`` exposes the first display
+# column of ``pane_title`` (CC's activity glyph slot) and the existing
+# conditional renders ``@desired_title`` (or ``pane_title`` fallback) for
+# the kaizen-owned label. Run 40 was aborted before this design landed
+# because the prior plan (``set -g allow-set-title off``) would have
+# silenced the glyph stream entirely — a regression the operator caught
+# from a single screen observation. See ``feedback-tmux-pane-title-dual-signal``
+# for the memory entry that records this lesson.
+#
+# Known cosmetic artifacts (deliberate trade-offs, NOT bugs):
+#   * Doubled glyph during the ~50ms un-tagged-pane init window — when
+#     ``@desired_title`` is unset the format falls through to
+#     ``#{=1:pane_title} #{pane_title}`` which double-prints the leading
+#     glyph. Below the perceptual-flash threshold; do NOT add an
+#     ``#{?#{m:*general-purpose*,...},...,...}`` conditional to "fix" it
+#     because that re-couples the render to a CC-internal string.
+#   * Bare ``g`` first char when ``pane_title`` is literally
+#     ``general-purpose`` (CC idle with no OSC 2 emission). Same rationale
+#     as above — acceptable cosmetic vs CC-internals coupling.
+CONFIG_BLOCK = """# Pane border format — compose CC's OSC 2 activity glyph (#{=1:pane_title})
+# with kaizen's @desired_title (with pane_title fallback for un-tagged panes).
+# kaizen#76 — dual-signal: the leading char of pane_title carries CC's idle/busy
+# indicator; @desired_title carries the wave/role label and is immune to OSC 2.
 set -g pane-border-status top
-set -g pane-border-format '#[fg=cyan]#{?@desired_title,#{@desired_title},#{pane_title}}#[default]'
+set -g pane-border-format '#{=1:pane_title} #[fg=cyan]#{?@desired_title,#{@desired_title},#{pane_title}}#[default]'
 
 # Default layout for new windows: main-vertical
 # Apps may override per-window via select-layout.

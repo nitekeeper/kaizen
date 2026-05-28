@@ -80,6 +80,9 @@ class MockTeamTools:
     def team_delete(self, team_id):
         self.calls.append(("team_delete", (team_id,), {}))
 
+    def apply_layout(self, team_id):
+        self.calls.append(("apply_layout", (team_id,), {}))
+
 
 def _project(roster: list[str] | None = None) -> dict:
     return {

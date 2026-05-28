@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS bridge_requests (
     run_id        INTEGER NOT NULL,
     kind          TEXT NOT NULL CHECK (kind IN
                   ('team_create','send_message','team_delete',
-                   'cycle_done','aborted')),
+                   'apply_layout','cycle_done','aborted')),
     args_json     TEXT NOT NULL,
     status        TEXT NOT NULL DEFAULT 'pending'
                   CHECK (status IN ('pending','ready','error')),
@@ -142,6 +142,52 @@ def purge_old_rows(
     return deleted
 
 
+# kaizen#86 — the `kind` CHECK constraint gained 'apply_layout'. SQLite cannot
+# ALTER a CHECK, so an existing bridge.db (created before #86) keeps the old
+# constraint and would reject apply_layout INSERTs. This idempotent rebuild
+# upgrades such a DB in place, preserving rows. bridge.db is per-machine
+# ephemeral state and bootstrap runs at run-start with no concurrent run, so the
+# rebuild is safe (no in-flight rows from another run).
+_BRIDGE_REQUESTS_REBUILD = """
+ALTER TABLE bridge_requests RENAME TO _bridge_requests_old;
+CREATE TABLE bridge_requests (
+    id            INTEGER PRIMARY KEY,
+    run_id        INTEGER NOT NULL,
+    kind          TEXT NOT NULL CHECK (kind IN
+                  ('team_create','send_message','team_delete',
+                   'apply_layout','cycle_done','aborted')),
+    args_json     TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending','ready','error')),
+    response_json TEXT,
+    error_text    TEXT,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at  TEXT
+);
+INSERT INTO bridge_requests
+    (id, run_id, kind, args_json, status, response_json, error_text, created_at, completed_at)
+    SELECT id, run_id, kind, args_json, status, response_json, error_text, created_at, completed_at
+    FROM _bridge_requests_old;
+DROP TABLE _bridge_requests_old;
+CREATE INDEX IF NOT EXISTS idx_bridge_requests_run_pending
+    ON bridge_requests(run_id, status, id);
+"""
+
+
+def _upgrade_kind_constraint(con: sqlite3.Connection) -> bool:
+    """Rebuild bridge_requests if its `kind` CHECK predates 'apply_layout'
+    (kaizen#86). Idempotent: a no-op when the constraint is already current.
+    Returns True iff a rebuild was performed."""
+    row = con.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='bridge_requests'"
+    ).fetchone()
+    if row is None or "apply_layout" in (row[0] or ""):
+        return False
+    con.executescript(_BRIDGE_REQUESTS_REBUILD)
+    con.commit()
+    return True
+
+
 def bootstrap(
     bridge_db_path: str | Path = ".ai/bridge.db",
     purge_age_s: int = _DEFAULT_PURGE_AGE_S,
@@ -172,6 +218,7 @@ def bootstrap(
     try:
         con.executescript(_BRIDGE_SCHEMA)
         con.commit()
+        _upgrade_kind_constraint(con)
         purge_old_rows(con, cutoff_age_s=purge_age_s)
     finally:
         con.close()

@@ -173,6 +173,42 @@ def test_team_delete_round_trips(bridge_path):
     t.join(timeout=5)
 
 
+def test_apply_layout_round_trips_and_enqueues_apply_layout_kind(bridge_path):
+    """kaizen#86: apply_layout enqueues an `apply_layout` bridge row the
+    orchestrator services (it runs scripts.fold_workspace), and returns None."""
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=86)
+    _tick_bridge_heartbeat(bridge_path, run_id=86, at_offset_seconds=0)
+    captured: dict[str, str] = {}
+
+    def fake_s1():
+        row_id = _wait_for_pending_row(bridge_path, run_id=86)
+        con = sqlite3.connect(str(bridge_path))
+        try:
+            captured["kind"] = con.execute(
+                "SELECT kind FROM bridge_requests WHERE id=?", (row_id,)
+            ).fetchone()[0]
+        finally:
+            con.close()
+        _mark_row_ready(bridge_path, row_id, {})
+
+    t = threading.Thread(target=fake_s1, daemon=True)
+    t.start()
+    assert wrapper.apply_layout("kaizen-cycle-86-1") is None
+    t.join(timeout=5)
+    assert captured["kind"] == "apply_layout"
+
+
+def test_apply_layout_is_best_effort_on_timeout(bridge_path):
+    """A layout that never gets serviced must NOT raise — it is cosmetic and
+    must never abort the cycle (mirrors team_delete best-effort)."""
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=87)
+    wrapper.CLEANUP_TIMEOUT_S = 0.3
+    wrapper.POLL_INTERVAL_S = 0.02
+    _tick_bridge_heartbeat(bridge_path, run_id=87, at_offset_seconds=0)
+    # No servicing thread → the apply_layout row times out; apply_layout swallows it.
+    assert wrapper.apply_layout("never-serviced") is None
+
+
 # ── Heartbeat behaviour ───────────────────────────────────────────────────
 
 

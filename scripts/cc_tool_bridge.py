@@ -382,6 +382,34 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
                 file=sys.stderr,
             )
 
+    def apply_layout(self, team_id: str) -> None:
+        # kaizen#86: the workspace fold MUST run in the orchestrator session
+        # (whose $TMUX/$TMUX_PANE point at the window holding the teammate
+        # panes), NOT in this detached run_bridged process — whose tmux commands
+        # never reach that window, so the in-process fold is a silent no-op and
+        # the panes stay a single stacked column. So we enqueue an `apply_layout`
+        # bridge request; the orchestrator services it by running
+        # `python3 -m scripts.fold_workspace` (see skills/improve/SKILL.md).
+        #
+        # Best-effort + cosmetic: a layout that fails to apply MUST NOT abort the
+        # cycle, so we swallow Bridge*Error (mirrors team_delete). The cleanup
+        # bypass is reused so a layout request late in a wall-clock-pressed cycle
+        # still gets a chance rather than tripping the cycle-wall.
+        try:
+            self._request(
+                "apply_layout",
+                {"team_id": team_id},
+                timeout_s=self.CLEANUP_TIMEOUT_S,
+                cleanup=True,
+            )
+        except BridgeError as exc:
+            print(
+                f"[kaizen.cc_tool_bridge] apply_layout({team_id!r}) did not "
+                f"complete via the bridge ({type(exc).__name__}: {exc}); "
+                f"continuing — layout is cosmetic, the cycle proceeds.",
+                file=sys.stderr,
+            )
+
     # ── internal helpers ──────────────────────────────────────────────
 
     def _insert(self, kind: str, args: dict) -> int:

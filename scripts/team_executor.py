@@ -191,6 +191,13 @@ class TeamTools(Protocol):
         """Tear down the team."""
         ...
 
+    def apply_layout(self, team_id: str) -> None:
+        """Fold the orchestrator's tmux window into the PM-left + 2-col grid
+        (kaizen#86). Best-effort + cosmetic. In bridge mode the implementation
+        enqueues an `apply_layout` request the orchestrator services in the
+        window-owning session; in-process the fold can't reach that window."""
+        ...
+
 
 @dataclass
 class TeamCycleOutcome:
@@ -1322,6 +1329,9 @@ def team_cycle_executor(
         def team_delete(self, team_id: str) -> None:
             self._inner.team_delete(team_id)
 
+        def apply_layout(self, team_id: str) -> None:
+            self._inner.apply_layout(team_id)
+
     raw_tools = tools
     tools = _TrackedTools(raw_tools)
 
@@ -1379,6 +1389,17 @@ def team_cycle_executor(
             # label and decide whether a tmux call is needed.
             for role in pane_to_agent.values():
                 current_title[role] = role
+        # kaizen#86 — the apply_workspace_layout call above runs in THIS
+        # (detached run_bridged) process, whose tmux commands never reach the
+        # orchestrator's window, so its select-layout/join-pane fold is a silent
+        # no-op there (it still gives us pane_to_agent for the title bookkeeping
+        # above). Emit an `apply_layout` request so the ORCHESTRATOR folds its
+        # own window for real. Best-effort: the wrapper swallows bridge errors
+        # (layout is cosmetic and must never abort the cycle).
+        try:
+            tools.apply_layout(team_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            _log.warning("apply_layout request failed: %s", exc)
 
     def _retitle_on_first_send(recipient: str) -> None:
         """Apply layout (if not yet) and label the recipient's pane.

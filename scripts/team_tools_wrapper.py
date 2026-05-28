@@ -81,6 +81,16 @@ class AgentTeamsWrapper:
             "Python. Subclass AgentTeamsWrapper and override team_delete."
         )
 
+    def apply_layout(self, team_id: str) -> None:
+        """Fold the orchestrator's tmux window into the PM-left + 2-col grid
+        (kaizen#86). Best-effort and purely cosmetic, so — UNLIKE the other
+        tools — the base implementation is a **no-op** rather than a raise: a
+        missing/absent layout impl MUST NOT break a run. ``QueueBridgeWrapper``
+        overrides this to enqueue an ``apply_layout`` bridge request that the
+        orchestrator services by running ``scripts.fold_workspace`` in the
+        window-owning session (the in-process fold can't reach that window)."""
+        return None
+
 
 class RecordingWrapper(AgentTeamsWrapper):
     """Test/debug wrapper that records every call and returns scripted responses.
@@ -106,3 +116,6 @@ class RecordingWrapper(AgentTeamsWrapper):
 
     def team_delete(self, team_id: str) -> None:
         self.calls.append(("team_delete", (team_id,), {}))
+
+    def apply_layout(self, team_id: str) -> None:
+        self.calls.append(("apply_layout", (team_id,), {}))

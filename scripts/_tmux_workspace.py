@@ -590,6 +590,46 @@ def fold_right_column(pane_ids: list[str]) -> None:
             )
 
 
+def fold_current_window(*, workspace_name: str = "") -> None:
+    """Fold the CURRENT tmux window into "PM-left + right-area layout".
+
+    kaizen#86 — this MUST be run **by the orchestrator session** (the one whose
+    ``$TMUX`` / ``$TMUX_PANE`` point at the window that actually holds the
+    teammate panes). In bridge/team mode the in-process
+    :func:`apply_workspace_layout` runs inside the *detached* ``run_bridged``
+    process, whose ``tmux`` commands never reach the orchestrator's window — so
+    the fold is a silent no-op there and the panes stay a single stacked column
+    regardless of phase. The orchestrator invokes this helper (via
+    ``python3 -m scripts.fold_workspace``, serviced from the ``apply_layout``
+    bridge request) so ``select-layout`` / ``join-pane`` hit the real window.
+
+    Reuses the kaizen#78 right-area layout resolution (``KAIZEN_TEAMMATE_LAYOUT``
+    → ``grid-2col`` / ``stripes``) and the kaizen#81-correct
+    :func:`fold_right_column` (the orchestrator/PM pane — excluded from
+    ``_list_pane_ids`` — is prepended so EVERY teammate folds). The fold is
+    positional on the live pane list, so no roster argument is needed.
+
+    Best-effort: tolerant of "no tmux server" / a missing window — never raises
+    (a kaizen cycle must not abort on a tmux quirk).
+    """
+    lead_pane_id = _orchestrator_pane_id()
+    pane_ids = _list_pane_ids(workspace_name)  # excludes the orchestrator pane at source
+    if not pane_ids:
+        return
+    layout_mode = _resolve_layout(len(pane_ids), os.environ.get("KAIZEN_TEAMMATE_LAYOUT"))
+    primitive = "main-vertical" if layout_mode == "grid-2col" else "even-vertical"
+    proc = _run_tmux(["select-layout", primitive])
+    if _tmux_unavailable(proc) or proc.returncode != 0:
+        return
+    if layout_mode == "grid-2col":
+        # kaizen#81: prepend the PM pane (the untouched main at index 0) so
+        # fold_right_column pairs ALL teammates rather than dropping the first.
+        if lead_pane_id is not None:
+            fold_right_column([lead_pane_id, *pane_ids])
+        else:
+            fold_right_column(pane_ids)
+
+
 def pin_orchestrator_title(pane_id: str, glyph: str | None = None) -> None:
     """Pin the orchestrator's pane title to the reserved PM literal.
 

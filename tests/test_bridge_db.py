@@ -8,6 +8,26 @@ import pytest
 
 from scripts.bridge_db import bootstrap, purge_old_rows
 
+# The pre-#86 bridge_requests schema: identical to current except its `kind`
+# CHECK omits 'apply_layout'. Used to simulate a legacy DB for the
+# constraint-upgrade migration test.
+_LEGACY_BRIDGE_REQUESTS = """
+CREATE TABLE bridge_requests (
+    id            INTEGER PRIMARY KEY,
+    run_id        INTEGER NOT NULL,
+    kind          TEXT NOT NULL CHECK (kind IN
+                  ('team_create','send_message','team_delete',
+                   'cycle_done','aborted')),
+    args_json     TEXT NOT NULL,
+    status        TEXT NOT NULL DEFAULT 'pending'
+                  CHECK (status IN ('pending','ready','error')),
+    response_json TEXT,
+    error_text    TEXT,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at  TEXT
+);
+"""
+
 
 @pytest.fixture
 def bridge_path(tmp_path):
@@ -307,5 +327,72 @@ def test_heartbeat_tables_use_run_id_primary_key(bridge_path):
             con.execute(
                 "INSERT INTO python_heartbeat (run_id, last_beat_at) VALUES (1, '2026-01-02')"
             )
+    finally:
+        con.close()
+
+
+def test_bootstrap_upgrades_legacy_kind_constraint_preserving_rows(bridge_path):
+    """kaizen#86: a bridge.db whose `kind` CHECK predates 'apply_layout' is
+    rebuilt in place on bootstrap. Existing rows survive and apply_layout
+    INSERTs become legal."""
+    bridge_path.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(bridge_path))
+    try:
+        con.executescript(_LEGACY_BRIDGE_REQUESTS)
+        con.execute(
+            "INSERT INTO bridge_requests (id, run_id, kind, args_json) "
+            "VALUES (7, 50, 'team_create', '{}')"
+        )
+        con.commit()
+        with pytest.raises(sqlite3.IntegrityError):
+            con.execute(
+                "INSERT INTO bridge_requests (run_id, kind, args_json) "
+                "VALUES (50, 'apply_layout', '{}')"
+            )
+        con.rollback()
+    finally:
+        con.close()
+
+    bootstrap(str(bridge_path))
+
+    con = sqlite3.connect(str(bridge_path))
+    try:
+        # Legacy row preserved (id + kind intact).
+        row = con.execute("SELECT run_id, kind FROM bridge_requests WHERE id = 7").fetchone()
+        assert row == (50, "team_create")
+        # apply_layout now accepted.
+        con.execute(
+            "INSERT INTO bridge_requests (run_id, kind, args_json) "
+            "VALUES (50, 'apply_layout', '{}')"
+        )
+        con.commit()
+        # Old table fully removed, not left dangling.
+        assert "_bridge_requests_old" not in _table_names(con)
+    finally:
+        con.close()
+
+
+def test_bootstrap_kind_upgrade_is_idempotent(bridge_path):
+    """Running bootstrap twice on an already-current DB does not rebuild or
+    drop rows (the migration is a no-op when 'apply_layout' is present)."""
+    bootstrap(str(bridge_path))
+    con = sqlite3.connect(str(bridge_path))
+    try:
+        con.execute(
+            "INSERT INTO bridge_requests (run_id, kind, args_json) "
+            "VALUES (50, 'apply_layout', '{}')"
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    bootstrap(str(bridge_path))  # second bootstrap must not touch the row
+
+    con = sqlite3.connect(str(bridge_path))
+    try:
+        count = con.execute(
+            "SELECT COUNT(*) FROM bridge_requests WHERE kind = 'apply_layout'"
+        ).fetchone()[0]
+        assert count == 1
     finally:
         con.close()

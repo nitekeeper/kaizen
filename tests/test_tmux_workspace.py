@@ -668,6 +668,47 @@ def test_apply_workspace_layout_no_swap_pane_when_orchestrator_excluded(monkeypa
     )
 
 
+def test_apply_workspace_layout_folds_all_teammates_when_orchestrator_excluded(monkeypatch):
+    """kaizen#81 regression: with TMUX_PANE set, _list_pane_ids excludes the PM,
+    so the list handed to the fold is the ENTIRE right column (no main at
+    index 0). apply_workspace_layout must prepend the PM pane so
+    fold_right_column pairs EVERY teammate — including the FIRST one.
+
+    Before the fix the PM-excluded list was passed straight through;
+    fold_right_column then treated the first teammate as the (untouched) main
+    pane and skipped it, so the right side never folded into the 2-col grid and
+    the operator saw a single stacked column.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv:
+            # %1 = orchestrator/PM (excluded by _list_pane_ids); %2-%5 = 4 teammates.
+            return _mk_proc(0, "%1\n%2\n%3\n%4\n%5\n")
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    _tmux_workspace.apply_workspace_layout(
+        workspace_name="w",
+        ordered_agents=["a", "b", "c", "d"],
+    )
+    join_calls = [c for c in calls if "join-pane" in c]
+    # All 4 teammates fold into 2 rows of 2 — the FIRST teammate (%2) is paired,
+    # not skipped. (Before the fix this was a single join %5→%4, with %2 dropped.)
+    assert len(join_calls) == 2, f"expected 2 joins folding all 4 teammates, got {join_calls}"
+    # Pair 1: source %3 joined into target %2 — proves the first teammate folds.
+    assert join_calls[0][join_calls[0].index("-s") + 1] == "%3"
+    assert join_calls[0][join_calls[0].index("-t") + 1] == "%2"
+    # Pair 2: source %5 joined into target %4.
+    assert join_calls[1][join_calls[1].index("-s") + 1] == "%5"
+    assert join_calls[1][join_calls[1].index("-t") + 1] == "%4"
+    # The orchestrator/PM pane (%1) is the untouched main — never folded.
+    for c in join_calls:
+        assert "%1" not in c, f"PM pane %1 must not be a fold source/target: {c}"
+
+
 def test_apply_workspace_layout_swap_pane_fallback_when_no_tmux_pane(monkeypatch):
     """kaizen#66: the swap-pane fallback still works when TMUX_PANE is unset."""
     calls: list[list[str]] = []

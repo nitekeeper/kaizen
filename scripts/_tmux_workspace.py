@@ -523,8 +523,22 @@ def apply_workspace_layout(
     # the right-column panes into 2-col rows via ``fold_right_column``;
     # ``stripes`` skips the fold so the (already-applied) ``even-vertical``
     # primitive's full-width horizontal stripes remain intact.
+    #
+    # kaizen#81 — fold_right_column's contract is "pane_ids[0] is the main
+    # (left) pane; pane_ids[1:] is the right column to pair". When the
+    # orchestrator pane exists, ``_list_pane_ids`` has ALREADY excluded it
+    # (kaizen#66), so ``pane_ids`` here is the ENTIRE right column with NO main
+    # at index 0. Passing it straight to fold_right_column made it treat the
+    # FIRST teammate as the (untouched) main and skip it — so that teammate
+    # stayed full-width and the right side never folded into the grid (the
+    # operator saw a single stacked column). Prepend the PM pane so index 0 is
+    # the main and EVERY teammate is paired. On the swap path (lead_pane_id is
+    # None) pane_ids[0] is already the main after the swap, so pass it through.
     if layout_mode == "grid-2col":
-        fold_right_column(pane_ids)
+        if lead_pane_id is not None:
+            fold_right_column([lead_pane_id, *pane_ids])
+        else:
+            fold_right_column(pane_ids)
 
     # kaizen#68 iter 3 — tag every teammate pane with the team_id so the
     # cleanup path (L3) can gate destructive actions on team-id equality.

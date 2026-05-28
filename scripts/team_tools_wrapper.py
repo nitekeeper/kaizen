@@ -58,7 +58,9 @@ class AgentTeamsWrapper:
             "AgentTeamsWrapper and override send_message."
         )
 
-    def send_message_many(self, messages: list[dict]) -> list[str]:
+    def send_message_many(
+        self, messages: list[dict], *, quorum_floor: int | None = None
+    ) -> list[str]:
         """Default batch fan-out — calls send_message N times sequentially.
 
         Subclasses that want true batched/parallel dispatch (e.g.
@@ -66,6 +68,10 @@ class AgentTeamsWrapper:
         this. The default is correctness-preserving but loses the
         wall-clock parallelism that motivated this method (GAP-4 of
         docs/kaizen/2026-05-24-bridge-smoke-2.md).
+
+        ``quorum_floor`` (#83) is accepted for interface compatibility with
+        the quorum-relaxed override but has no effect here: a sequential
+        per-row dispatch has no batch in which to forgive a silent straggler.
         """
         return [self.send_message(m["team_id"], m["to"], m["message"]) for m in messages]
 

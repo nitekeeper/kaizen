@@ -67,7 +67,7 @@ class MockTeamTools:
                 return resp
         return self.default
 
-    def send_message_many(self, messages):
+    def send_message_many(self, messages, *, quorum_floor=None):
         """Batch wrapper for tests — record each as a send_message call so
         existing assertions ("recipient is in this list", "wave order is
         [A,B,C]") keep working unchanged. Each individual call also goes
@@ -1658,7 +1658,7 @@ class TestGap7ShutdownHandshake:
             calls fall through to the parent's per-message routing.
             """
 
-            def send_message_many(self_inner, messages):
+            def send_message_many(self_inner, messages, *, quorum_floor=None):
                 if messages and all(
                     m["message"].startswith('{"type": "shutdown_request"')
                     or m["message"].startswith('{"type":"shutdown_request"')
@@ -1827,7 +1827,7 @@ class TestGap7ShutdownHandshake:
         roster, scripted = self._three_member_happy_setup(monkeypatch)
 
         class ApproveFalseMock(MockTeamTools):
-            def send_message_many(self_inner, messages):
+            def send_message_many(self_inner, messages, *, quorum_floor=None):
                 # If this batch is the shutdown batch (all bodies contain
                 # 'shutdown_request'), return approve=false responses
                 # WITHOUT routing through self.send_message so we don't
@@ -1883,7 +1883,7 @@ class TestGap7ShutdownHandshake:
         roster, scripted = self._three_member_happy_setup(monkeypatch)
 
         class ShutdownFailMock(MockTeamTools):
-            def send_message_many(self_inner, messages):
+            def send_message_many(self_inner, messages, *, quorum_floor=None):
                 # Trigger ONLY on the shutdown batch — let Phase 2/3/5b'
                 # batch dispatch (which use real prose) succeed via
                 # parent's send_message routing.

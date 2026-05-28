@@ -111,6 +111,8 @@ from scripts._tmux_workspace import (
     set_pane_title,
     set_pane_titles,
 )
+from scripts.agent_id_match import guarded_argv, team_agent_id_regex
+from scripts.cc_tool_bridge import quorum_for
 from scripts.ci_runner import run_ci_checks
 from scripts.cycle_git import commit_cycle
 from scripts.dag import validate_dag
@@ -168,13 +170,20 @@ class TeamTools(Protocol):
         """Send a message; returns the recipient's response synchronously."""
         ...
 
-    def send_message_many(self, messages: list[dict]) -> list[str]:
+    def send_message_many(
+        self, messages: list[dict], *, quorum_floor: int | None = None
+    ) -> list[str]:
         """Batch dispatch — enqueue N messages in parallel; return their
         responses in input order. Each dict has ``team_id``, ``to``,
         ``message``. Used by Phase 2 fan-out, Phase 3 Star-open broadcast,
         and Phase 5b' parallel reviewer dispatch — see
         docs/kaizen/2026-05-24-bridge-smoke-2.md GAP-4 for the motivation
         (sequential send_message is the wall-clock bottleneck of a cycle).
+
+        ``quorum_floor`` (#83): None → strict (every row must reply). An int
+        opts into quorum-relaxed dispatch (silent stragglers soft-dropped once
+        quorum is met and the per-row soft-timeout elapses). Safety-critical
+        phases (reviewers, state-mutating gates) MUST leave it None.
         """
         ...
 
@@ -686,8 +695,12 @@ def _agent_id_regex(team_name: str) -> str:
     ``team_name`` is `re.escape`-d defensively even though kaizen team
     names are restricted to ``kaizen-cycle-<run>-<n>`` (no regex metachars
     by construction). Defense in depth against future team-name changes.
+
+    Thin wrapper over :func:`scripts.agent_id_match.team_agent_id_regex` —
+    the canonical pattern (and the ``--`` argv guard at the pgrep/pkill call
+    sites) now lives in that shared module (kaizen#82).
     """
-    return rf"--agent-id \S+@{re.escape(team_name)}( |$)"
+    return team_agent_id_regex(team_name)
 
 
 def _pgrep_teammates(team_name: str) -> list[int]:
@@ -699,7 +712,7 @@ def _pgrep_teammates(team_name: str) -> list[int]:
     """
     try:
         proc = subprocess.run(  # nosec - argv is a fixed list, no shell=True
-            ["pgrep", "-f", _agent_id_regex(team_name)],
+            guarded_argv("pgrep", ["-f"], _agent_id_regex(team_name)),
             capture_output=True,
             text=True,
             check=False,
@@ -737,7 +750,7 @@ def _pkill_teammates(team_name: str, signal: str) -> None:
     """
     try:
         subprocess.run(  # nosec - argv is a fixed list, no shell=True
-            ["pkill", signal, "-f", _agent_id_regex(team_name)],
+            guarded_argv("pkill", [signal, "-f"], _agent_id_regex(team_name)),
             capture_output=True,
             text=True,
             check=False,
@@ -1288,12 +1301,17 @@ def team_cycle_executor(
             _retitle_on_first_send(to)
             return resp
 
-        def send_message_many(self, messages: list[dict]) -> list[str]:
-            resps = self._inner.send_message_many(messages)
+        def send_message_many(
+            self, messages: list[dict], *, quorum_floor: int | None = None
+        ) -> list[str]:
+            resps = self._inner.send_message_many(messages, quorum_floor=quorum_floor)
             # Record every recipient whose call did not raise. The batch
             # is all-or-nothing on the wrapper side (a single exception
             # aborts the whole batch), so on a successful return every
-            # `to` in the batch is active.
+            # `to` in the batch is active. NB with a quorum-relaxed batch a
+            # soft-dropped recipient still appears here (its slot returned a
+            # sentinel response, not an exception) — harmless for active-member
+            # tracking, which only gates pane retitling.
             for m in messages:
                 active_members.add(m["to"])
                 # kaizen#61 — retitle each batch recipient on first
@@ -1427,7 +1445,13 @@ def team_cycle_executor(
                     }
                     for participant in phase_2_recipients
                 ]
-                phase_2_responses = tools.send_message_many(phase_2_messages)
+                # #83: Phase 2 pre-analysis is a FUNGIBLE fan-out — synthesis
+                # is valid on a quorum of proposals, so opt into quorum-relaxed
+                # dispatch (a single silent specialist is soft-dropped, not a
+                # whole-batch failure). Quorum counts genuine replies only.
+                phase_2_responses = tools.send_message_many(
+                    phase_2_messages, quorum_floor=quorum_for(len(phase_2_messages))
+                )
                 # All teammate panes exist by now — apply the workspace
                 # layout once (issue kaizen#55).
                 _setup_tmux_layout_once()
@@ -1451,6 +1475,7 @@ def team_cycle_executor(
             # Star open: brief every roster member with the proposals
             # GAP-4: batch-dispatch — one transaction, N parallel briefs.
             if roster:
+                # #83: Star-open broadcast is a fungible fan-out — quorum-relaxed.
                 tools.send_message_many(
                     [
                         {
@@ -1459,7 +1484,8 @@ def team_cycle_executor(
                             "message": phase_3_open(proposals=proposals),
                         }
                         for participant in roster
-                    ]
+                    ],
+                    quorum_floor=quorum_for(len(roster)),
                 )
 
             # Mesh (simplified): each participant signals consensus.
@@ -1467,6 +1493,7 @@ def team_cycle_executor(
             # as Star-open; serialising it was the same Phase 2 bottleneck.
             agreements: list[dict] = []
             if roster:
+                # #83: Mesh debate is a fungible fan-out — quorum-relaxed.
                 debate_responses = tools.send_message_many(
                     [
                         {
@@ -1475,7 +1502,8 @@ def team_cycle_executor(
                             "message": phase_3_debate(),
                         }
                         for participant in roster
-                    ]
+                    ],
+                    quorum_floor=quorum_for(len(roster)),
                 )
                 for participant, resp in zip(roster, debate_responses, strict=True):
                     if _is_abandon(resp):
@@ -1744,6 +1772,11 @@ def team_cycle_executor(
                             }
                             for reviewer in reviewers
                         ]
+                        # #83 caller-audit: reviewer dispatch is SAFETY-CRITICAL
+                        # (P2/F9) — it stays STRICT (no quorum_floor). A silent
+                        # reviewer must escalate to the hard backstop, never be
+                        # soft-dropped: soft-dropping a reviewer would collapse
+                        # the review->fix loop and let an unreviewed change ship.
                         reviewer_responses = tools.send_message_many(reviewer_messages)
                         for reviewer, resp in zip(reviewers, reviewer_responses, strict=True):
                             findings.extend(
@@ -1925,6 +1958,10 @@ def team_cycle_executor(
                     }
                     for member in sorted(active_members)
                 ]
+                # #83 caller-audit: shutdown is a teardown/state-transition
+                # broadcast — STRICT (no quorum_floor). It is already wrapped in
+                # best-effort GAP-7 handling below, so a silent member does not
+                # block team_delete; quorum-relaxing here would add nothing.
                 tools.send_message_many(shutdown_messages)
             except Exception as exc:
                 # Don't block team_delete on shutdown failure. Log + proceed.

@@ -31,6 +31,7 @@ Per the python-cc-tool-bridge design (Rev 4):
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -39,6 +40,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from scripts.bridge_db import bootstrap
+from scripts.bridge_softdrop import make_soft_drop_record
 from scripts.team_tools_wrapper import AgentTeamsWrapper
 
 # Per the design's "Code-level API sketch (Rev 4)" section.
@@ -122,6 +124,67 @@ def _resolve_cycle_wall_s() -> float:
 
 CYCLE_WALL_S: float = _resolve_cycle_wall_s()
 
+
+# Per-row soft-timeout for the quorum path (#83). Distinct from the batch
+# hard-deadline PER_CALL_TIMEOUT_S: once a batch has met its quorum, any row
+# still 'pending' that has waited longer than this soft-timeout becomes
+# eligible to be soft-dropped (a synthetic absent-teammate record) so a single
+# silent teammate cannot fail the whole batch. It NEVER short-circuits the hard
+# backstops (PER_CALL_TIMEOUT_S / CYCLE_WALL_S / HEARTBEAT_STALL_S): those still
+# govern when quorum is NOT met. Default is < PER_CALL_TIMEOUT_S so it can fire
+# before the hard deadline. Operator escape hatch mirrors KAIZEN_CYCLE_WALL_S.
+_DEFAULT_ROW_SOFT_TIMEOUT_S: float = 300.0
+
+
+def _resolve_row_soft_timeout_s() -> float:
+    """Resolve the per-row soft-timeout from ``KAIZEN_ROW_SOFT_TIMEOUT_S``.
+
+    Same defensive-parse contract as :func:`_resolve_cycle_wall_s`:
+
+      * unset or empty string → ``_DEFAULT_ROW_SOFT_TIMEOUT_S``
+      * non-numeric           → warn to stderr, fall back to default
+      * numeric and <= 0      → warn to stderr, fall back to default
+      * numeric and > 0       → use it (no upper clamp)
+
+    A malformed env var MUST NOT abort a cycle.
+    """
+    raw = os.environ.get("KAIZEN_ROW_SOFT_TIMEOUT_S")
+    if raw is None or raw == "":
+        return _DEFAULT_ROW_SOFT_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        print(
+            f"[kaizen.cc_tool_bridge] KAIZEN_ROW_SOFT_TIMEOUT_S={raw!r} is not "
+            f"numeric; falling back to default {_DEFAULT_ROW_SOFT_TIMEOUT_S}s.",
+            file=sys.stderr,
+        )
+        return _DEFAULT_ROW_SOFT_TIMEOUT_S
+    if value <= 0:
+        print(
+            f"[kaizen.cc_tool_bridge] KAIZEN_ROW_SOFT_TIMEOUT_S={value} must be "
+            f"> 0; falling back to default {_DEFAULT_ROW_SOFT_TIMEOUT_S}s.",
+            file=sys.stderr,
+        )
+        return _DEFAULT_ROW_SOFT_TIMEOUT_S
+    return value
+
+
+ROW_SOFT_TIMEOUT_S: float = _resolve_row_soft_timeout_s()
+
+# Default quorum fraction for fan-out phases that opt into quorum-relaxed
+# dispatch. quorum = max(1, ceil(QUORUM_FRACTION * N)). NB for small N this
+# forgives nothing (N=2→2, N=3→3) — intentional: a small evidence base has no
+# redundancy to spare, so soft-drop is effectively a large-wave (N>=4) feature.
+QUORUM_FRACTION: float = 0.75
+
+
+def quorum_for(n: int, fraction: float = QUORUM_FRACTION) -> int:
+    """Return the genuine-ready row count required to satisfy quorum for a
+    batch of ``n`` rows: ``max(1, ceil(fraction * n))``."""
+    return max(1, math.ceil(fraction * n))
+
+
 # Module-level table of per-run "last python heartbeat" monotonic timestamps.
 # Keyed by run_id (multiple QueueBridgeWrapper instances in one process may
 # share this table; each updates only its own row). Used by the hybrid stall
@@ -174,6 +237,7 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
     POLL_INTERVAL_S: float = POLL_INTERVAL_S
     STALE_ROW_S: float = STALE_ROW_S
     CYCLE_WALL_S: float = CYCLE_WALL_S
+    ROW_SOFT_TIMEOUT_S: float = ROW_SOFT_TIMEOUT_S
 
     def __init__(self, db_path: str | Path, run_id: int):
         self._db_path = Path(db_path)
@@ -212,15 +276,27 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
             raise BridgeRemoteError(f"send_message response missing 'response' string: {resp!r}")
         return out
 
-    def send_message_many(self, messages: list[dict]) -> list[str]:
+    def send_message_many(
+        self, messages: list[dict], *, quorum_floor: int | None = None
+    ) -> list[str]:
         """Batch variant of send_message — enqueue N rows in one transaction
-        and wait for ALL to reach status='ready' before returning the
-        responses in INPUT ORDER.
+        and wait for the batch to resolve before returning the responses in
+        INPUT ORDER.
 
         Each dict in ``messages`` must have keys ``team_id`` (str), ``to``
         (str), ``message`` (str). Returns a list[str] of
         ``response_json["response"]`` strings, in the same order as input
         ``messages``.
+
+        ``quorum_floor`` (#83): when ``None`` (default) the batch is STRICT —
+        every row must reach ``status='ready'`` (the original contract). When
+        an int, the batch is quorum-relaxed (see :meth:`_poll_many`): once
+        ``quorum_floor`` rows are genuinely ready and the per-row soft-timeout
+        has elapsed, silent stragglers are soft-dropped and their slot carries
+        the ``SOFT_DROP_SENTINEL``-prefixed response string. Callers that
+        dispatch a SAFETY-CRITICAL phase (e.g. an independent reviewer or a
+        state-mutating gate) MUST leave this ``None`` so a silent reviewer can
+        never be forgiven by a contributor quorum.
 
         Raises:
           * BridgeRemoteError — if any row reaches status='error' OR if any
@@ -261,7 +337,9 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
                     )
 
         row_ids = self._insert_many("send_message", messages)
-        responses = self._poll_many(row_ids, kind="send_message", messages=messages)
+        responses = self._poll_many(
+            row_ids, kind="send_message", messages=messages, quorum_floor=quorum_floor
+        )
         # `responses` is keyed by row_id in our input order; unwrap to
         # response strings and validate each.
         out: list[str] = []
@@ -281,11 +359,28 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
         # bumped CLEANUP_TIMEOUT_S=120s (see the GAP-5 rationale comment
         # above the module-level constant) — best-effort, larger than the
         # orchestrator's turn-cycle latency.
-        self._request(
-            "team_delete",
-            {"team_id": team_id},
-            timeout_s=self.CLEANUP_TIMEOUT_S,
-        )
+        #
+        # #83: cleanup=True bypasses the per-cycle wall-clock (teardown often
+        # runs *because* the wall expired). And teardown is BEST-EFFORT — a
+        # teardown that raises is not a teardown: we swallow Bridge*Error and
+        # let the caller fall through to the L1-L4 filesystem/pkill cleanup
+        # rather than abort the run on a failed reap. The bounded
+        # CLEANUP_TIMEOUT_S + the still-active heartbeat-stall guard keep this
+        # from blocking forever.
+        try:
+            self._request(
+                "team_delete",
+                {"team_id": team_id},
+                timeout_s=self.CLEANUP_TIMEOUT_S,
+                cleanup=True,
+            )
+        except BridgeError as exc:
+            print(
+                f"[kaizen.cc_tool_bridge] team_delete({team_id!r}) did not "
+                f"complete via the bridge ({type(exc).__name__}: {exc}); "
+                f"continuing — filesystem/pkill teardown is the backstop.",
+                file=sys.stderr,
+            )
 
     # ── internal helpers ──────────────────────────────────────────────
 
@@ -333,6 +428,7 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
         *,
         kind: str,
         messages: list[dict],
+        quorum_floor: int | None = None,
     ) -> list[dict]:
         """Poll N bridge_requests rows in lock-step. Returns the decoded
         ``response_json`` dicts in INPUT ORDER (aligned to ``row_ids``).
@@ -343,6 +439,34 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
 
         Mirrors the single-row poll loop (``_request``) — same stall and
         timeout invariants, just SELECT'ing N rows at once.
+
+        Quorum (#83). When ``quorum_floor`` is ``None`` (the default) the
+        batch is STRICT: every row must reach ``status='ready'`` (the
+        original all-or-nothing contract). When ``quorum_floor`` is an int,
+        the batch is quorum-relaxed: once at least ``quorum_floor`` rows are
+        GENUINELY ``ready`` AND every still-``pending`` row has waited longer
+        than ``ROW_SOFT_TIMEOUT_S``, the remaining pending rows are
+        SOFT-DROPPED — their result slot is filled (in input order) with a
+        synthetic absent-teammate record from
+        :func:`scripts.bridge_softdrop.make_soft_drop_record` and the batch
+        returns. Invariants:
+
+          * Quorum forgives SILENCE only, never FAILURE: ``status='error'``
+            and disappeared rows still raise ``BridgeRemoteError`` — those
+            checks run BEFORE the quorum-satisfied return each tick, so a
+            failure can never be masked by a met quorum.
+          * Only GENUINELY ready rows count toward ``quorum_floor`` — a
+            soft-drop can never satisfy quorum.
+          * No drop before quorum: until ``quorum_floor`` genuine-ready rows
+            exist, the hard backstops (PER_CALL_TIMEOUT_S / CYCLE_WALL_S /
+            heartbeat-stall) are the SOLE governors, unchanged.
+          * Grace after quorum: a still-pending row that has NOT yet exceeded
+            ``ROW_SOFT_TIMEOUT_S`` keeps being awaited even when quorum is
+            already met — we never drop a teammate who may be about to answer.
+          * Soft-dropped rows are left ``status='pending'`` in the DB (the
+            orchestrator S1 owns row lifecycle); the synthetic record lives
+            only in the returned list. A late genuine reply that flips the row
+            to ``ready`` after we return is harmless — we no longer read it.
         """
         # Map row_id → (input_index, recipient) for error attribution
         id_to_index = {rid: i for i, rid in enumerate(row_ids)}
@@ -355,6 +479,16 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
         # Lazy-init per-cycle outer deadline (Issue #42). Mirrors _request.
         if self._cycle_deadline is None:
             self._cycle_deadline = time.monotonic() + self.CYCLE_WALL_S
+        # Quorum bookkeeping (#83). batch_start anchors the per-row
+        # soft-timeout: _insert_many enqueues every row in ONE transaction so
+        # each row's first-seen time == batch_start. `soft_dropped` tracks rows
+        # filled with a synthetic absent record; those NEVER count toward
+        # quorum. `effective_quorum` is None for the strict (all-N) path.
+        batch_start = time.monotonic()
+        soft_dropped: set[int] = set()
+        effective_quorum = (
+            None if quorum_floor is None else max(1, min(int(quorum_floor), len(row_ids)))
+        )
         while True:
             # Capture monotonic gap BEFORE this iteration's tick — see the
             # Issue #41 rationale in `_request` for the why.
@@ -377,7 +511,7 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
             seen_ids = {row[0] for row in rows}
             # Any disappeared row → treat as error attributed to that input.
             for rid in row_ids:
-                if rid not in seen_ids and rid not in completed:
+                if rid not in seen_ids and rid not in completed and rid not in soft_dropped:
                     idx = id_to_index[rid]
                     recipient = id_to_recipient[rid]
                     raise BridgeRemoteError(
@@ -385,7 +519,7 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
                         f"row {rid} disappeared from queue"
                     )
             for rid, status, response_json, error_text in rows:
-                if rid in completed:
+                if rid in completed or rid in soft_dropped:
                     continue
                 if status == "ready":
                     idx = id_to_index[rid]
@@ -410,9 +544,35 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
                     )
                 # else status == 'pending' — keep waiting
 
-            if len(completed) == len(row_ids):
-                # All done — results list is fully populated.
-                return [r if r is not None else {} for r in results]
+            # Return-decision (#83). error/disappeared raises above already
+            # ran this tick, so a met quorum can never mask a failure.
+            if effective_quorum is None:
+                # STRICT path: every row must be genuinely ready.
+                if len(completed) == len(row_ids):
+                    return [r if r is not None else {} for r in results]
+            else:
+                # QUORUM path: only GENUINELY ready rows count toward quorum.
+                if len(completed) >= effective_quorum and (
+                    time.monotonic() - batch_start >= self.ROW_SOFT_TIMEOUT_S
+                ):
+                    # Quorum met AND past the soft-timeout: soft-drop every
+                    # still-pending straggler (grace window has elapsed). A row
+                    # still inside its soft-timeout is left pending and keeps
+                    # being awaited on the next tick.
+                    for rid in row_ids:
+                        if rid not in completed and rid not in soft_dropped:
+                            idx = id_to_index[rid]
+                            recipient = id_to_recipient[rid]
+                            results[idx] = make_soft_drop_record(
+                                idx,
+                                recipient,
+                                "row never reached ready before soft-timeout",
+                            )
+                            soft_dropped.add(rid)
+                if len(completed) + len(soft_dropped) == len(row_ids):
+                    # Either all rows are genuinely ready, or quorum was met and
+                    # the stragglers were soft-dropped — batch is resolved.
+                    return [r if r is not None else {} for r in results]
 
             # Stall + deadline checks — same shape as _request, just batch-scoped.
             # Hybrid stall predicate (Issue #41): both clocks must agree.
@@ -570,6 +730,7 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
         args: dict,
         *,
         timeout_s: float | None = None,
+        cleanup: bool = False,
     ) -> dict:
         """Enqueue + poll one bridge_requests row. Returns the decoded
         `response_json` dict (or raises one of the Bridge*Error).
@@ -581,10 +742,23 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
         ``BridgeStallError("cycle wall-clock exceeded")``. The deadline
         resets when a new wrapper is constructed (the production path) or
         when ``reset_cycle_deadline()`` is called explicitly.
+
+        ``cleanup`` (#83): teardown-path requests (``team_delete``) set this
+        to ``True``. It BYPASSES the per-cycle wall-clock — and does not
+        initialise it — because teardown most often runs precisely BECAUSE the
+        cycle wall already expired; without the bypass, ``team_delete`` would
+        raise ``BridgeStallError("cycle wall-clock exceeded")`` on the first
+        poll before cleanup could complete, leaking the very teammate
+        processes/panes the teardown exists to reap. The heartbeat-stall guard
+        stays active (you cannot tear down through a dead bridge) and the
+        per-call ``timeout_s`` (``CLEANUP_TIMEOUT_S`` for teardown) still
+        bounds the call so a hung teardown cannot block forever.
         """
         timeout_s = self.PER_CALL_TIMEOUT_S if timeout_s is None else timeout_s
         # Lazy-initialize the per-cycle outer deadline on first dispatch.
-        if self._cycle_deadline is None:
+        # Skip for cleanup-path calls: teardown must not start (or be bounded
+        # by) the cycle clock.
+        if not cleanup and self._cycle_deadline is None:
             self._cycle_deadline = time.monotonic() + self.CYCLE_WALL_S
         row_id = self._insert(kind, args)
         deadline = time.monotonic() + timeout_s
@@ -655,8 +829,14 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
                 deadline = time.monotonic() + timeout_s
 
             # Per-cycle outer wall-clock bound. Applies across all calls in
-            # the cycle; if the aggregate budget is blown, abandon.
-            if time.monotonic() >= self._cycle_deadline:
+            # the cycle; if the aggregate budget is blown, abandon. Skipped on
+            # the cleanup path (#83) — teardown must complete even when the
+            # cycle wall has already expired.
+            if (
+                not cleanup
+                and self._cycle_deadline is not None
+                and time.monotonic() >= self._cycle_deadline
+            ):
                 elapsed = time.monotonic() - (self._cycle_deadline - self.CYCLE_WALL_S)
                 raise BridgeStallError(
                     f"cycle wall-clock exceeded: {elapsed:.1f}s elapsed "

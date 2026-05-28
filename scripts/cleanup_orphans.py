@@ -44,6 +44,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from scripts.agent_id_match import guarded_argv, substring_agent_id_regex
 from scripts.sweep_leaked_teams import find_orphan_team_ids
 
 # Default config-layer root. Kept module-level so tests can monkeypatch
@@ -64,10 +65,12 @@ def _pgrep_agent_processes(pattern: str) -> list[tuple[int, str]]:
     """
     # Use a regex that requires `--agent-id` AND the pattern to appear
     # in the argv. `pgrep -af` returns 1 on no-match — treat that as
-    # empty rather than an error.
-    expr = rf"--agent-id\s+\S*{pattern}"
+    # empty rather than an error. The `--` end-of-options guard
+    # (kaizen#82) stops getopt parsing the leading `--agent-id` as an
+    # option; `guarded_argv` is the single enforcement point.
+    expr = substring_agent_id_regex(pattern)
     proc = subprocess.run(
-        ["pgrep", "-af", expr],
+        guarded_argv("pgrep", ["-af"], expr),
         capture_output=True,
         text=True,
         check=False,

@@ -229,6 +229,24 @@ The boundary is narrow: this is *not* a general "skip atelier" license. If `atel
 
 ---
 
+## F15 — Supervise hand-orch subagents (background + deadline guard)
+
+**Rule.** When hand-orchestrating cycle workers or independent reviewers as subagents, dispatch them with `run_in_background`, arm a task-sized deadline guard, cancel the guard on completion, and intervene (inspect / re-scope / `TaskStop` + hand-finish inline) if the guard fires first. Dispatch-and-forget and confabulated supervision are both barred.
+
+**Why it exists — two coupled failure modes.** Hand-orchestration (Phase 4–7, and lean kaizen-on-kaizen runs) leans on the orchestrator session to dispatch and shepherd subagents. Two ways that goes wrong:
+
+1. **Context bloat from inline subagents.** Running a reviewer or implementer inline streams all of its intermediate tool calls into the orchestrator's context. The entire reason to delegate is to keep the orchestrator's context lean for the long-context reasoning the run depends on (the model-rec section sizes the orchestrator at Opus precisely for this). Background dispatch keeps the subagent's transcript off-context; only its final result returns.
+
+2. **No supervision.** A subagent dispatched and then ignored can grind past any sane budget — the large-module bridge-timeout failure mode (`feedback-kaizen-per-row-bridge-timeout`) is the automated analog; F15 is the manual analog. Without a deadline guard the orchestrator has no signal to re-scope or hand-finish, and the run stalls invisibly.
+
+**Confabulated supervision.** A related failure observed at origin: reporting a subagent's runtime or liveness from a single terse harness message (e.g. treating a "tool use rejected" string as proof the agent "never ran") instead of measuring it. The harness message is not ground truth about what executed; when the actual state is unknown, say so and verify — do not narrate unobserved internal state with false confidence.
+
+**Mechanism.** Dispatch `Agent(run_in_background: true)` → note the agentId + dispatch time → arm a guard (`Bash` `run_in_background` with an `until` timer emitting one notification at the budget, or `Monitor` with `timeout_ms`). The agent's completion notification is the success path (cancel the guard via `TaskStop`); the guard firing first is the intervention trigger.
+
+**Originating incident.** 2026-05-29, run-53 #88 layout-stability review hand-finish: a reviewer subagent was dispatched without a deadline guard and the orchestrator went passive, then reported the agent's runtime from a harness string rather than measuring it. Filed as `feedback-subagent-active-management`.
+
+---
+
 ## Deferred follow-ups
 
 The following items were considered during the kaizen#53 / run 33 rule consolidation and intentionally punted. They are recorded here so future contributors can see they were weighed.

@@ -108,6 +108,79 @@ def test_fold_current_window_no_panes_is_noop(monkeypatch):
     tw.fold_current_window()  # no raise
 
 
+def test_fold_current_window_reset_then_fold_is_idempotent_on_reduced_pane_set(monkeypatch):
+    """CHARACTERIZATION of the fold idempotency that kaizen#88's repeated
+    re-fold RELIES ON (review MINOR-4 — relabelled honestly: this exercises
+    `fold_current_window` directly, NOT the executor's re-fold trigger, which
+    is pinned by TestLayoutStabilityRefold in test_team_executor.py).
+
+    Each `fold_current_window` call issues `select-layout` THEN `join-pane`,
+    so re-folding after a pane is REMOVED rebuilds the grid from the current
+    (smaller) pane set. The unconditional per-phase-boundary fold added for
+    kaizen#88 MAJOR-1 depends on exactly this reset-then-fold property: firing
+    the fold when the grid is already correct, or after a removal, both leave
+    a correct grid — never a corrupted one.
+
+    The first call sees 5 teammates (%2..%6) → 2 join pairs. A teammate is
+    then removed; the second call sees 4 teammates (%2..%5) → 2 join pairs,
+    each re-issued AFTER a fresh `select-layout main-vertical` reset."""
+    pane_lists = iter(["%1\n%2\n%3\n%4\n%5\n%6\n", "%1\n%2\n%3\n%4\n%5\n"])
+    current_panes = {"v": ""}
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv:
+            return _mk_proc(0, current_panes["v"])
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(tw.subprocess, "run", fake_run)
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    monkeypatch.setenv("KAIZEN_TEAMMATE_LAYOUT", "grid-2col")
+
+    # First fold — 5 teammates.
+    current_panes["v"] = next(pane_lists)
+    tw.fold_current_window()
+    # Second fold — 4 teammates (one removed) — the re-fold rebuilds.
+    current_panes["v"] = next(pane_lists)
+    tw.fold_current_window()
+
+    # Each call resets via select-layout main-vertical THEN folds via
+    # join-pane. Two calls → two select-layouts, and join-pane must follow
+    # the second select-layout (idempotent reset-then-fold, NOT a raw
+    # join-pane on an already-folded window).
+    layout_idxs = [i for i, c in enumerate(calls) if "select-layout" in c]
+    join_idxs = [i for i, c in enumerate(calls) if "join-pane" in c]
+    assert len(layout_idxs) == 2, f"expected one select-layout per fold; got {layout_idxs}"
+    assert all("main-vertical" in calls[i] for i in layout_idxs)
+    # Joins from the SECOND fold come after the SECOND select-layout — proving
+    # the grid is rebuilt (reset first), not left to drift.
+    joins_after_second_reset = [i for i in join_idxs if i > layout_idxs[1]]
+    assert len(joins_after_second_reset) == 2, (
+        f"second fold must re-issue join-pane after its reset; got joins={join_idxs}, "
+        f"resets={layout_idxs}"
+    )
+
+
+def test_fold_current_window_logs_when_no_panes(monkeypatch, capsys):
+    """kaizen#88 (D5) — a no-op fold (no reachable panes) MUST log to stderr
+    so the no-op is visible, not silent (the #86 silent-no-op trap). The
+    helper still does not raise and the CLI still exits 0."""
+
+    def fake_run(argv, **kwargs):
+        if "list-panes" in argv:
+            return _mk_proc(0, "")  # no panes
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(tw.subprocess, "run", fake_run)
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    tw.fold_current_window()
+    err = capsys.readouterr().err
+    assert "fold" in err.lower() and "no" in err.lower(), (
+        f"expected a visible no-op log on stderr; got: {err!r}"
+    )
+
+
 def test_fold_workspace_cli_returns_zero(monkeypatch):
     """The CLI always exits 0 (best-effort) and forwards --team-id as workspace_name."""
     seen = {}

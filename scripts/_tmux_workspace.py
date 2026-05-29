@@ -569,13 +569,19 @@ def fold_right_column(pane_ids: list[str]) -> None:
     column from top to bottom. Pair (1+2), (3+4), (5+6), ... by joining
     the second of each pair into the first via a horizontal split.
 
-    Designed to be called ONCE per cycle — the caller holds the
-    "did I fold yet" flag (e.g. ``layout_applied`` in
-    ``scripts.team_executor.team_cycle_executor``). Re-folding would
-    undo earlier joins, so this helper does not self-gate.
+    This helper does NOT self-gate and must be invoked ONLY after a fresh
+    ``select-layout`` reset (as ``fold_current_window`` /
+    ``apply_workspace_layout`` do): calling it on an ALREADY-folded window
+    would mis-pair. The reset-then-fold sequence in ``fold_current_window`` is
+    what makes the kaizen#88 repeated re-fold idempotent — never call this
+    bare on a window that was not just reset.
 
     Tolerant of "no tmux server" / individual join failures: surfaces a
-    single stderr warning per failed pair and proceeds.
+    single stderr warning per failed pair and proceeds. kaizen#88 relies on
+    this pre-existing per-pair failure log (parity with the D5 no-op log in
+    ``fold_current_window``) for re-fold visibility — a window that reset to
+    main-vertical but failed to grid into 2 columns is VISIBLE, not silently
+    left half-folded.
     """
     right_panes = pane_ids[1:]
     for i in range(0, len(right_panes) - 1, 2):
@@ -612,18 +618,47 @@ def fold_current_window(*, workspace_name: str = "") -> None:
     Best-effort: tolerant of "no tmux server" / a missing window — never raises
     (a kaizen cycle must not abort on a tmux quirk).
     """
-    lead_pane_id = _orchestrator_pane_id()
     pane_ids = _list_pane_ids(workspace_name)  # excludes the orchestrator pane at source
     if not pane_ids:
+        # kaizen#88 (D5) — make the no-op VISIBLE. The #86 trap was a fold
+        # that silently did nothing because it could not reach a window with
+        # teammate panes; the operator then saw an un-folded layout with no
+        # diagnostic. ``_list_pane_ids`` returns ``None`` on a tmux soft
+        # failure (no server / list-panes error) and ``[]`` when the window
+        # genuinely holds no teammate panes — both reduce to "nothing to
+        # fold." Log which case fired, then keep the best-effort exit-0
+        # contract (return without raising).
+        reason = (
+            "tmux unavailable or list-panes failed (no reachable window)"
+            if pane_ids is None
+            else "no teammate panes in the current window"
+        )
+        print(
+            f"[_tmux_workspace] fold_current_window no-op for {workspace_name!r}: "
+            f"{reason}; layout left unchanged.",
+            file=sys.stderr,
+        )
         return
     layout_mode = _resolve_layout(len(pane_ids), os.environ.get("KAIZEN_TEAMMATE_LAYOUT"))
     primitive = "main-vertical" if layout_mode == "grid-2col" else "even-vertical"
     proc = _run_tmux(["select-layout", primitive])
     if _tmux_unavailable(proc) or proc.returncode != 0:
+        # kaizen#88 (D5) — the select-layout step itself failed (server went
+        # away between list-panes and now, or tmux rejected the primitive).
+        # Surface it rather than returning silently.
+        print(
+            f"[_tmux_workspace] fold_current_window no-op for {workspace_name!r}: "
+            f"select-layout {primitive} did not apply "
+            f"({(proc.stderr or '').strip() or 'tmux unavailable'}); layout left unchanged.",
+            file=sys.stderr,
+        )
         return
     if layout_mode == "grid-2col":
         # kaizen#81: prepend the PM pane (the untouched main at index 0) so
         # fold_right_column pairs ALL teammates rather than dropping the first.
+        # Arch#5 NIT — read the orchestrator pane id next to its sole use,
+        # below the empty-pane / select-layout early-returns.
+        lead_pane_id = _orchestrator_pane_id()
         if lead_pane_id is not None:
             fold_right_column([lead_pane_id, *pane_ids])
         else:

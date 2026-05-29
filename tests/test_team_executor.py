@@ -1925,3 +1925,274 @@ class TestGap7ShutdownHandshake:
         assert any("simulated bridge failure" in w for w in warnings), (
             f"warning must surface the underlying exception text; got: {warnings}"
         )
+
+
+# ── kaizen#88 — layout stability across spawn waves ───────────────────────
+
+
+class TestLayoutStabilityRefold:
+    """kaizen#88 — the PM-left + 2-col-grid layout must hold at ALL times,
+    re-applied after every pane-count change, not just once after Phase 2.
+
+    Two complementary mechanisms (both exercised here):
+
+      1. UNCONDITIONAL per-phase-boundary fold (backbone, review MAJOR-1):
+         one `apply_layout` at each Phase-4 wave boundary and each Phase-5b'
+         reviewer iteration, regardless of WHY the pane count changed. This
+         self-heals teammate ADD, REMOVE (a reaped straggler), and RESPAWN —
+         because `fold_current_window` is reset-then-fold idempotent.
+
+      2. First-contact within-batch complement (review MINOR-5): a
+         never-before-seen recipient mid-batch flags one coalesced re-fold
+         after the batch, so a mid-phase spawn re-folds promptly rather than
+         waiting for the next boundary. This is a HEURISTIC blind to
+         removals/respawns — hence mechanism (1) is the backbone.
+
+    The fold routes through the idempotent `apply_layout` → `fold_workspace`
+    → `fold_current_window` (#86 bridge path); no raw `fold_right_column`.
+    """
+
+    def _one_ai_owner_offroster_json(self) -> str:
+        # Owner `impl-x` is deliberately NOT in the roster below, so it is
+        # first contacted in Phase 4 (a brand-new pane).
+        return (
+            "ok\n```json\n["
+            '{"id": "A", "touches": ["a.py"], "reads": [], "depends_on": [], '
+            '"wave": 1, "owner": "impl-x"}'
+            "]\n```"
+        )
+
+    def _two_wave_all_roster_json(self) -> str:
+        # Two waves, owners ALL in the roster below — so NO new recipient is
+        # introduced in Phase 4. Used by the self-heal test: the pre-fix
+        # new-recipient-only logic fires ZERO folds for these waves; the
+        # unconditional per-wave-boundary fold MUST still fire.
+        return (
+            "ok\n```json\n["
+            '{"id": "A", "touches": ["a.py"], "reads": [], "depends_on": [], '
+            '"wave": 1, "owner": "be-1"}, '
+            '{"id": "B", "touches": ["b.py"], "reads": ["a.py"], "depends_on": ["A"], '
+            '"wave": 2, "owner": "be-1"}'
+            "]\n```"
+        )
+
+    def test_apply_layout_fires_more_than_once_when_phase4_introduces_new_pane(
+        self, tmp_path, monkeypatch
+    ):
+        """A Phase-4 owner not seen in Phase 1/2 is a new pane → re-fold.
+
+        Pre-fix (one-shot gate) `apply_layout` fires exactly once after
+        Phase 2; this asserts it fires AGAIN for the Phase-4 new recipient.
+        """
+        _patch_ci_green(monkeypatch)
+        _patch_phase5c(monkeypatch)
+        # Roster: PM + three specialists, all contacted in Phase 1/2. The
+        # implementer `impl-x` (the DAG owner) is OFF-roster → first seen
+        # in Phase 4.
+        roster = [
+            "pm-1",
+            "security-engineer-1",
+            "software-architect-1",
+            "sdet-1",
+        ]
+        tools = MockTeamTools(
+            scripted={
+                "Phase 1": "do x",
+                "Phase 2": "proposal",
+                "Phase 3 close": self._one_ai_owner_offroster_json(),
+                "Phase 4 wave": "applied",
+                "Phase 5b'": "NO ISSUES",
+            }
+        )
+        with patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}):
+            team_cycle_executor(
+                clone_dir=tmp_path,
+                project=_project(roster=roster),
+                run_row=_run_row(),
+                cycle_n=1,
+                tools=tools,
+            )
+        apply_layout_calls = [c for c in tools.calls if c[0] == "apply_layout"]
+        assert len(apply_layout_calls) > 1, (
+            "apply_layout must fire more than once — once after Phase 2 and "
+            "again when Phase 4 introduces a never-before-seen pane (kaizen#88); "
+            f"got {len(apply_layout_calls)} call(s)"
+        )
+
+    def test_apply_layout_self_heals_each_wave_with_no_new_recipient(self, tmp_path, monkeypatch):
+        """SELF-HEAL (review MAJOR-2 ii): a Phase-4 wave whose owner was
+        ALREADY contacted in Phase 2 introduces NO new recipient — yet the
+        layout still drifts (a straggler may have been reaped, panes re-tiled)
+        and MUST be re-folded at the wave boundary.
+
+        This pins the UNCONDITIONAL per-phase-boundary fold. The pre-fix
+        new-recipient-only logic fires ZERO folds for these two waves (be-1 is
+        already seen from Phase 2), so it would record only the Phase-1/2
+        folds — this test FAILS on that logic and PASSES with the backbone
+        fold. We assert a strictly LARGER fold count than a run with no
+        Phase-4 waves at all would produce.
+        """
+        _patch_ci_green(monkeypatch)
+        _patch_phase5c(monkeypatch)
+        # `be-1` (the only implementer) IS in the roster → contacted in
+        # Phase 2 → NOT a new recipient in Phase 4. Reviewers are the other
+        # roster members, also already seen.
+        roster = [
+            "pm-1",
+            "be-1",
+            "security-engineer-1",
+            "software-architect-1",
+            "sdet-1",
+        ]
+        tools = MockTeamTools(
+            scripted={
+                "Phase 1": "do x",
+                "Phase 2": "proposal",
+                "Phase 3 close": self._two_wave_all_roster_json(),
+                "Phase 4 wave": "applied",
+                "Phase 5b'": "NO ISSUES",
+            }
+        )
+        with patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}):
+            team_cycle_executor(
+                clone_dir=tmp_path,
+                project=_project(roster=roster),
+                run_row=_run_row(),
+                cycle_n=1,
+                tools=tools,
+            )
+        apply_layout_calls = [c for c in tools.calls if c[0] == "apply_layout"]
+        # Deterministic count under the fix:
+        #   Phase 1 (pm-1, first send → initial setup fold) ........... 1
+        #   Phase 2 batch (4 new non-PM members → coalesced fold) ..... 1
+        #   Phase 4 wave 1 boundary (unconditional) ................... 1
+        #   Phase 4 wave 2 boundary (unconditional) ................... 1
+        #   Phase 5b' reviewer iteration boundary (unconditional) ..... 1
+        #   ----------------------------------------------------------------
+        #                                                       total = 5
+        # The two WAVE-boundary folds are exactly what the pre-fix
+        # new-recipient logic would NOT emit (be-1 already seen), so the
+        # self-heal is what carries the count past 3.
+        assert len(apply_layout_calls) == 5, (
+            "expected exactly 5 folds (1 setup + 1 Phase-2 batch + 2 "
+            "unconditional wave boundaries + 1 reviewer-iteration boundary); "
+            f"got {len(apply_layout_calls)}. The two wave-boundary folds are "
+            "the self-heal that the pre-fix new-recipient-only logic omits."
+        )
+
+    def test_apply_layout_exactly_one_fold_per_wave_boundary(self, tmp_path, monkeypatch):
+        """COALESCE (review MAJOR-2 i): a wave that dispatches K owners via K
+        individual `send_message` calls must fire EXACTLY ONE fold at the
+        wave boundary — not K. We drive a single wave with 3 owners and assert
+        the count attributable to that wave is 1.
+        """
+        _patch_ci_green(monkeypatch)
+        _patch_phase5c(monkeypatch)
+        # One wave, THREE owners — all already-seen roster members so the only
+        # fold the wave can produce is the single unconditional boundary fold.
+        ai_json = (
+            "ok\n```json\n["
+            '{"id": "A", "touches": ["a.py"], "reads": [], "depends_on": [], '
+            '"wave": 1, "owner": "be-1"}, '
+            '{"id": "B", "touches": ["b.py"], "reads": [], "depends_on": [], '
+            '"wave": 1, "owner": "security-engineer-1"}, '
+            '{"id": "C", "touches": ["c.py"], "reads": [], "depends_on": [], '
+            '"wave": 1, "owner": "software-architect-1"}'
+            "]\n```"
+        )
+        roster = [
+            "pm-1",
+            "be-1",
+            "security-engineer-1",
+            "software-architect-1",
+            "sdet-1",
+            "prompt-engineer-1",
+        ]
+        tools = MockTeamTools(
+            scripted={
+                "Phase 1": "do x",
+                "Phase 2": "proposal",
+                "Phase 3 close": ai_json,
+                "Phase 4 wave": "applied",
+                "Phase 5b'": "NO ISSUES",
+            }
+        )
+        with patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}):
+            team_cycle_executor(
+                clone_dir=tmp_path,
+                project=_project(roster=roster),
+                run_row=_run_row(),
+                cycle_n=1,
+                tools=tools,
+            )
+        apply_layout_calls = [c for c in tools.calls if c[0] == "apply_layout"]
+        # Deterministic count under the fix:
+        #   Phase 1 setup .......................... 1
+        #   Phase 2 batch (5 new non-PM) ........... 1
+        #   Phase 4 single wave boundary ........... 1   (NOT 3, despite 3 owners)
+        #   Phase 5b' reviewer-iteration boundary .. 1
+        #   ------------------------------------------------
+        #                                    total = 4
+        # If the per-owner send fired its own fold, a 3-owner wave would add
+        # 2 extra → total 6. Pinning to 4 proves the wave coalesces to one.
+        assert len(apply_layout_calls) == 4, (
+            "a 3-owner wave must coalesce to ONE boundary fold, not three; "
+            f"expected 4 total folds, got {len(apply_layout_calls)}"
+        )
+
+    def test_apply_layout_coalesced_once_per_batch_not_per_message(self, tmp_path, monkeypatch):
+        """COALESCE (Phase-2 fan-out): a `send_message_many` that spawns N new
+        recipients folds ONCE for the batch, not N times.
+
+        Roster below: PM + 4 specialists, single-wave all-roster owner. The
+        only batch that introduces new panes is Phase 2 (the 4 non-PM
+        members), which must coalesce to a single fold rather than 4.
+        """
+        _patch_ci_green(monkeypatch)
+        _patch_phase5c(monkeypatch)
+        roster = [
+            "pm-1",
+            "security-engineer-1",
+            "software-architect-1",
+            "sdet-1",
+            "prompt-engineer-1",
+        ]
+        # All-roster owner so Phase 4 introduces no NEW recipient.
+        ai_json = (
+            "ok\n```json\n["
+            '{"id": "A", "touches": ["a.py"], "reads": [], "depends_on": [], '
+            '"wave": 1, "owner": "security-engineer-1"}'
+            "]\n```"
+        )
+        tools = MockTeamTools(
+            scripted={
+                "Phase 1": "do x",
+                "Phase 2": "proposal",
+                "Phase 3 close": ai_json,
+                "Phase 4 wave": "applied",
+                "Phase 5b'": "NO ISSUES",
+            }
+        )
+        with patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}):
+            team_cycle_executor(
+                clone_dir=tmp_path,
+                project=_project(roster=roster),
+                run_row=_run_row(),
+                cycle_n=1,
+                tools=tools,
+            )
+        apply_layout_calls = [c for c in tools.calls if c[0] == "apply_layout"]
+        # Deterministic count under the fix:
+        #   Phase 1 setup .......................... 1
+        #   Phase 2 batch (4 new non-PM, ONE fold) . 1   (NOT 4)
+        #   Phase 4 single wave boundary ........... 1
+        #   Phase 5b' reviewer-iteration boundary .. 1
+        #   ------------------------------------------------
+        #                                    total = 4
+        # If Phase 2 folded per-message it would add 3 extra → 7. Pinning to
+        # the EXACT 4 (tightened from the prior loose 1<=n<=2 bound) proves
+        # the per-batch coalesce holds.
+        assert len(apply_layout_calls) == 4, (
+            "Phase 2 must coalesce its 4-recipient fan-out to ONE fold; "
+            f"expected 4 total folds, got {len(apply_layout_calls)}"
+        )

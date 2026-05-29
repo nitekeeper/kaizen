@@ -1305,7 +1305,16 @@ def team_cycle_executor(
             active_members.add(to)
             # kaizen#61 — per-spawn retitle hook. Apply tmux layout +
             # title this recipient's pane on first observation.
+            # kaizen#88 — clear the per-batch re-fold flag, retitle (which
+            # sets it iff `to` is a new pane), then fold ONCE after — UNLESS a
+            # phase boundary owns the fold (``suppress_batch_refold``), in
+            # which case the boundary's single unconditional fold covers this
+            # spawn and we must not add a per-message fold.
+            needs_refold[0] = False
             _retitle_on_first_send(to)
+            if needs_refold[0] and not suppress_batch_refold[0]:
+                _request_orchestrator_fold()
+            needs_refold[0] = False
             return resp
 
         def send_message_many(
@@ -1319,11 +1328,23 @@ def team_cycle_executor(
             # soft-dropped recipient still appears here (its slot returned a
             # sentinel response, not an exception) — harmless for active-member
             # tracking, which only gates pane retitling.
+            #
+            # kaizen#88 — COALESCE the re-fold to once per batch: a batch that
+            # spawns N new panes is a SINGLE pane-count change from the
+            # operator's view, so we clear the flag, retitle every recipient
+            # (each first-seen one sets `needs_refold`), then fold ONCE after
+            # the whole batch — never one fold per message.
+            needs_refold[0] = False
             for m in messages:
                 active_members.add(m["to"])
                 # kaizen#61 — retitle each batch recipient on first
                 # observation. Set-membership keeps repeats cheap.
                 _retitle_on_first_send(m["to"])
+            # Fold ONCE after the whole batch — unless a phase boundary owns
+            # the fold (``suppress_batch_refold``), per kaizen#88 MAJOR-2.
+            if needs_refold[0] and not suppress_batch_refold[0]:
+                _request_orchestrator_fold()
+            needs_refold[0] = False
             return resps
 
         def team_delete(self, team_id: str) -> None:
@@ -1353,9 +1374,80 @@ def team_cycle_executor(
     # See :func:`scripts.team_executor._apply_pane_label` for the
     # decision predicate.
     current_title: dict[str, str] = {}
-    # One-shot "did I fold yet" flag (Phase 4 wave dispatch retitles but
-    # MUST NOT re-fold — re-folding would undo earlier join-pane work).
+    # One-shot "did I do the title/bookkeeping setup yet" flag. The in-process
+    # ``apply_workspace_layout`` + initial ``set_pane_titles`` run EXACTLY once
+    # per cycle (re-running them would re-issue the no-op in-process fold and
+    # re-stamp bare titles over wave labels). The ORCHESTRATOR-side fold is NOT
+    # gated by this — see ``_request_orchestrator_fold`` / ``needs_refold``.
     layout_applied: list[bool] = [False]
+    # kaizen#88 — every recipient we have ever dispatched to. CC's team-mode
+    # spawn is lazy and per-first-``SendMessage``, so the FIRST time we see a
+    # ``to`` a new pane was just materialised in the orchestrator's window,
+    # which tmux auto-retiles (collapsing the grid). Tracking "have I seen this
+    # recipient" is a FIRST-CONTACT HEURISTIC, NOT a true pane-count delta: it
+    # fires on teammate ADD but is blind to teammate REMOVE (TeamDelete of a
+    # straggler) and to RESPAWN of an already-seen role. Those cases are
+    # backstopped by the UNCONDITIONAL per-phase-boundary fold
+    # (``_phase_boundary_fold``) issued at each Phase-4 wave boundary and each
+    # Phase-5b' reviewer iteration — that is the backbone that delivers
+    # "PM-left + 2-col grid at ALL times"; the heuristic is a within-batch
+    # complement so a mid-phase spawn re-folds promptly rather than waiting
+    # for the next boundary. (review MAJOR-1 / MINOR-5)
+    seen_recipients: set[str] = set()
+    # Per-batch "a new pane appeared — re-fold once after this batch" flag.
+    # Mutated by ``_retitle_on_first_send``; checked + cleared by the
+    # ``_TrackedTools`` wrappers so the re-fold coalesces to ONE
+    # ``apply_layout`` per batch (not one per message). A list so the
+    # closure can mutate it.
+    needs_refold: list[bool] = [False]
+    # kaizen#88 (review MAJOR-2) — suppress the per-message new-recipient
+    # in-wrapper trigger while a phase BOUNDARY owns the fold. The Phase-4
+    # wave loop dispatches owners via individual ``tools.send_message`` calls;
+    # without this guard a K-new-owner wave would fire K folds. The wave (and
+    # each Phase-5b' iteration) sets this True around its dispatches and emits
+    # exactly ONE unconditional ``_phase_boundary_fold`` at the boundary, so
+    # the per-wave / per-iteration fold count is exactly 1. A list so the
+    # closure can mutate it.
+    suppress_batch_refold: list[bool] = [False]
+
+    def _request_orchestrator_fold() -> None:
+        """Emit an ``apply_layout`` bridge request so the ORCHESTRATOR folds
+        its own window into "PM-left + 2-col grid" (kaizen#86 path).
+
+        UNGATED by design (kaizen#88): the in-process
+        ``apply_workspace_layout`` runs in the detached ``run_bridged``
+        process, whose tmux commands never reach the orchestrator's window —
+        so the fold is a no-op there and must be re-requested every time the
+        live pane count changes. The request routes through the IDEMPOTENT
+        ``scripts.fold_workspace`` → ``fold_current_window`` (reset-then-fold),
+        so firing it repeatedly is safe — never call ``fold_right_column``
+        directly here. Best-effort + cosmetic: the wrapper swallows bridge
+        errors so a layout request can never abort the cycle.
+        """
+        try:
+            tools.apply_layout(team_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            _log.warning("apply_layout request failed: %s", exc)
+
+    def _phase_boundary_fold() -> None:
+        """Unconditional, idempotent re-fold issued at a phase boundary.
+
+        kaizen#88 (review MAJOR-1): the new-recipient heuristic in
+        ``_retitle_on_first_send`` only catches teammate ADD. A teammate
+        REMOVE (a straggler reaped between waves) or a RESPAWN of an
+        already-seen role also re-tiles the window but produces no new
+        recipient — so the heuristic misses it. An unconditional fold at each
+        Phase-4 wave boundary and each Phase-5b' reviewer iteration SELF-HEALS
+        the grid regardless of WHY the pane count changed, because
+        ``fold_current_window`` is reset-then-fold idempotent (a fold when the
+        grid is already correct is a cheap no-op).
+
+        Also clears any pending ``needs_refold`` so a within-batch trigger
+        that fired during this boundary's dispatch does not double-fold on top
+        of this one (bounds the count to exactly 1 per boundary).
+        """
+        needs_refold[0] = False
+        _request_orchestrator_fold()
 
     def _setup_tmux_layout_once() -> None:
         if layout_applied[0]:
@@ -1374,7 +1466,9 @@ def team_cycle_executor(
             )
         except Exception as exc:  # pragma: no cover - defensive
             _log.warning("apply_workspace_layout failed: %s", exc)
-            return
+            # Still request the orchestrator-side fold below — the in-process
+            # call failing does not mean the orchestrator window cannot fold.
+            result = {}
         pane_to_agent.update(result)
         if pane_to_agent:
             # Pre-wave initial titles: bare role names, no wave prefix
@@ -1389,20 +1483,14 @@ def team_cycle_executor(
             # label and decide whether a tmux call is needed.
             for role in pane_to_agent.values():
                 current_title[role] = role
-        # kaizen#86 — the apply_workspace_layout call above runs in THIS
-        # (detached run_bridged) process, whose tmux commands never reach the
-        # orchestrator's window, so its select-layout/join-pane fold is a silent
-        # no-op there (it still gives us pane_to_agent for the title bookkeeping
-        # above). Emit an `apply_layout` request so the ORCHESTRATOR folds its
-        # own window for real. Best-effort: the wrapper swallows bridge errors
-        # (layout is cosmetic and must never abort the cycle).
-        try:
-            tools.apply_layout(team_id)
-        except Exception as exc:  # pragma: no cover - defensive
-            _log.warning("apply_layout request failed: %s", exc)
+        # kaizen#86/#88 — emit the FIRST orchestrator-side fold (the
+        # post-first-wave fold). Subsequent spawn waves re-fold via the
+        # ``needs_refold`` path in the ``_TrackedTools`` wrappers.
+        _request_orchestrator_fold()
 
     def _retitle_on_first_send(recipient: str) -> None:
-        """Apply layout (if not yet) and label the recipient's pane.
+        """Apply layout (if not yet), label the recipient's pane, and flag a
+        re-fold when ``recipient`` is a brand-new pane.
 
         Called after every successful ``send_message`` /
         ``send_message_many`` from ``_TrackedTools``. The label-change
@@ -1410,13 +1498,37 @@ def team_cycle_executor(
         on repeat calls — a recipient already labeled with its bare
         role name is a one-comparison no-op.
 
+        kaizen#88: a ``recipient`` never seen before means CC just spawned a
+        new pane, which tmux auto-retiled — so we SET ``needs_refold`` (the
+        ``_TrackedTools`` wrapper folds once after the batch UNLESS a phase
+        boundary owns the fold; see ``suppress_batch_refold``). The recipient
+        that TRIGGERS the initial setup is not itself flagged, because
+        ``_setup_tmux_layout_once`` already issues the initial fold that
+        covers it. (In a multi-recipient first batch the later recipients
+        still flag a re-fold; that batch-end fold is idempotent — reset-then-
+        fold — so the worst case on the very first batch is one redundant but
+        harmless fold, never a corrupted grid.)
+
+        This first-contact flag is only a COMPLEMENT to the unconditional
+        per-phase-boundary fold (``_phase_boundary_fold``) — it cannot see a
+        teammate REMOVE or a RESPAWN, which the boundary fold handles.
+
         Phase 4 and Phase 5b' wrap a different desired label
         (``[w{n}] {role}`` / ``[R{iter_n}] {role}``) so the per-spawn
         bare-role label here is only authoritative until the first
         wave/iter dispatch overrides it.
         """
-        if not layout_applied[0]:
+        first_setup = not layout_applied[0]
+        if first_setup:
             _setup_tmux_layout_once()
+        # A never-before-seen recipient → a new pane was just spawned →
+        # the grid drifted → request a re-fold. Skip flagging for recipients
+        # observed during the very batch that triggered the initial setup
+        # fold (that fold already covers them).
+        if recipient not in seen_recipients:
+            seen_recipients.add(recipient)
+            if not first_setup:
+                needs_refold[0] = True
         try:
             _apply_pane_label(recipient, recipient, current_title, pane_to_agent)
         except Exception as exc:  # pragma: no cover - defensive
@@ -1650,26 +1762,41 @@ def team_cycle_executor(
                             tmux_exc,
                         )
                 wave_abandoned = False
-                for ai_id in wave_ids:
-                    item = items_by_id[ai_id]
-                    owner = item.get("owner") or pm
-                    impl_resp = tools.send_message(
-                        team_id,
-                        to=owner,
-                        message=phase_4_implementer(item=item, wave_n=wave_n),
-                    )
-                    if _is_abandon(impl_resp):
-                        _abandon(
-                            outcome_acc,
-                            phase_reached="implementation",
-                            reason="other",
-                            detail=(
-                                f"Owner {owner} abandoned AI {ai_id}: {_abandon_reason(impl_resp)}"
-                            ),
+                # kaizen#88 MAJOR-1/MAJOR-2 — the wave dispatches its owners as
+                # individual ``send_message`` calls; suppress the per-message
+                # in-wrapper re-fold for the duration of the wave and emit
+                # EXACTLY ONE unconditional ``_phase_boundary_fold`` at the
+                # boundary (in the finally). This both coalesces the add-case
+                # to one fold/wave AND self-heals removals/respawns the
+                # first-contact heuristic cannot see. The finally runs even on
+                # a mid-wave abandon, so a partially-spawned wave still has its
+                # grid restored.
+                suppress_batch_refold[0] = True
+                try:
+                    for ai_id in wave_ids:
+                        item = items_by_id[ai_id]
+                        owner = item.get("owner") or pm
+                        impl_resp = tools.send_message(
+                            team_id,
+                            to=owner,
+                            message=phase_4_implementer(item=item, wave_n=wave_n),
                         )
-                        wave_abandoned = True
-                        break
-                    outcome_acc.decisions.append(f"AI {ai_id}: {(impl_resp or '')[:200]}")
+                        if _is_abandon(impl_resp):
+                            _abandon(
+                                outcome_acc,
+                                phase_reached="implementation",
+                                reason="other",
+                                detail=(
+                                    f"Owner {owner} abandoned AI {ai_id}: "
+                                    f"{_abandon_reason(impl_resp)}"
+                                ),
+                            )
+                            wave_abandoned = True
+                            break
+                        outcome_acc.decisions.append(f"AI {ai_id}: {(impl_resp or '')[:200]}")
+                finally:
+                    suppress_batch_refold[0] = False
+                    _phase_boundary_fold()
                 if wave_abandoned:
                     break
                 # CI mirror at every wave boundary
@@ -1798,7 +1925,20 @@ def team_cycle_executor(
                         # reviewer must escalate to the hard backstop, never be
                         # soft-dropped: soft-dropping a reviewer would collapse
                         # the review->fix loop and let an unreviewed change ship.
-                        reviewer_responses = tools.send_message_many(reviewer_messages)
+                        #
+                        # kaizen#88 MAJOR-1 — a reviewer iteration is a phase
+                        # boundary: reviewers (and respawned reviewers across
+                        # iterations) materialise/re-tile panes. Suppress the
+                        # per-batch in-wrapper trigger and emit EXACTLY ONE
+                        # unconditional ``_phase_boundary_fold`` after the
+                        # reviewer batch (in the finally, so it self-heals even
+                        # if a reviewer reply raises). One fold per iteration.
+                        suppress_batch_refold[0] = True
+                        try:
+                            reviewer_responses = tools.send_message_many(reviewer_messages)
+                        finally:
+                            suppress_batch_refold[0] = False
+                            _phase_boundary_fold()
                         for reviewer, resp in zip(reviewers, reviewer_responses, strict=True):
                             findings.extend(
                                 _parse_reviewer_response(resp or "", reviewer, prefix=f"R{iter_n}")

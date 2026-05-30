@@ -38,6 +38,10 @@ VALID_REASONS: frozenset[str] = frozenset(
         "lint_failed",
         "security_failed",
         "sca_failed",
+        # kaizen#93: dedicated bridge-timeout reason. Mirrored in
+        # migrations/006_bridge_timeout_reason.sql — any addition here MUST
+        # also extend the SQL CHECK constraint in the next migration.
+        "bridge_timeout",
         "other",
     }
 )

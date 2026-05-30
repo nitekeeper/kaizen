@@ -257,10 +257,15 @@ def _bridge_timeout_to_abandoned_outcome(exc, *, subject, branch) -> dict:
     human via the run_bridged log even if the later DB write fails.
 
     Capture-only: it never resumes, commits, or pushes the survived work — the
-    branch name is a manual-recovery POINTER. ``reason='other'`` + a greppable
-    detail prefix avoids a schema migration for a dedicated reason; the phase
-    is a best-effort ``'implementation'`` default (the bridge layer does not
-    carry the cycle phase — a future refinement could thread the real phase).
+    branch name is a manual-recovery POINTER. ``reason='bridge_timeout'`` (the
+    dedicated enum value added by migration 006_bridge_timeout_reason.sql,
+    kaizen#93) makes these incidents filterable
+    (``SELECT * FROM abandonments WHERE reason='bridge_timeout'``) instead of
+    bucketed in ``'other'``; the greppable detail prefix is retained as
+    belt-and-braces so any pre-migration rows (which recorded ``'other'``) stay
+    discoverable by grep. The phase is a best-effort ``'implementation'``
+    default (the bridge layer does not carry the cycle phase — a future
+    refinement could thread the real phase).
     """
     snapshot = getattr(exc, "snapshot", None)
     exc_name = type(exc).__name__
@@ -304,7 +309,7 @@ def _bridge_timeout_to_abandoned_outcome(exc, *, subject, branch) -> dict:
     return {
         "status": "abandoned",
         "phase_reached": "implementation",
-        "reason": "other",
+        "reason": "bridge_timeout",
         "detail": detail,
         "participants": participants,
         "artifacts": [branch] if branch else [],

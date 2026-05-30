@@ -457,11 +457,14 @@ def test_valid_reasons_includes_new_taxonomy():
     assert "review_unrecoverable" in VALID_REASONS
 
 
-@pytest.mark.parametrize("new_reason", ["lint_failed", "security_failed", "sca_failed"])
+@pytest.mark.parametrize(
+    "new_reason", ["lint_failed", "security_failed", "sca_failed", "bridge_timeout"]
+)
 def test_record_abandonment_accepts_new_reasons(db, run_and_cycle, new_reason):
-    """F12 (audit cleanup): migration 005 extended the CHECK constraint to
-    accept the three new categories — inserting a row with any of them must
-    succeed (not raise an IntegrityError)."""
+    """F12 (audit cleanup) + kaizen#93: migrations 005/006 extended the CHECK
+    constraint to accept the per-CI-category reasons and the dedicated
+    bridge_timeout reason — inserting a row with any of them must succeed (not
+    raise an IntegrityError)."""
     row = record_abandonment(
         db_path=db,
         cycle_id=run_and_cycle["cycle"]["id"],

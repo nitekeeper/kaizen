@@ -1511,7 +1511,7 @@ def test_orchestrate_run_bridge_timeout_becomes_abandonment(
     assert result["cycles_abandoned"] == 1
     assert len(result["abandonments"]) == 1
     ab = result["abandonments"][0]
-    assert ab["reason"] == "other"
+    assert ab["reason"] == "bridge_timeout"
     # The recoverable pointer is persisted in the DB detail column (→ PR body):
     # classification, the N-of-M counts, the soft-dropped suffix, AND the branch.
     assert "partial_progress" in ab["detail"]

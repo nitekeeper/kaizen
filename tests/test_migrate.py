@@ -36,13 +36,13 @@ def test_migration_recorded(tmp_path):
 
 
 def test_migration_is_idempotent(tmp_path):
-    """Re-running migrations is a no-op and does not double-apply (001-005)."""
+    """Re-running migrations is a no-op and does not double-apply (001-006)."""
     db_path = str(tmp_path / "test.db")
     apply_migrations(db_path, MIGRATIONS_DIR)
     apply_migrations(db_path, MIGRATIONS_DIR)  # must not raise
     with closing(get_connection(db_path)) as conn:
         count = conn.execute("SELECT COUNT(*) FROM migrations").fetchone()[0]
-    assert count == 5
+    assert count == 6
 
 
 def test_fk_indexes_created(tmp_path):
@@ -227,8 +227,31 @@ def test_abandonments_reason_check_rejects_push_failed(tmp_path):
             conn.commit()
 
 
+def test_abandonments_reason_check_accepts_bridge_timeout(tmp_path):
+    """kaizen#93: migration 006 added 'bridge_timeout' to the reason CHECK so a
+    raw INSERT with that reason succeeds, while an unknown reason still raises."""
+    db_path = str(tmp_path / "test.db")
+    apply_migrations(db_path, MIGRATIONS_DIR)
+    with closing(get_connection(db_path)) as conn:
+        project_id = _insert_project(conn)
+        cycle_id = _insert_run_and_cycle(conn, project_id)
+        conn.execute(
+            "INSERT INTO abandonments (cycle_id, phase_reached, reason, detail, created_at) "
+            "VALUES (?, 'implementation', 'bridge_timeout', 'detail', datetime('now'))",
+            (cycle_id,),
+        )
+        conn.commit()
+        with pytest.raises(sqlite3.IntegrityError):
+            conn.execute(
+                "INSERT INTO abandonments (cycle_id, phase_reached, reason, detail, created_at) "
+                "VALUES (?, 'implementation', 'not_a_reason', 'detail', datetime('now'))",
+                (cycle_id,),
+            )
+            conn.commit()
+
+
 def test_abandonments_valid_values_accepted(tmp_path):
-    """All valid (phase_reached x reason) combinations must succeed (6 phases x 5 reasons = 30)."""
+    """All valid (phase_reached x reason) combinations must succeed (6 phases x 9 reasons = 54)."""
     db_path = str(tmp_path / "test.db")
     apply_migrations(db_path, MIGRATIONS_DIR)
     with closing(get_connection(db_path)) as conn:
@@ -240,6 +263,12 @@ def test_abandonments_valid_values_accepted(tmp_path):
             "destructive_rejected",
             "tests_unrecoverable",
             "review_unrecoverable",
+            # 005 trio (lint/security/sca) + 006 bridge_timeout — keep in sync
+            # with the abandonments.reason CHECK in the latest migration.
+            "lint_failed",
+            "security_failed",
+            "sca_failed",
+            "bridge_timeout",
             "other",
         )
         for phase in valid_phases:

@@ -2254,12 +2254,29 @@ class TestLayoutStabilityRefold:
                 tools=tools,
             )
         apply_layout_calls = [c for c in tools.calls if c[0] == "apply_layout"]
-        assert len(apply_layout_calls) > 1, (
+        # kaizen#96 — EXACTLY three apply_layout requests fire on the raising
+        # path, and the count must pin BOTH self-heal layers. A loose ``> 1``
+        # would stay green if EITHER layer were silently reverted, because one
+        # layer alone still yields 2 — so this asserts ``== 3`` to map and lock
+        # every contributing fold (mirrors the exact-count idiom at
+        # ``test_apply_layout_coalesced_once_per_batch_not_per_message``):
+        #   #1  Phase-1 setup fold (``_setup_tmux_layout_once`` on the first
+        #       send to the PM — fires regardless of this fix);
+        #   #2  Layer A — the ``send_message_many`` ``finally`` re-fold after
+        #       the Phase-2 batch raises (4 fresh recipients flag needs_refold,
+        #       ``suppress_batch_refold`` is False);
+        #   #3  Layer B — the cycle-level ``except`` backstop (gated on
+        #       ``layout_applied``) re-folds before re-raising.
+        # Revert Layer A → 2 (setup + B); revert Layer B → 2 (setup + A); both
+        # drop below 3, so ``== 3`` catches a silent regression of either.
+        assert len(apply_layout_calls) == 3, (
             "a mid-cycle error (Phase-2 dispatch raising AFTER the panes "
-            "spawned) must STILL trigger an orchestrator-side re-fold so the "
-            "single-column collapse cannot persist (kaizen#96); pre-fix only "
-            f"the one setup fold fires, got {len(apply_layout_calls)} "
-            "apply_layout call(s)"
+            "spawned) must trigger BOTH self-heal re-folds — Layer A "
+            "(send_message_many finally) AND Layer B (cycle except backstop) — "
+            "on top of the Phase-1 setup fold, so the single-column collapse "
+            "cannot persist (kaizen#96). Expected exactly 3 apply_layout calls "
+            "(#1 setup, #2 Layer A, #3 Layer B); pre-fix only the one setup "
+            f"fold fires. Got {len(apply_layout_calls)}: {apply_layout_calls}"
         )
         # Lifecycle invariant preserved — team_delete still fires last even
         # though the cycle raised.

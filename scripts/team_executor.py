@@ -1291,9 +1291,14 @@ def team_cycle_executor(
         spawned before a BridgeTimeoutError — the lazy spawn precedes the
         poll — but we still keep `active_members` success-only so the GAP-7
         shutdown handshake only targets bridge-serviced slots; an orphaned
-        spawned pane is reaped by the team_id-matched OS-level cleanup +
-        the always-fires team_delete. The tmux RE-FOLD, by contrast, DOES
-        run on the raising path — see the `finally` blocks below.)
+        spawned pane is reaped by the team-NAME-matched L1/L2 process
+        cleanup (pgrep/pkill on the teammate ``--agent-id role@team_name``
+        argv) + the always-fires team_delete. (A lazily-spawned pane is
+        never ``@kaizen_team_id``-tagged — tagging is a one-shot snapshot
+        taken at layout time, before the Phase-2 panes exist — so it falls
+        THROUGH the L3 ``team_id`` gate, but the L1/L2 process sweep catches
+        it regardless.) The tmux RE-FOLD, by contrast, DOES run on the
+        raising path — see the `finally` blocks below.)
 
         Per-method delegation is intentional: a `__getattr__` proxy would
         bypass the Protocol-shape preflight that ran on the ORIGINAL
@@ -1322,11 +1327,13 @@ def team_cycle_executor(
                 # (kaizen#96): ``active_members`` gates the GAP-7 graceful
                 # shutdown handshake, and we only want to handshake a slot
                 # the bridge actually serviced. A pane that spawned-then-
-                # timed-out is still reaped by the team_id-matched OS-level
-                # cleanup + the always-fires team_delete in the cycle
-                # ``finally`` — so leaving it out of ``active_members`` does
-                # not orphan it, and keeping it out preserves the
-                # "no active on exception" contract the lifecycle tests pin.
+                # timed-out is still reaped by the team-NAME-matched L1/L2
+                # process cleanup (pgrep/pkill on the teammate
+                # ``--agent-id role@team_name`` argv) + the always-fires
+                # team_delete in the cycle ``finally`` — so leaving it out of
+                # ``active_members`` does not orphan it, and keeping it out
+                # preserves the "no active on exception" contract the
+                # lifecycle tests pin.
                 active_members.add(to)
                 return resp
             finally:
@@ -1372,8 +1379,9 @@ def team_cycle_executor(
                 # kaizen#96 — active-member tracking stays SUCCESS-ONLY (not
                 # moved into ``finally``): see the rationale on
                 # ``send_message`` above. A spawned-then-timed-out pane is
-                # reaped by the team_id-matched OS-level cleanup + the
-                # always-fires team_delete, so excluding it from
+                # reaped by the team-NAME-matched L1/L2 process cleanup
+                # (pgrep/pkill on the ``--agent-id role@team_name`` argv) +
+                # the always-fires team_delete, so excluding it from
                 # ``active_members`` neither orphans it nor regresses the
                 # lifecycle "no active on exception" contract.
                 for m in messages:

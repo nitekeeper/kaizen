@@ -2196,3 +2196,73 @@ class TestLayoutStabilityRefold:
             "Phase 2 must coalesce its 4-recipient fan-out to ONE fold; "
             f"expected 4 total folds, got {len(apply_layout_calls)}"
         )
+
+    def test_apply_layout_refolds_when_phase2_dispatch_raises(self, tmp_path, monkeypatch):
+        """kaizen#96 — a mid-cycle error must NOT leave the grid collapsed.
+
+        In run 55, Phase 2's ``send_message_many`` raised a
+        ``BridgeTimeoutError`` AFTER the teammate panes had lazily spawned
+        (tmux auto-retiled into a single stacked column). Pre-fix, the
+        re-fold lived AFTER the inner ``send_message_many`` return, the cycle
+        ``try`` had no ``except``, and the ``finally`` only tore the team
+        down — so the only ``apply_layout`` ever emitted was the single
+        pre-fan-out setup fold (bridge.db row 720) and the collapse became
+        permanent.
+
+        Fail-before / pass-after: with the old code exactly ONE
+        ``apply_layout`` fires (Phase-1 setup) and the Phase-2 raise skips
+        every re-fold (count == 1, this assert fails). With Layer A (the
+        ``send_message_many`` ``finally`` re-folds the spawned recipients)
+        and Layer B (the cycle ``except`` backstop), the collapse self-heals
+        and ``apply_layout`` fires again on the raising path (count > 1).
+        """
+        roster = [
+            "pm-1",
+            "security-engineer-1",
+            "software-architect-1",
+            "sdet-1",
+            "prompt-engineer-1",
+        ]
+
+        class Phase2RaisesMock(MockTeamTools):
+            def send_message_many(self_inner, messages, *, quorum_floor=None):
+                # The Phase-2 pre-analysis fan-out is the first
+                # ``send_message_many``; the GAP-7 shutdown batch (cycle
+                # ``finally``) also uses it but carries shutdown_request JSON
+                # bodies — let those through so team_delete still fires.
+                is_shutdown = bool(messages) and all(
+                    m["message"].startswith('{"type": "shutdown_request"')
+                    or m["message"].startswith('{"type":"shutdown_request"')
+                    for m in messages
+                )
+                if not is_shutdown:
+                    # Simulate panes having spawned (lazy spawn happened in the
+                    # real bridge) THEN the poll timing out — the #96 path.
+                    raise RuntimeError("simulated Phase 2 BridgeTimeoutError")
+                return super().send_message_many(messages)
+
+        tools = Phase2RaisesMock(scripted={"Phase 1": "do x", "Phase 2": "proposal"})
+        with (
+            patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}),
+            pytest.raises(RuntimeError, match="simulated Phase 2 BridgeTimeoutError"),
+        ):
+            team_cycle_executor(
+                clone_dir=tmp_path,
+                project=_project(roster=roster),
+                run_row=_run_row(),
+                cycle_n=1,
+                tools=tools,
+            )
+        apply_layout_calls = [c for c in tools.calls if c[0] == "apply_layout"]
+        assert len(apply_layout_calls) > 1, (
+            "a mid-cycle error (Phase-2 dispatch raising AFTER the panes "
+            "spawned) must STILL trigger an orchestrator-side re-fold so the "
+            "single-column collapse cannot persist (kaizen#96); pre-fix only "
+            f"the one setup fold fires, got {len(apply_layout_calls)} "
+            "apply_layout call(s)"
+        )
+        # Lifecycle invariant preserved — team_delete still fires last even
+        # though the cycle raised.
+        assert [c[0] for c in tools.calls][-1] == "team_delete", (
+            "team_delete must still fire last on the raising path"
+        )

@@ -60,6 +60,56 @@ def test_fold_current_window_grids_all_teammates_orchestrator_excluded(monkeypat
         assert "%1" not in c, f"PM pane must not be folded: {c}"
 
 
+def test_fold_current_window_five_teammates_auto_resolves_to_two_col_grid(monkeypatch):
+    """kaizen#96 (acceptance criterion 4) — 5 teammate panes with
+    KAIZEN_TEAMMATE_LAYOUT UNSET auto-resolve to grid-2col (n>=4) and fold
+    into a >=2-COLUMN grid, NEVER a single stacked column.
+
+    list-panes returns the orchestrator pane %1 plus 5 teammates
+    (%2..%6); %1 is excluded at source. The fold must issue exactly one
+    ``select-layout main-vertical`` reset then a 2-column ``join-pane``
+    sequence pairing (%2,%3) and (%4,%5), leaving the odd %6 trailing in
+    the right column; %1 is never folded. This pins the STRUCTURE (the
+    right region is a multi-column grid) — the regression the owner saw
+    in run 55 was the right region collapsing to a single full-width
+    vertical column of stacked workers."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv:
+            return _mk_proc(0, "%1\n%2\n%3\n%4\n%5\n%6\n")  # %1 = orchestrator
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(tw.subprocess, "run", fake_run)
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    # UNSET → auto-resolve; n_right_panes == 5 (>= 4) → grid-2col.
+    monkeypatch.delenv("KAIZEN_TEAMMATE_LAYOUT", raising=False)
+
+    tw.fold_current_window()
+
+    layout_calls = [c for c in calls if "select-layout" in c]
+    assert len(layout_calls) == 1 and "main-vertical" in layout_calls[0], (
+        f"auto-resolve for n>=4 must reset via one main-vertical; got {layout_calls}"
+    )
+    join_calls = [c for c in calls if "join-pane" in c]
+    assert len(join_calls) == 2, (
+        "5 right-panes must fold into a 2-column grid (2 join pairs), never a "
+        f"single stack; got {join_calls}"
+    )
+    assert join_calls[0][join_calls[0].index("-s") + 1] == "%3"
+    assert join_calls[0][join_calls[0].index("-t") + 1] == "%2"
+    assert join_calls[1][join_calls[1].index("-s") + 1] == "%5"
+    assert join_calls[1][join_calls[1].index("-t") + 1] == "%4"
+    for c in join_calls:
+        assert "%1" not in c, f"orchestrator pane must never be folded: {c}"
+    # The odd 5th teammate (%6) trails un-joined in the right column — it is
+    # NOT joined into any pair (that is what leaves a clean 2-col grid + 1).
+    assert not any("%6" in c for c in join_calls), (
+        f"the odd teammate %6 must trail un-joined, not stack the column; {join_calls}"
+    )
+
+
 def test_fold_current_window_stripes_skips_fold(monkeypatch):
     """KAIZEN_TEAMMATE_LAYOUT=stripes → even-vertical, no join-pane."""
     calls: list[list[str]] = []

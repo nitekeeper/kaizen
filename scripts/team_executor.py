@@ -1287,7 +1287,13 @@ def team_cycle_executor(
         wrapper. `send_message` and `send_message_many` additionally
         record the recipient(s) in the enclosing-scope `active_members`
         set AFTER a successful return — exceptions on the underlying
-        call do NOT mark the recipient active (no spawn happened).
+        call do NOT mark the recipient active. (kaizen#96: a pane MAY have
+        spawned before a BridgeTimeoutError — the lazy spawn precedes the
+        poll — but we still keep `active_members` success-only so the GAP-7
+        shutdown handshake only targets bridge-serviced slots; an orphaned
+        spawned pane is reaped by the team_id-matched OS-level cleanup +
+        the always-fires team_delete. The tmux RE-FOLD, by contrast, DOES
+        run on the raising path — see the `finally` blocks below.)
 
         Per-method delegation is intentional: a `__getattr__` proxy would
         bypass the Protocol-shape preflight that ran on the ORIGINAL
@@ -1301,51 +1307,95 @@ def team_cycle_executor(
             return self._inner.team_create(name, members)
 
         def send_message(self, team_id: str, to: str, message: str) -> str:
-            resp = self._inner.send_message(team_id, to, message)
-            active_members.add(to)
-            # kaizen#61 — per-spawn retitle hook. Apply tmux layout +
-            # title this recipient's pane on first observation.
-            # kaizen#88 — clear the per-batch re-fold flag, retitle (which
-            # sets it iff `to` is a new pane), then fold ONCE after — UNLESS a
-            # phase boundary owns the fold (``suppress_batch_refold``), in
-            # which case the boundary's single unconditional fold covers this
-            # spawn and we must not add a per-message fold.
-            needs_refold[0] = False
-            _retitle_on_first_send(to)
-            if needs_refold[0] and not suppress_batch_refold[0]:
-                _request_orchestrator_fold()
-            needs_refold[0] = False
-            return resp
+            # kaizen#96 — the retitle + re-fold MUST run even if the inner
+            # send raises. CC's team-mode spawn is lazy on first SendMessage,
+            # so by the time a BridgeTimeoutError fires the recipient's pane
+            # has ALREADY materialised and tmux has auto-retiled the window
+            # into a single column; if we skip the fold on the raising path
+            # that collapse becomes permanent (run 55 / bridge.db row 720).
+            # The retitle/fold keys off the INPUT ``to`` (not the response),
+            # so it is valid to run in ``finally``; the bare ``finally``
+            # re-raises the original exception automatically.
+            try:
+                resp = self._inner.send_message(team_id, to, message)
+                # active-member contract is INTENTIONALLY success-only
+                # (kaizen#96): ``active_members`` gates the GAP-7 graceful
+                # shutdown handshake, and we only want to handshake a slot
+                # the bridge actually serviced. A pane that spawned-then-
+                # timed-out is still reaped by the team_id-matched OS-level
+                # cleanup + the always-fires team_delete in the cycle
+                # ``finally`` — so leaving it out of ``active_members`` does
+                # not orphan it, and keeping it out preserves the
+                # "no active on exception" contract the lifecycle tests pin.
+                active_members.add(to)
+                return resp
+            finally:
+                # kaizen#61 — per-spawn retitle hook. Apply tmux layout +
+                # title this recipient's pane on first observation.
+                # kaizen#88 — clear the per-batch re-fold flag, retitle (which
+                # sets it iff `to` is a new pane), then fold ONCE after —
+                # UNLESS a phase boundary owns the fold
+                # (``suppress_batch_refold``), in which case the boundary's
+                # single unconditional fold covers this spawn and we must not
+                # add a per-message fold.
+                needs_refold[0] = False
+                _retitle_on_first_send(to)
+                if needs_refold[0] and not suppress_batch_refold[0]:
+                    _request_orchestrator_fold()
+                needs_refold[0] = False
 
         def send_message_many(
             self, messages: list[dict], *, quorum_floor: int | None = None
         ) -> list[str]:
-            resps = self._inner.send_message_many(messages, quorum_floor=quorum_floor)
-            # Record every recipient whose call did not raise. The batch
-            # is all-or-nothing on the wrapper side (a single exception
-            # aborts the whole batch), so on a successful return every
-            # `to` in the batch is active. NB with a quorum-relaxed batch a
-            # soft-dropped recipient still appears here (its slot returned a
-            # sentinel response, not an exception) — harmless for active-member
-            # tracking, which only gates pane retitling.
-            #
-            # kaizen#88 — COALESCE the re-fold to once per batch: a batch that
-            # spawns N new panes is a SINGLE pane-count change from the
-            # operator's view, so we clear the flag, retitle every recipient
-            # (each first-seen one sets `needs_refold`), then fold ONCE after
-            # the whole batch — never one fold per message.
-            needs_refold[0] = False
-            for m in messages:
-                active_members.add(m["to"])
-                # kaizen#61 — retitle each batch recipient on first
-                # observation. Set-membership keeps repeats cheap.
-                _retitle_on_first_send(m["to"])
-            # Fold ONCE after the whole batch — unless a phase boundary owns
-            # the fold (``suppress_batch_refold``), per kaizen#88 MAJOR-2.
-            if needs_refold[0] and not suppress_batch_refold[0]:
-                _request_orchestrator_fold()
-            needs_refold[0] = False
-            return resps
+            # kaizen#96 — the post-fan-out re-fold MUST survive an inner
+            # raise. ``send_message_many`` is what lazily SPAWNS the batch's
+            # panes (tmux auto-retiles to a single column); the kaizen#88
+            # re-fold then restores the grid. In run 55, ``_poll_many`` raised
+            # ``BridgeTimeoutError`` at the 600s PER_CALL_TIMEOUT_S AFTER the
+            # panes had spawned, so the inner call left this wrapper BEFORE the
+            # re-fold — and with no ``except`` on the cycle ``try`` the
+            # single-column collapse became permanent (bridge.db had exactly
+            # ONE apply_layout row, emitted before the fan-out). Running the
+            # retitle/re-fold in ``finally`` (keyed off the INPUT ``messages``,
+            # not the responses) re-folds on BOTH the success and the raising
+            # path; the bare ``finally`` re-raises the original exception.
+            try:
+                resps = self._inner.send_message_many(messages, quorum_floor=quorum_floor)
+                # Record every recipient on a SUCCESSFUL return. The batch is
+                # all-or-nothing on the wrapper side (a single exception aborts
+                # the whole batch), so on success every `to` in the batch is
+                # active. NB with a quorum-relaxed batch a soft-dropped
+                # recipient still appears here (its slot returned a sentinel
+                # response, not an exception) — harmless for active-member
+                # tracking, which only gates the GAP-7 shutdown handshake.
+                #
+                # kaizen#96 — active-member tracking stays SUCCESS-ONLY (not
+                # moved into ``finally``): see the rationale on
+                # ``send_message`` above. A spawned-then-timed-out pane is
+                # reaped by the team_id-matched OS-level cleanup + the
+                # always-fires team_delete, so excluding it from
+                # ``active_members`` neither orphans it nor regresses the
+                # lifecycle "no active on exception" contract.
+                for m in messages:
+                    active_members.add(m["to"])
+                return resps
+            finally:
+                # kaizen#88 — COALESCE the re-fold to once per batch: a batch
+                # that spawns N new panes is a SINGLE pane-count change from
+                # the operator's view, so we clear the flag, retitle every
+                # recipient (each first-seen one sets `needs_refold`), then
+                # fold ONCE after the whole batch — never one fold per message.
+                needs_refold[0] = False
+                for m in messages:
+                    # kaizen#61 — retitle each batch recipient on first
+                    # observation. Set-membership keeps repeats cheap.
+                    _retitle_on_first_send(m["to"])
+                # Fold ONCE after the whole batch — unless a phase boundary
+                # owns the fold (``suppress_batch_refold``), per kaizen#88
+                # MAJOR-2.
+                if needs_refold[0] and not suppress_batch_refold[0]:
+                    _request_orchestrator_fold()
+                needs_refold[0] = False
 
         def team_delete(self, team_id: str) -> None:
             self._inner.team_delete(team_id)
@@ -2081,6 +2131,30 @@ def team_cycle_executor(
                     f"git rev-parse HEAD in {clone_dir} returned an empty SHA; "
                     "the clone may be corrupt or HEAD may be unset."
                 )
+    except Exception:
+        # kaizen#96 Layer B — cycle-level error backstop (the repo owner's
+        # explicit ask: "once a layout is established it must remain
+        # unchanged / be restored regardless of runtime errors"). Layer A
+        # (the ``_TrackedTools`` ``finally`` blocks) already re-folds on the
+        # raising-DISPATCH path; this backstop covers ANY other mid-cycle
+        # exception (a CI helper raise, DAG parse, commit failure, ...) so a
+        # collapsed grid self-heals instead of persisting. It runs in the
+        # ``except`` — which fires BEFORE the ``finally``'s graceful shutdown
+        # + team_delete — so the re-fold request reaches the orchestrator
+        # while the teammate panes still exist. Best-effort and
+        # self-contained: it MUST NOT mask or replace the in-flight
+        # exception, so the fold is wrapped in its own try/except that logs
+        # and continues (defense-in-depth on top of
+        # ``_request_orchestrator_fold``'s own swallow), and we always
+        # ``raise`` the original error afterwards. Gated on
+        # ``layout_applied`` so we only restore a layout that was actually
+        # established (nothing to fold if we never got past team_create).
+        if layout_applied[0]:
+            try:
+                _request_orchestrator_fold()
+            except Exception as fold_exc:  # pragma: no cover - defensive
+                _log.warning("kaizen#96 cycle-level re-fold backstop failed: %s", fold_exc)
+        raise
     finally:
         # GAP-7 (docs/kaizen/2026-05-24-bridge-smoke-3.md) — graceful
         # teammate shutdown BEFORE team_delete. Per CC's TeamCreate docs:

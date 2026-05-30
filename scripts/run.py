@@ -285,7 +285,13 @@ def _bridge_timeout_to_abandoned_outcome(exc, *, subject, branch) -> dict:
         surviving_summary = f"single-row bridge call raised {exc_name}; no batch progress snapshot"
         participants = []
 
-    detail = f"bridge {exc_name} ({classification}): {exc}. {surviving_summary}"
+    # The recoverable branch name leads the detail string so it survives the
+    # 200-char truncation in scripts/pr.py and reaches the DB `detail` column +
+    # the bundled PR body — not just the stderr line below (kaizen#91 review).
+    detail = (
+        f"bridge {exc_name} ({classification}); recoverable branch: {branch}; "
+        f"{surviving_summary}. ({exc})"
+    )
 
     # Always-available capture surface: the run_bridged subprocess log that the
     # orchestrator session tails. Fires even if the DB write below fails.

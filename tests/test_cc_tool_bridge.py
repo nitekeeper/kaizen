@@ -1154,3 +1154,51 @@ def test_bridge_error_snapshot_defaults_to_none():
         pending_recipients=("a",),
     )
     assert BridgeTimeoutError("z", snapshot=snap).snapshot is snap
+
+
+def test_cycle_wall_clock_raise_site_carries_snapshot(bridge_path, monkeypatch):
+    """kaizen#91: the THIRD _poll_many trip site — the cycle wall-clock
+    BridgeStallError — also attaches a snapshot. Distinct from the per-call
+    timeout and heartbeat-stall sites; without this test a mutation that drops
+    the snapshot kwarg there would go undetected. Drives the trip via a short
+    CYCLE_WALL_S + a fast-forwarding monotonic, with S1 heartbeating so the
+    stall predicate doesn't fire first (mirrors
+    test_cycle_wall_clock_exceeded_raises_bridge_stall_error but batch-scoped)."""
+    run_id = 915
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=run_id)
+    wrapper.CYCLE_WALL_S = 10.0
+    wrapper.POLL_INTERVAL_S = 0.01
+    _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=0)
+
+    state = {"sim_elapsed": 0.0}
+    real_monotonic = time.monotonic
+
+    def fake_monotonic():
+        state["sim_elapsed"] += 5.0
+        return real_monotonic() + state["sim_elapsed"]
+
+    monkeypatch.setattr(bridge_mod.time, "monotonic", fake_monotonic)
+
+    def fake_s1():
+        # Keep the heartbeat fresh so the cycle-wall raise — not the stall
+        # raise — fires (the stall predicate needs a stale julianday gap).
+        for _ in range(40):
+            _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=0)
+            time.sleep(0.01)
+
+    t = threading.Thread(target=fake_s1, daemon=True)
+    t.start()
+    with pytest.raises(BridgeStallError) as ei:
+        wrapper.send_message_many(
+            [
+                {"team_id": "t", "to": "a", "message": "m1"},
+                {"team_id": "t", "to": "b", "message": "m2"},
+            ]
+        )
+    t.join(timeout=5)
+    assert "cycle wall-clock exceeded" in str(ei.value)
+    snap = ei.value.snapshot
+    assert snap is not None
+    assert snap.total == 2
+    assert snap.classification == "true_stall"  # nothing serviced before the wall
+    assert set(snap.pending_recipients) == {"a", "b"}

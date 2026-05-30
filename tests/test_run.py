@@ -1460,27 +1460,42 @@ def test_orchestrate_run_with_run_id_writes_failed_sentinel_on_cycle_exception(
 # ── kaizen#91: bridge timeout → abandonment (read-first capture) ────────────
 
 
-def test_orchestrate_run_bridge_timeout_becomes_abandonment(db, project, tmp_path, monkeypatch):
-    """kaizen#91: a BridgeTimeoutError raised from the cycle executor is
-    converted into a proper cycle abandonment (recoverable-artifact report +
-    skip-and-continue), NOT a bare run failure. Today the same exception hits
-    run.py's blanket except → status='failed', no report — this is the gap."""
-    from scripts.cc_tool_bridge import BridgeTimeoutError, BridgeTimeoutSnapshot
+@pytest.mark.parametrize("exc_kind", ["timeout", "stall"])
+def test_orchestrate_run_bridge_timeout_becomes_abandonment(
+    db, project, tmp_path, monkeypatch, capsys, exc_kind
+):
+    """kaizen#91: a BridgeTimeoutError OR BridgeStallError raised from the cycle
+    executor is converted into a proper cycle abandonment (recoverable-artifact
+    report + skip-and-continue), NOT a bare run failure. Parametrized over BOTH
+    members of run.py's except tuple, so dropping either re-fails this test.
+    Today the same exception hits the blanket except → status='failed', no
+    report — this is the gap."""
+    from scripts.cc_tool_bridge import (
+        BridgeStallError,
+        BridgeTimeoutError,
+        BridgeTimeoutSnapshot,
+    )
 
     _install_orchestrator_stubs(monkeypatch, tmp_path)
 
+    # completed=1, soft_dropped=1, pending=1 → exercises the soft-dropped suffix.
     snap = BridgeTimeoutSnapshot(
         completed_count=1,
         total=3,
-        pending_count=2,
-        soft_dropped_count=0,
+        pending_count=1,
+        soft_dropped_count=1,
         classification="partial_progress",
         completed_responses=({"response": "done-a"},),
-        pending_recipients=("b", "c"),
+        pending_recipients=("b",),
+    )
+    exc = (
+        BridgeTimeoutError("row 706 timed out after 600.0s", snapshot=snap)
+        if exc_kind == "timeout"
+        else BridgeStallError("cycle wall-clock exceeded: CYCLE_WALL_S=10.0", snapshot=snap)
     )
 
     def fake_executor(clone_dir, proj, run_row, cycle_n):
-        raise BridgeTimeoutError("row 706 timed out after 600.0s", snapshot=snap)
+        raise exc
 
     result = orchestrate_run(
         db_path=db,
@@ -1497,9 +1512,17 @@ def test_orchestrate_run_bridge_timeout_becomes_abandonment(db, project, tmp_pat
     assert len(result["abandonments"]) == 1
     ab = result["abandonments"][0]
     assert ab["reason"] == "other"
-    # The recoverable-artifact pointer + classification are persisted in detail.
+    # The recoverable pointer is persisted in the DB detail column (→ PR body):
+    # classification, the N-of-M counts, the soft-dropped suffix, AND the branch.
     assert "partial_progress" in ab["detail"]
     assert "1 of 3" in ab["detail"]
+    assert "soft-dropped" in ab["detail"]
+    assert "recoverable branch:" in ab["detail"]
+    assert "kaizen/" in ab["detail"], ab["detail"]
+    # The always-on stderr capture surface fired (independent of the DB write).
+    err = capsys.readouterr().err
+    assert "[kaizen#91] bridge abandonment captured" in err
+    assert "partial_progress" in err
 
 
 def test_orchestrate_run_bridge_timeout_continues_to_next_cycle(db, project, tmp_path, monkeypatch):

@@ -471,3 +471,78 @@ def test_record_abandonment_accepts_new_reasons(db, run_and_cycle, new_reason):
         report_memex_slug=None,
     )
     assert row["reason"] == new_reason
+
+
+# ── kaizen#91: recoverable-artifact section ────────────────────────────────
+
+
+def test_format_report_includes_recoverable_section_when_present():
+    """kaizen#91: when the recoverable-artifact fields are populated (a bridge
+    timeout that left survived work), the report renders a '## Recoverable
+    artifacts' section with the branch, classification, and surviving summary."""
+    md = format_report(
+        project_name="acme",
+        git_url="https://github.com/acme/widget.git",
+        run_id=7,
+        cycle_n=1,
+        subject="big module",
+        participants=["pm", "backend-engineer-1"],
+        phase_reached="implementation",
+        reason="other",
+        detail="bridge per-call timeout",
+        artifacts=["kaizen/issue-42-branch"],
+        recoverable_artifact="kaizen/issue-42-branch",
+        progress_classification="partial_progress",
+        surviving_summary="1 of 3 rows completed before the timeout; 2 pending (recipients: b, c)",
+    )
+    assert "## Recoverable artifacts" in md
+    assert "kaizen/issue-42-branch" in md
+    assert "partial_progress" in md
+    assert "1 of 3 rows completed before the timeout" in md
+    # Capture-only contract is stated in the report.
+    assert "MANUAL" in md or "manual" in md
+
+
+def test_format_report_omits_recoverable_section_when_absent():
+    """kaizen#91: with the recoverable fields all None (every legacy
+    abandonment), the section is omitted and the report shape is unchanged."""
+    md = format_report(
+        project_name="acme",
+        git_url="https://github.com/acme/widget.git",
+        run_id=7,
+        cycle_n=1,
+        subject="docs",
+        participants=["pm"],
+        phase_reached="meeting",
+        reason="no_consensus",
+        detail="agents disagreed",
+        artifacts=[],
+    )
+    assert "Recoverable artifacts" not in md
+
+
+def test_process_abandonment_threads_recoverable_fields(db, run_and_cycle):
+    """kaizen#91: process_abandonment forwards the recoverable-artifact fields
+    into the rendered markdown (and records the row as before)."""
+    project = run_and_cycle["project"]
+    run = run_and_cycle["run"]
+    cycle = run_and_cycle["cycle"]
+    row, markdown = process_abandonment(
+        db_path=db,
+        project=project,
+        run_id=run["id"],
+        cycle_id=cycle["id"],
+        cycle_n=1,
+        subject="big module",
+        participants=["pm"],
+        phase_reached="implementation",
+        reason="other",
+        detail="bridge timeout (partial_progress)",
+        artifacts=["kaizen/branch-x"],
+        recoverable_artifact="kaizen/branch-x",
+        progress_classification="partial_progress",
+        surviving_summary="1 of 3 rows completed",
+    )
+    assert "## Recoverable artifacts" in markdown
+    assert "kaizen/branch-x" in markdown
+    assert row["reason"] == "other"

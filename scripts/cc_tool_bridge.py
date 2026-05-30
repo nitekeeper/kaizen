@@ -37,6 +37,7 @@ import sqlite3
 import sys
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.bridge_db import bootstrap
@@ -197,8 +198,46 @@ def quorum_for(n: int, fraction: float = QUORUM_FRACTION) -> int:
 _last_python_tick_monotonic: dict[int, float] = {}
 
 
+@dataclass(frozen=True)
+class BridgeTimeoutSnapshot:
+    """Read-first capture of in-flight batch state at a bridge timeout/stall.
+
+    Attached to the ``BridgeTimeoutError`` / ``BridgeStallError`` raised from
+    :meth:`QueueBridgeWrapper._poll_many` so a caller (``scripts/run.py``) can
+    SURFACE the teammate work that completed before a hard-backstop trip
+    instead of silently discarding it (kaizen#91). Built from the poll loop's
+    in-memory, cycle-accurate bookkeeping — never a ``run_id``-scoped DB query
+    (``bridge_requests`` has no cycle column, so a ``run_id`` SELECT would
+    sweep in prior cycles' ready rows and corrupt the N-of-M count).
+
+    Capture + VISIBILITY only: holds decoded response payloads, counts,
+    pending recipients, and a partial-vs-stall classification. It deliberately
+    carries NO db handle, branch name, or resume token — recovery stays manual.
+    """
+
+    completed_count: int
+    total: int
+    pending_count: int
+    soft_dropped_count: int
+    classification: str  # "partial_progress" | "true_stall"
+    completed_responses: tuple[dict, ...]
+    pending_recipients: tuple[str, ...]
+
+
 class BridgeError(RuntimeError):
-    """Base class for queue-bridge failures observable by Python."""
+    """Base class for queue-bridge failures observable by Python.
+
+    kaizen#91: every ``Bridge*Error`` optionally carries a
+    :class:`BridgeTimeoutSnapshot` (``None`` unless raised from a batch
+    timeout/stall in ``_poll_many``) so the in-flight work that completed
+    before the trip is recoverable rather than silently discarded. The
+    keyword-only ``snapshot`` param is fully back-compatible — every existing
+    ``BridgeX("message")`` call site keeps working and gets ``snapshot=None``.
+    """
+
+    def __init__(self, *args: object, snapshot: BridgeTimeoutSnapshot | None = None) -> None:
+        super().__init__(*args)
+        self.snapshot = snapshot
 
 
 class BridgeStallError(BridgeError):
@@ -450,6 +489,39 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
         finally:
             con.close()
 
+    @staticmethod
+    def _build_timeout_snapshot(
+        row_ids: list[int],
+        id_to_index: dict[int, int],
+        id_to_recipient: dict[int, str],
+        completed: set[int],
+        soft_dropped: set[int],
+        results: list[dict | None],
+    ) -> BridgeTimeoutSnapshot:
+        """Capture in-flight batch state at a hard-backstop trip (kaizen#91).
+
+        Built from :meth:`_poll_many`'s batch-local bookkeeping so the work
+        that ALREADY completed is recoverable rather than silently discarded.
+        Cycle-accurate by construction: reads ONLY this batch's in-memory
+        decoded responses. ``completed_responses`` preserves INPUT order; a
+        soft-dropped row counts as neither completed nor pending (it is
+        forgiven-silence under quorum, not survived work and not a failure).
+        """
+        completed_responses = tuple(
+            (results[id_to_index[rid]] or {}) for rid in row_ids if rid in completed
+        )
+        pending_ids = [rid for rid in row_ids if rid not in completed and rid not in soft_dropped]
+        pending_recipients = tuple(id_to_recipient[rid] for rid in pending_ids)
+        return BridgeTimeoutSnapshot(
+            completed_count=len(completed),
+            total=len(row_ids),
+            pending_count=len(pending_ids),
+            soft_dropped_count=len(soft_dropped),
+            classification="partial_progress" if completed else "true_stall",
+            completed_responses=completed_responses,
+            pending_recipients=pending_recipients,
+        )
+
     def _poll_many(
         self,
         row_ids: list[int],
@@ -619,7 +691,10 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
                         f"python monotonic gap is "
                         f"{mono_gap if mono_gap is None else f'{mono_gap:.1f}s'}; "
                         f"{len(pending_ids)} of {len(row_ids)} rows still pending "
-                        f"(rows={pending_ids})"
+                        f"(rows={pending_ids})",
+                        snapshot=self._build_timeout_snapshot(
+                            row_ids, id_to_index, id_to_recipient, completed, soft_dropped, results
+                        ),
                     )
                 # Suspend/resume detected (or first iteration after a
                 # fresh-wrapper construction with no prior monotonic
@@ -635,7 +710,10 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
                     f"cycle wall-clock exceeded during send_message_many batch: "
                     f"{elapsed:.1f}s elapsed (> CYCLE_WALL_S={self.CYCLE_WALL_S}s); "
                     f"{len(pending_ids)} of {len(row_ids)} rows still pending "
-                    f"(rows={pending_ids})"
+                    f"(rows={pending_ids})",
+                    snapshot=self._build_timeout_snapshot(
+                        row_ids, id_to_index, id_to_recipient, completed, soft_dropped, results
+                    ),
                 )
 
             if time.monotonic() >= deadline:
@@ -644,7 +722,10 @@ class QueueBridgeWrapper(AgentTeamsWrapper):
                     f"send_message_many: {len(pending_ids)} of {len(row_ids)} rows "
                     f"timed out after {self.PER_CALL_TIMEOUT_S}s "
                     f"(S1 heartbeat alive, but rows never reached 'ready'); "
-                    f"pending rows={pending_ids}"
+                    f"pending rows={pending_ids}",
+                    snapshot=self._build_timeout_snapshot(
+                        row_ids, id_to_index, id_to_recipient, completed, soft_dropped, results
+                    ),
                 )
 
             time.sleep(self.POLL_INTERVAL_S)

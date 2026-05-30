@@ -1455,3 +1455,89 @@ def test_orchestrate_run_with_run_id_writes_failed_sentinel_on_cycle_exception(
     final = get_run(db, pending_run["id"])
     assert final["status"] == "failed"
     assert final["branch"] == "<failed>"
+
+
+# ── kaizen#91: bridge timeout → abandonment (read-first capture) ────────────
+
+
+def test_orchestrate_run_bridge_timeout_becomes_abandonment(db, project, tmp_path, monkeypatch):
+    """kaizen#91: a BridgeTimeoutError raised from the cycle executor is
+    converted into a proper cycle abandonment (recoverable-artifact report +
+    skip-and-continue), NOT a bare run failure. Today the same exception hits
+    run.py's blanket except → status='failed', no report — this is the gap."""
+    from scripts.cc_tool_bridge import BridgeTimeoutError, BridgeTimeoutSnapshot
+
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+
+    snap = BridgeTimeoutSnapshot(
+        completed_count=1,
+        total=3,
+        pending_count=2,
+        soft_dropped_count=0,
+        classification="partial_progress",
+        completed_responses=({"response": "done-a"},),
+        pending_recipients=("b", "c"),
+    )
+
+    def fake_executor(clone_dir, proj, run_row, cycle_n):
+        raise BridgeTimeoutError("row 706 timed out after 600.0s", snapshot=snap)
+
+    result = orchestrate_run(
+        db_path=db,
+        git_url=project["git_url"],
+        cycles_requested=1,
+        subject="big module",
+        cycle_executor=fake_executor,
+    )
+
+    # The run is NOT a bare failure — it is a graceful abandonment.
+    assert result["status"] == "complete"
+    assert result["cycles_succeeded"] == 0
+    assert result["cycles_abandoned"] == 1
+    assert len(result["abandonments"]) == 1
+    ab = result["abandonments"][0]
+    assert ab["reason"] == "other"
+    # The recoverable-artifact pointer + classification are persisted in detail.
+    assert "partial_progress" in ab["detail"]
+    assert "1 of 3" in ab["detail"]
+
+
+def test_orchestrate_run_bridge_timeout_continues_to_next_cycle(db, project, tmp_path, monkeypatch):
+    """kaizen#91: skip-and-continue (working-rule 3) — a bridge timeout in
+    cycle 1 abandons THAT cycle, but the next cycle still runs."""
+    from scripts.cc_tool_bridge import BridgeTimeoutError, BridgeTimeoutSnapshot
+
+    _install_orchestrator_stubs(monkeypatch, tmp_path)
+
+    snap = BridgeTimeoutSnapshot(
+        completed_count=0,
+        total=2,
+        pending_count=2,
+        soft_dropped_count=0,
+        classification="true_stall",
+        completed_responses=(),
+        pending_recipients=("a", "b"),
+    )
+
+    seen: list[int] = []
+
+    def fake_executor(clone_dir, proj, run_row, cycle_n):
+        seen.append(cycle_n)
+        if cycle_n == 1:
+            raise BridgeTimeoutError("timed out", snapshot=snap)
+        return {
+            "status": "success",
+            "commit_sha": f"sha-{cycle_n}",
+            "minutes_memex_slug": None,
+        }
+
+    result = orchestrate_run(
+        db_path=db,
+        git_url=project["git_url"],
+        cycles_requested=2,
+        cycle_executor=fake_executor,
+    )
+    assert seen == [1, 2]  # cycle 2 ran despite cycle 1's bridge timeout
+    assert result["cycles_abandoned"] == 1
+    assert result["cycles_succeeded"] == 1
+    assert result["status"] == "complete"

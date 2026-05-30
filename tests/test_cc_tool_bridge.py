@@ -28,6 +28,8 @@ from scripts.bridge_db import bootstrap
 from scripts.cc_tool_bridge import (
     BridgeRemoteError,
     BridgeStallError,
+    BridgeTimeoutError,
+    BridgeTimeoutSnapshot,
     QueueBridgeWrapper,
     queue_bridge_provider,
 )
@@ -1007,3 +1009,148 @@ def test_reset_cycle_deadline_clears_state(bridge_path):
     wrapper.team_create(name="y", members=[])
     t.join(timeout=5)
     assert wrapper._cycle_deadline is not None
+
+
+# ── kaizen#91: read-first capture on bridge timeout/stall ──────────────────
+
+
+def test_build_timeout_snapshot_shape():
+    """kaizen#91: the snapshot reports survived work in input order, excludes
+    soft-dropped rows from `pending`, and classifies on completed>0."""
+    row_ids = [10, 11, 12, 13]
+    id_to_index = {10: 0, 11: 1, 12: 2, 13: 3}
+    id_to_recipient = {10: "a", 11: "b", 12: "c", 13: "d"}
+    completed = {10, 12}
+    soft_dropped = {13}
+    results = [{"response": "ra"}, None, {"response": "rc"}, None]
+
+    snap = QueueBridgeWrapper._build_timeout_snapshot(
+        row_ids, id_to_index, id_to_recipient, completed, soft_dropped, results
+    )
+
+    assert snap.completed_count == 2
+    assert snap.total == 4
+    # Only row 11 (recipient b) is genuinely pending — 13 is soft-dropped.
+    assert snap.pending_count == 1
+    assert snap.soft_dropped_count == 1
+    assert snap.classification == "partial_progress"
+    # Survived responses captured in INPUT order (ra before rc).
+    assert snap.completed_responses == ({"response": "ra"}, {"response": "rc"})
+    assert snap.pending_recipients == ("b",)
+
+
+def test_timeout_snapshot_partial_progress(bridge_path):
+    """kaizen#91: a batch per-call timeout with SOME rows already ready carries
+    a snapshot of the survived work + 'partial_progress' classification."""
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=910)
+    wrapper.PER_CALL_TIMEOUT_S = 0.5
+    wrapper.POLL_INTERVAL_S = 0.02
+    # No bridge_heartbeat tick → _s1_seconds_since_last_poll() returns None →
+    # the stall branch is skipped and the per-call deadline governs.
+
+    def fake_s1():
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            pending = _all_pending_rows(bridge_path, run_id=910)
+            if len(pending) >= 3:
+                # Mark ONLY the first row ready; leave the rest pending forever.
+                _mark_row_ready(bridge_path, pending[0], {"response": "done-a"})
+                return
+            time.sleep(0.01)
+
+    t = threading.Thread(target=fake_s1, daemon=True)
+    t.start()
+    with pytest.raises(BridgeTimeoutError) as ei:
+        wrapper.send_message_many(
+            [
+                {"team_id": "t", "to": "a", "message": "m1"},
+                {"team_id": "t", "to": "b", "message": "m2"},
+                {"team_id": "t", "to": "c", "message": "m3"},
+            ]
+        )
+    t.join(timeout=5)
+
+    snap = ei.value.snapshot
+    assert snap is not None
+    assert snap.classification == "partial_progress"
+    assert snap.completed_count == 1
+    assert snap.total == 3
+    assert snap.pending_count == 2
+    assert {r["response"] for r in snap.completed_responses} == {"done-a"}
+    assert set(snap.pending_recipients) == {"b", "c"}
+
+
+def test_timeout_snapshot_true_stall(bridge_path):
+    """kaizen#91: a batch timeout with ZERO rows ready classifies as
+    'true_stall' and carries an empty survived-work list."""
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=911)
+    wrapper.PER_CALL_TIMEOUT_S = 0.4
+    wrapper.POLL_INTERVAL_S = 0.02
+    # No servicing thread: nothing is ever marked ready.
+    with pytest.raises(BridgeTimeoutError) as ei:
+        wrapper.send_message_many(
+            [
+                {"team_id": "t", "to": "a", "message": "m1"},
+                {"team_id": "t", "to": "b", "message": "m2"},
+            ]
+        )
+    snap = ei.value.snapshot
+    assert snap is not None
+    assert snap.classification == "true_stall"
+    assert snap.completed_count == 0
+    assert snap.completed_responses == ()
+    assert snap.pending_count == 2
+    assert set(snap.pending_recipients) == {"a", "b"}
+
+
+def test_stall_raise_site_carries_snapshot(bridge_path):
+    """kaizen#91: the heartbeat-stall raise site in _poll_many also attaches a
+    snapshot (true_stall here, since nothing was serviced before S1 went silent)."""
+    run_id = 914
+    # Simulate prior monotonic activity that then went silent (real S1 stall).
+    bridge_mod._last_python_tick_monotonic[run_id] = time.monotonic() - 600.0
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=run_id)
+    _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=600)
+
+    with pytest.raises(BridgeStallError) as ei:
+        wrapper.send_message_many(
+            [
+                {"team_id": "t", "to": "a", "message": "m1"},
+                {"team_id": "t", "to": "b", "message": "m2"},
+            ]
+        )
+    snap = ei.value.snapshot
+    assert snap is not None
+    assert snap.total == 2
+    assert snap.completed_count == 0
+    assert snap.classification == "true_stall"
+    assert set(snap.pending_recipients) == {"a", "b"}
+
+
+def test_single_row_request_timeout_snapshot_is_none(bridge_path):
+    """kaizen#91: the single-row _request path carries snapshot=None — the
+    N-of-M batch snapshot is only meaningful for _poll_many. The attribute must
+    still EXIST (not AttributeError) so callers can branch on `is None`."""
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=912)
+    wrapper.PER_CALL_TIMEOUT_S = 0.3
+    wrapper.POLL_INTERVAL_S = 0.02
+    with pytest.raises(BridgeTimeoutError) as ei:
+        wrapper.send_message("t", "a", "hello")  # single-row → _request
+    assert ei.value.snapshot is None
+
+
+def test_bridge_error_snapshot_defaults_to_none():
+    """kaizen#91: a bare Bridge*Error('msg') still constructs and exposes
+    snapshot=None — the new keyword-only param is fully back-compatible."""
+    assert BridgeStallError("x").snapshot is None
+    assert BridgeTimeoutError("y").snapshot is None
+    snap = BridgeTimeoutSnapshot(
+        completed_count=0,
+        total=1,
+        pending_count=1,
+        soft_dropped_count=0,
+        classification="true_stall",
+        completed_responses=(),
+        pending_recipients=("a",),
+    )
+    assert BridgeTimeoutError("z", snapshot=snap).snapshot is snap

@@ -247,6 +247,67 @@ def cleanup_after_pr(experiment_dir: Path) -> None:
 # ── Orchestrator ───────────────────────────────────────────────────────────
 
 
+def _bridge_timeout_to_abandoned_outcome(exc, *, subject, branch) -> dict:
+    """kaizen#91 — convert a bridge timeout/stall into a cycle-abandoned outcome.
+
+    Reads the read-first snapshot attached to the exception (``exc.snapshot`` —
+    ``None`` for the single-row ``_request`` path) and builds the structured
+    ``status='abandoned'`` dict the cycle loop already records + skip-and-
+    continues on. Also emits a structured stderr line so the capture reaches a
+    human via the run_bridged log even if the later DB write fails.
+
+    Capture-only: it never resumes, commits, or pushes the survived work — the
+    branch name is a manual-recovery POINTER. ``reason='other'`` + a greppable
+    detail prefix avoids a schema migration for a dedicated reason; the phase
+    is a best-effort ``'implementation'`` default (the bridge layer does not
+    carry the cycle phase — a future refinement could thread the real phase).
+    """
+    snapshot = getattr(exc, "snapshot", None)
+    exc_name = type(exc).__name__
+    if snapshot is not None:
+        classification = snapshot.classification
+        recipients = (
+            ", ".join(snapshot.pending_recipients) if snapshot.pending_recipients else "(none)"
+        )
+        surviving_summary = (
+            f"{snapshot.completed_count} of {snapshot.total} bridge rows completed "
+            f"before the {exc_name}; {snapshot.pending_count} pending "
+            f"(recipients: {recipients})"
+            + (
+                f"; {snapshot.soft_dropped_count} soft-dropped"
+                if snapshot.soft_dropped_count
+                else ""
+            )
+        )
+        participants = list(snapshot.pending_recipients)
+    else:
+        classification = "true_stall"
+        surviving_summary = f"single-row bridge call raised {exc_name}; no batch progress snapshot"
+        participants = []
+
+    detail = f"bridge {exc_name} ({classification}): {exc}. {surviving_summary}"
+
+    # Always-available capture surface: the run_bridged subprocess log that the
+    # orchestrator session tails. Fires even if the DB write below fails.
+    print(
+        f"[kaizen#91] bridge abandonment captured — {classification}; "
+        f"recoverable branch: {branch}; {surviving_summary}",
+        file=sys.stderr,
+    )
+
+    return {
+        "status": "abandoned",
+        "phase_reached": "implementation",
+        "reason": "other",
+        "detail": detail,
+        "participants": participants,
+        "artifacts": [branch] if branch else [],
+        "recoverable_artifact": branch,
+        "progress_classification": classification,
+        "surviving_summary": surviving_summary,
+    }
+
+
 def orchestrate_run(
     db_path: str,
     git_url: str,
@@ -287,6 +348,7 @@ def orchestrate_run(
     """
     # Local imports keep cycle.py / clone.py / etc. optional at import time.
     from scripts.abandonment import VALID_PHASES, VALID_REASONS, process_abandonment
+    from scripts.cc_tool_bridge import BridgeStallError, BridgeTimeoutError
     from scripts.clone import cleanup_experiment, clone_repo
     from scripts.cycle import (
         execute_cycle as default_executor,
@@ -419,11 +481,31 @@ def orchestrate_run(
             # 4-positional-arg call signature for backward compatibility
             # with any existing executor callable (including the default
             # `scripts.cycle.execute_cycle`).
-            if mode == "team" and tools_provider is not None:
-                tools = tools_provider(experiment_dir, project, run_row, cycle_n)
-                outcome = cycle_executor(experiment_dir, project, run_row, cycle_n, tools=tools)
-            else:
-                outcome = cycle_executor(experiment_dir, project, run_row, cycle_n)
+            #
+            # kaizen#91 — read-first capture. A bridge per-call timeout /
+            # cycle wall-clock / heartbeat stall raises BridgeTimeoutError or
+            # BridgeStallError from deep inside the executor's bridge dispatch.
+            # Without this guard it propagates to the blanket `except Exception`
+            # below, which blanks the branch to '<failed>', finalizes
+            # status='failed', and re-raises — crashing the whole run and
+            # discarding the teammate work that DID complete before the trip
+            # (the run-53 failure mode). Convert it into a proper cycle
+            # abandonment instead: the in-flight work is captured into the
+            # report (e.snapshot), the next cycle still runs (working-rule 3),
+            # and the run finalizes with a PR referencing the report rather
+            # than a bare crash. team_cycle_executor's `finally` has already
+            # torn down the team before the exception reached us, so no
+            # teammate leaks across into the next cycle.
+            try:
+                if mode == "team" and tools_provider is not None:
+                    tools = tools_provider(experiment_dir, project, run_row, cycle_n)
+                    outcome = cycle_executor(experiment_dir, project, run_row, cycle_n, tools=tools)
+                else:
+                    outcome = cycle_executor(experiment_dir, project, run_row, cycle_n)
+            except (BridgeTimeoutError, BridgeStallError) as bridge_exc:
+                outcome = _bridge_timeout_to_abandoned_outcome(
+                    bridge_exc, subject=subject, branch=branch
+                )
 
             if outcome.get("status") == "success":
                 record_cycle_success(
@@ -486,6 +568,12 @@ def orchestrate_run(
                     unresolved_findings=outcome.get("unresolved_findings"),
                     convergence_summary=outcome.get("convergence_summary"),
                     reviewer_attribution=outcome.get("reviewer_attribution"),
+                    # kaizen#91 — recoverable-artifact pointer for bridge-timeout
+                    # abandonments. None for every other abandonment reason, so
+                    # the report shape is unchanged for legacy cases.
+                    recoverable_artifact=outcome.get("recoverable_artifact"),
+                    progress_classification=outcome.get("progress_classification"),
+                    surviving_summary=outcome.get("surviving_summary"),
                 )
                 abandonment_rows.append(ab_row)
                 cycles_abandoned += 1

@@ -80,6 +80,9 @@ def format_report(
     unresolved_findings: list[dict] | None = None,
     convergence_summary: str | None = None,
     reviewer_attribution: dict | None = None,
+    recoverable_artifact: str | None = None,
+    progress_classification: str | None = None,
+    surviving_summary: str | None = None,
 ) -> str:
     """Render the abandonment report markdown (frontmatter + body).
 
@@ -91,6 +94,13 @@ def format_report(
     are None the "Review-loop details" section is omitted (preserves the
     legacy report shape). Populate them only for `review_unrecoverable`
     abandonments — see scripts/abandonment.py::record_abandonment.
+
+    kaizen#91: the three recoverable-artifact fields (recoverable_artifact,
+    progress_classification, surviving_summary) are likewise optional. When ALL
+    three are None the "Recoverable artifacts" section is omitted (legacy
+    shape preserved). Populate them for bridge-timeout / wall-clock
+    abandonments so the in-flight teammate work that survived the trip is
+    visible and manually recoverable.
     """
     slug = _slug_for(run_id, cycle_n)
     title = f"Cycle {cycle_n} abandoned — {reason}"
@@ -170,7 +180,39 @@ def format_report(
             f"{attrib_block}\n"
         )
 
-    return frontmatter + body + review_section
+    # kaizen#91 — recoverable-artifact section. Gated on any field present so
+    # legacy abandonments (all three None) keep their byte-for-byte shape.
+    recoverable_section = ""
+    any_recoverable_field = any(
+        v is not None for v in (recoverable_artifact, progress_classification, surviving_summary)
+    )
+    if any_recoverable_field:
+        branch_line = (
+            f"Recoverable branch: {recoverable_artifact}"
+            if recoverable_artifact is not None
+            else "Recoverable branch: (none)"
+        )
+        class_line = (
+            f"Progress: {progress_classification}"
+            if progress_classification is not None
+            else "Progress: (unknown)"
+        )
+        surviving_line = (
+            f"Surviving work: {surviving_summary}"
+            if surviving_summary is not None
+            else "Surviving work: (none)"
+        )
+        note = (
+            "Recovery is MANUAL and out of automated scope (kaizen#91): the "
+            "teammate work that completed before the trip survives on the "
+            "feature branch in the experiment clone for a human to inspect or "
+            "hand-finish. No work was auto-resumed, committed, or pushed."
+        )
+        recoverable_section = (
+            f"\n## Recoverable artifacts\n{branch_line}\n{class_line}\n{surviving_line}\n{note}\n"
+        )
+
+    return frontmatter + body + review_section + recoverable_section
 
 
 # ── DB write ───────────────────────────────────────────────────────────────
@@ -260,6 +302,9 @@ def process_abandonment(
     unresolved_findings: list[dict] | None = None,
     convergence_summary: str | None = None,
     reviewer_attribution: dict | None = None,
+    recoverable_artifact: str | None = None,
+    progress_classification: str | None = None,
+    surviving_summary: str | None = None,
 ) -> tuple[dict, str]:
     """Format report → record abandonment row → return (row, rendered markdown).
 
@@ -268,6 +313,11 @@ def process_abandonment(
 
     See `record_abandonment` for the four optional review-loop kwargs — they
     are threaded through both the markdown renderer and the DB insert.
+
+    kaizen#91: the three recoverable-artifact kwargs are threaded into the
+    markdown renderer ONLY (they are surfaced in the report + the row's
+    `detail`, not a dedicated DB column — no migration). They default to None
+    so every legacy call site is unaffected.
     """
     markdown = format_report(
         project_name=project["name"],
@@ -284,6 +334,9 @@ def process_abandonment(
         unresolved_findings=unresolved_findings,
         convergence_summary=convergence_summary,
         reviewer_attribution=reviewer_attribution,
+        recoverable_artifact=recoverable_artifact,
+        progress_classification=progress_classification,
+        surviving_summary=surviving_summary,
     )
     slug = _slug_for(run_id, cycle_n)
     row = record_abandonment(

@@ -29,7 +29,7 @@ from __future__ import annotations
 from pathlib import Path
 
 # MARKER_VERSION is the installed-config schema, NOT the tmux binary version.
-MARKER_VERSION = 3
+MARKER_VERSION = 4
 MARKER_START = "# >>> agent-teams v{} >>>"
 MARKER_END = "# <<< agent-teams v{} <<<"
 
@@ -70,16 +70,56 @@ MARKER_END = "# <<< agent-teams v{} <<<"
 #   * Bare ``g`` first char when ``pane_title`` is literally
 #     ``general-purpose`` (CC idle with no OSC 2 emission). Same rationale
 #     as above — acceptable cosmetic vs CC-internals coupling.
+#
+# kaizen#79 (v4): OPTIONAL integration with the third-party
+# ``accessd/tmux-agent-indicator`` plugin (MIT; tmux 3.0+, bash 4+). That
+# plugin drives a richer THREE-state indicator (running / needs-input /
+# done) off Claude Code's official hooks + ``tmux set-option``/``set-hook``
+# — NOT terminal escape passthrough (it does NOT use or require
+# ``allow-passthrough``). The integration model is DETECT-AND-SOURCE:
+#
+#   * The composite ``pane-border-format`` render above is set
+#     UNCONDITIONALLY and remains the zero-dependency FALLBACK — it carries
+#     the wave/role label and CC's idle/busy glyph whether or not the plugin
+#     is installed.
+#   * An ``if-shell -b`` guard re-evaluates plugin presence at config LOAD
+#     time (robust if the operator installs the plugin AFTER kaizen wrote
+#     the block). When ``~/.tmux/plugins/tmux-agent-indicator`` exists, we
+#     source the plugin's bootstrap, add the ``#{agent_indicator}``
+#     placeholder to ``status-right`` (composed with the time, not
+#     clobbering an operator's own status-right which lives outside this
+#     marker block), and pin the icon map so the Claude icon is the default
+#     🤖. The ``claude=`` icon is the entry inside the single
+#     ``@agent-indicator-icons`` option — there is no standalone
+#     ``@agent-indicator-icon-claude``.
+#
+# Kaizen NEVER installs the plugin and NEVER writes ``~/.claude/settings.json``
+# or ``~/.tmux.conf`` directly — the operator runs the upstream installer
+# (which wires the CC hooks). See ``docs/runbooks/tmux-claude-state-indicator.md``.
 CONFIG_BLOCK = """# Pane border format — compose CC's OSC 2 activity glyph (#{=1:pane_title})
 # with kaizen's @desired_title (with pane_title fallback for un-tagged panes).
 # kaizen#76 — dual-signal: the leading char of pane_title carries CC's idle/busy
 # indicator; @desired_title carries the wave/role label and is immune to OSC 2.
+# This render is UNCONDITIONAL — it is the zero-dependency fallback (kaizen#79).
 set -g pane-border-status top
 set -g pane-border-format '#{=1:pane_title} #[fg=cyan]#{?@desired_title,#{@desired_title},#{pane_title}}#[default]'
 
 # Default layout for new windows: main-vertical
 # Apps may override per-window via select-layout.
 set -g main-pane-width 60
+
+# kaizen#79 — OPTIONAL detect-and-source integration of the third-party
+# accessd/tmux-agent-indicator plugin (3-state running/needs-input/done off
+# CC hooks). Guarded by if-shell -b so detection re-runs at config LOAD time;
+# a no-op when the plugin dir is absent. Kaizen does NOT install the plugin;
+# the plugin drives state via CC hooks (no terminal escape passthrough needed,
+# see docs/runbooks/tmux-claude-state-indicator.md).
+if-shell -b '[ -d "$HOME/.tmux/plugins/tmux-agent-indicator" ]' " \\
+    source-file -q '$HOME/.tmux/plugins/tmux-agent-indicator/agent-indicator.tmux' ; \\
+    set -g @agent-indicator-icons 'claude=🤖,codex=🧠,opencode=💻,default=🤖' ; \\
+    set -g @agent-indicator-indicator-enabled 'on' ; \\
+    set -g status-right '#{agent_indicator} | %H:%M' \\
+"
 """
 
 

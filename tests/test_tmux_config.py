@@ -125,14 +125,15 @@ def test_apply_config_block_is_idempotent_at_same_version(tmp_path):
 # ── CONFIG_BLOCK content (kaizen#76 — dual-signal pane-border-format) ─────
 
 
-def test_marker_version_bumped_to_3():
-    """kaizen#76 — MARKER_VERSION must bump to 3 for the dual-signal block.
+def test_marker_version_bumped_to_4():
+    """kaizen#79 — MARKER_VERSION must bump to 4 for the agent-indicator block.
 
     The bump is the forcing-function that drives setup.py's "update
     available" branch on existing installs; without it, operators with a
-    v2 marker would not be prompted to refresh their tmux.conf.
+    v3 marker would not be prompted to refresh their tmux.conf to pick up
+    the optional tmux-agent-indicator detect-and-source integration.
     """
-    assert MARKER_VERSION == 3
+    assert MARKER_VERSION == 4
 
 
 def test_config_block_renders_activity_glyph_prefix():
@@ -156,6 +157,89 @@ def test_config_block_renders_desired_title_token():
     Iron Law: both signals must be present in the rendered border.
     """
     assert "#{?@desired_title,#{@desired_title},#{pane_title}}" in CONFIG_BLOCK
+
+
+# ── CONFIG_BLOCK content (kaizen#79 — tmux-agent-indicator detect-and-source) ─
+
+
+def test_config_block_has_plugin_detection_guard():
+    """kaizen#79 — integration is gated behind an if-shell -b presence check.
+
+    The guard re-evaluates plugin presence at config LOAD time (robust if the
+    operator installs the plugin AFTER kaizen wrote the block) and is a
+    harmless no-op when the dir is absent.
+    """
+    assert "if-shell -b" in CONFIG_BLOCK
+    assert '[ -d "$HOME/.tmux/plugins/tmux-agent-indicator" ]' in CONFIG_BLOCK
+
+
+def test_config_block_sources_plugin_bootstrap():
+    """kaizen#79 — the present-branch sources the plugin bootstrap with -q.
+
+    ``-q`` ensures a missing/renamed bootstrap never errors the config load.
+    """
+    assert (
+        "source-file -q '$HOME/.tmux/plugins/tmux-agent-indicator/agent-indicator.tmux'"
+        in CONFIG_BLOCK
+    )
+
+
+def test_config_block_adds_agent_indicator_status_right():
+    """kaizen#79 — the #{agent_indicator} placeholder must reach status-right.
+
+    Without a status-right placeholder the plugin renders nothing — this is
+    the one line that actually surfaces the indicator.
+    """
+    assert "#{agent_indicator}" in CONFIG_BLOCK
+    assert "set -g status-right '#{agent_indicator} | %H:%M'" in CONFIG_BLOCK
+
+
+def test_config_block_sets_claude_icon_option():
+    """kaizen#79 — the Claude icon is the claude= entry in @agent-indicator-icons.
+
+    There is no standalone @agent-indicator-icon-claude option; the icon map
+    is the single @agent-indicator-icons option with claude=🤖 as the default.
+    """
+    assert (
+        "set -g @agent-indicator-icons 'claude=🤖,codex=🧠,opencode=💻,default=🤖'" in CONFIG_BLOCK
+    )
+
+
+def test_config_block_composite_render_preserved_as_fallback():
+    """kaizen#79 — the kaizen#76 composite render stays set UNCONDITIONALLY.
+
+    It must appear OUTSIDE the if-shell guard so it is the zero-dependency
+    fallback when the plugin is absent and still carries the wave/role label
+    when present. We assert it is not nested inside the if-shell command
+    string by checking it precedes the guard in the block.
+    """
+    border_line = (
+        "set -g pane-border-format "
+        "'#{=1:pane_title} #[fg=cyan]#{?@desired_title,#{@desired_title},#{pane_title}}#[default]'"
+    )
+    assert border_line in CONFIG_BLOCK
+    # The unconditional border render must come BEFORE the if-shell guard.
+    assert CONFIG_BLOCK.index(border_line) < CONFIG_BLOCK.index("if-shell -b")
+
+
+def test_config_block_never_auto_installs_or_mutates_global_config():
+    """kaizen#79 — kaizen NEVER installs the plugin or writes global config.
+
+    The integration is purely additive tmux directives; the block must contain
+    no installer invocation and no mutation of the operator's settings/conf.
+    """
+    forbidden = (
+        "curl",
+        "install.sh",
+        ".claude/settings.json",
+        "allow-passthrough",
+    )
+    for token in forbidden:
+        assert token not in CONFIG_BLOCK, f"CONFIG_BLOCK must not contain {token!r}"
+    # The block must not write the user's tmux.conf either (it IS the content
+    # that gets written, via consent flow — it must not self-mutate ~/.tmux.conf).
+    assert "~/.tmux.conf" not in CONFIG_BLOCK
+    assert ".tmux.conf" not in CONFIG_BLOCK
 
 
 # ── show_diff ─────────────────────────────────────────────────────────────

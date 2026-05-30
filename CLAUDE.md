@@ -151,7 +151,7 @@ If you maintain a fork that diverges from this posture, override per-skill via C
 - Scripts: `scripts/*.py` — deterministic infrastructure (DB, git, clone, PR, detect)
 - Migrations: `migrations/*.sql`
 - Tests: `tests/test_*.py` — pytest
-- Operational runbooks: `docs/runbooks/`
+- Operational runbooks: `docs/runbooks/` (incl. `docs/runbooks/tmux-claude-state-indicator.md` — optional tmux-agent-indicator detect-and-source integration)
 - Extended Claude rules rationale: `docs/claude-operational-rules.md`
 - Design specs, implementation plans, cycle minutes, and bridge-smoke reports live in **Memex** (`memex:run ask`) and the **Notion Claude HQ → Decisions** workspace — see `### Process-artifact storage` above. They are gitignored, not tracked in this repo.
 

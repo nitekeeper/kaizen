@@ -52,12 +52,12 @@ The Claude Code hooks the installer wires map agent lifecycle events to states:
 Integration model: **detect-and-source** (operator-consent-respecting). Kaizen's generated tmux config block (`scripts/_tmux_config.py`, `CONFIG_BLOCK`) carries an `if-shell -b` guard:
 
 ```
-if-shell -b '[ -d "$HOME/.tmux/plugins/tmux-agent-indicator" ]' ' \
-    source-file -q "$HOME/.tmux/plugins/tmux-agent-indicator/agent-indicator.tmux" ; \
-    set -g @agent-indicator-icons "claude=🤖,codex=🧠,opencode=💻,default=🤖" ; \
-    set -g @agent-indicator-indicator-enabled "on" ; \
-    set -g status-right "#{agent_indicator} | %H:%M" \
-'
+if-shell -b '[ -d "$HOME/.tmux/plugins/tmux-agent-indicator" ]' " \
+    source-file -q '$HOME/.tmux/plugins/tmux-agent-indicator/agent-indicator.tmux' ; \
+    set -g @agent-indicator-icons 'claude=🤖,codex=🧠,opencode=💻,default=🤖' ; \
+    set -g @agent-indicator-indicator-enabled 'on' ; \
+    set -g status-right '#{agent_indicator} | %H:%M' \
+"
 ```
 
 - The guard is re-evaluated at config **load** time, so it works even if you install the plugin AFTER kaizen wrote the block.

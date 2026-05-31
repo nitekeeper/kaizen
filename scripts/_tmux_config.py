@@ -26,6 +26,7 @@ v{new} available" to the user.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 # MARKER_VERSION is the installed-config schema, NOT the tmux binary version.
@@ -285,3 +286,163 @@ def show_diff(tmux_conf_path: Path, version: int) -> str:
         f"(update) {tmux_conf_path}: replace v{existing_version} with v{version}:\n\n"
         f"{_full_block(version)}"
     )
+
+
+# ── kaizen#98: activity-glyph readiness helpers ────────────────────────────
+#
+# Claude Code's team-mode panes carry an OSC 2 activity glyph (the leading
+# braille spinner / idle dot in pane_title) that the v4 CONFIG_BLOCK composes
+# into the pane border. tmux's DEFAULT ``allow-set-title`` is ``on``, so a
+# fresh v4 install renders the glyph. The bug class (kaizen#98) is OPERATOR
+# CONFIG DRIFT: a machine stuck on the old v2 block that set
+# ``allow-set-title off`` (which gates the OSC 2 stream) renders no glyph.
+#
+# ``allow-set-title off`` is the CONFIRMED glyph-gating directive — it is the
+# per-pane tmux option that gates the OSC 2 escape carrying CC's glyph.
+# ``set-titles off`` gates only the OUTER terminal title (not pane_title) and
+# ``allow-passthrough`` gates DCS passthrough (the v4 agent-indicator path
+# explicitly does NOT use it — see CONFIG_BLOCK kaizen#79 note), so neither
+# is included here; adding them would emit false-positive warnings.
+_GLYPH_GATING_DIRECTIVES = ("allow-set-title off",)
+
+# Matches a tmux ``set`` family command and captures the option + value, e.g.
+# ``set -g allow-set-title off`` / ``setw -gq allow-set-title off`` /
+# ``set-option -g allow-set-title off``. String-based + tmux-free by design.
+# The option group requires a leading letter so a flag cluster (``-gu``) can
+# never be misparsed as the option name (kaizen#98 review NIT) — option names
+# always start with a letter, flags always start with ``-``.
+_SET_CMD_RE = re.compile(
+    r"^\s*set(?:w|-option|-window-option)?"  # set / setw / set-option / set-window-option
+    r"(?:\s+-[A-Za-z]+)*"  # optional flags: -g, -p, -gq, ...
+    r"\s+(?P<opt>[A-Za-z][\w-]*)"  # option name (letter-led; may contain hyphens)
+    r"\s+(?P<val>\S+)"  # value
+)
+
+
+def _unquote(value: str) -> str:
+    """Strip a single pair of matching surrounding quotes from a tmux value.
+
+    tmux accepts ``set -g allow-set-title 'off'`` / ``"off"`` as well as the
+    bare ``off``; the regex captures the quotes into the value, so normalize
+    them away before comparison (kaizen#98 review NIT).
+    """
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        return value[1:-1]
+    return value
+
+
+def _block_sets_option_to(block_text: str, option: str, value: str) -> bool:
+    """True if any ``set`` line in ``block_text`` sets ``option`` to ``value``.
+
+    Case-insensitive on the value (``off`` vs ``Off``); tmux option names are
+    case-sensitive so ``option`` is matched exactly. Pure string scan — no
+    tmux invocation.
+    """
+    for raw in block_text.splitlines():
+        m = _SET_CMD_RE.match(raw)
+        if m is None:
+            continue
+        if m.group("opt") == option and _unquote(m.group("val")).lower() == value.lower():
+            return True
+    return False
+
+
+def extract_installed_block(tmux_conf_path: Path) -> str:
+    """Return the body text BETWEEN the agent-teams markers, or '' if none.
+
+    Excludes the START/END marker lines themselves. Tolerant of a missing
+    file (returns ''). Used by setup.py to diff the OLD installed block
+    against the new ``CONFIG_BLOCK`` for glyph-gating-directive removal.
+    """
+    text = _read_text(tmux_conf_path)
+    if not text:
+        return ""
+    body: list[str] = []
+    inside = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not inside and stripped.startswith("# >>> agent-teams v"):
+            inside = True
+            continue
+        if inside and stripped.startswith("# <<< agent-teams v"):
+            break
+        if inside:
+            body.append(line)
+    return "\n".join(body)
+
+
+def removed_glyph_gating_directives(old_block: str, new_block: str) -> list[str]:
+    """Return glyph-gating directives present in ``old_block`` but not ``new_block``.
+
+    Pure, tmux-free, unit-testable. ``old_block`` / ``new_block`` are the
+    agent-teams block bodies (marker-stripped). The confirmed landmine is
+    ``allow-set-title off`` — a v2→v4 in-place upgrade removes it from the
+    FILE, but a RUNNING tmux server keeps the option set until restart
+    (``source-file`` does not unset a removed option). Returning the removed
+    directives lets the caller warn that the live session is still gated.
+    """
+    removed: list[str] = []
+    for directive in _GLYPH_GATING_DIRECTIVES:
+        option, _, value = directive.partition(" ")
+        if _block_sets_option_to(old_block, option, value) and not _block_sets_option_to(
+            new_block, option, value
+        ):
+            removed.append(directive)
+    return removed
+
+
+def check_glyph_readiness(
+    tmux_conf_path: Path,
+    *,
+    live_allow_set_title: str | None = None,
+) -> list[str]:
+    """Return actionable warnings about activity-glyph readiness; ``[]`` when fresh.
+
+    Advisory only — the caller logs these and NEVER fails on them. Two checks:
+
+      1. Stale marker — the conf's agent-teams marker version is
+         ``< MARKER_VERSION`` (the composite glyph render may be missing or
+         glyph-less on the older block).
+      2. Glyph blocked — ``allow-set-title off`` is in effect, either as a
+         directive in the conf file and/or as the passed-in live runtime value
+         (``live_allow_set_title == "off"``). When a server is present the
+         caller can read the live value via ``tmux show-options`` and pass it;
+         otherwise pass ``None`` and rely on the file check.
+
+    Tolerant of a missing conf file (the file checks simply find nothing). A
+    malformed marker is surfaced as a single warning rather than raised.
+    """
+    path = Path(tmux_conf_path)
+    warnings: list[str] = []
+    try:
+        version = detect_existing_marker(path)
+    except ValueError:
+        return [
+            f"tmux activity-glyph config in {path} has a malformed agent-teams "
+            f"marker; run setup.py to repair it so the live Claude idle/busy "
+            f"glyph renders."
+        ]
+    if version is not None and version < MARKER_VERSION:
+        warnings.append(
+            f"tmux activity-glyph config is v{version}; run setup.py to upgrade "
+            f"to v{MARKER_VERSION} (the live Claude idle/busy glyph may not "
+            f"render on the stale block)."
+        )
+    text = _read_text(path)
+    file_gated = _block_sets_option_to(text, "allow-set-title", "off")
+    live_gated = (
+        isinstance(live_allow_set_title, str) and live_allow_set_title.strip().lower() == "off"
+    )
+    if file_gated or live_gated:
+        where = []
+        if file_gated:
+            where.append(f"a directive in {path}")
+        if live_gated:
+            where.append("the running tmux server")
+        warnings.append(
+            "tmux 'allow-set-title off' is in effect ("
+            + " and ".join(where)
+            + "); Claude's activity glyph (OSC 2 pane title) is blocked. Remove "
+            "it and restart tmux, or run `tmux set -gu allow-set-title`."
+        )
+    return warnings

@@ -10,7 +10,10 @@ from scripts._tmux_config import (
     MARKER_START,
     MARKER_VERSION,
     apply_config_block,
+    check_glyph_readiness,
     detect_existing_marker,
+    extract_installed_block,
+    removed_glyph_gating_directives,
     show_diff,
 )
 
@@ -351,3 +354,132 @@ def test_check_tmux_config_updates_when_older_marker(tmp_path, monkeypatch):
     # Old version marker should be gone; new version marker should be present.
     assert MARKER_START.format(0) not in text
     assert MARKER_START.format(MARKER_VERSION) in text
+
+
+# ── kaizen#98 Gap A — removed_glyph_gating_directives / extract block ──────
+
+# A representative OLD v2 block body: glyph-less border + the confirmed
+# glyph-gating ``allow-set-title off`` landmine.
+_V2_BLOCK_BODY = (
+    "set -g pane-border-status top\n"
+    "set -g pane-border-format '#[fg=cyan]#{pane_title}#[default]'\n"
+    "set -g allow-set-title off\n"
+)
+
+
+def test_extract_installed_block_returns_body_between_markers(tmp_path):
+    p = tmp_path / "tmux.conf"
+    p.write_text(
+        f"set -g status on\n\n{MARKER_START.format(2)}\n{_V2_BLOCK_BODY}{MARKER_END.format(2)}\n"
+    )
+    body = extract_installed_block(p)
+    assert "allow-set-title off" in body
+    # Marker lines themselves are excluded.
+    assert "agent-teams" not in body
+    # Content outside the block is excluded.
+    assert "status on" not in body
+
+
+def test_extract_installed_block_empty_when_no_marker(tmp_path):
+    p = tmp_path / "tmux.conf"
+    p.write_text("set -g status on\n")
+    assert extract_installed_block(p) == ""
+
+
+def test_extract_installed_block_empty_when_file_missing(tmp_path):
+    assert extract_installed_block(tmp_path / "nope.conf") == ""
+
+
+def test_removed_glyph_gating_detects_allow_set_title_drop():
+    """v2 (allow-set-title off) → v4 (no such directive) ⇒ directive reported."""
+    removed = removed_glyph_gating_directives(_V2_BLOCK_BODY, CONFIG_BLOCK)
+    assert removed == ["allow-set-title off"]
+
+
+def test_removed_glyph_gating_empty_when_new_block_also_sets_it():
+    """If BOTH old and new set the gate, it was not removed → not reported."""
+    new_with_gate = CONFIG_BLOCK + "\nset -g allow-set-title off\n"
+    assert removed_glyph_gating_directives(_V2_BLOCK_BODY, new_with_gate) == []
+
+
+def test_removed_glyph_gating_empty_when_old_never_set_it():
+    """A v3-style block with no gate → nothing to remove."""
+    old_no_gate = "set -g pane-border-status top\nset -g main-pane-width 60\n"
+    assert removed_glyph_gating_directives(old_no_gate, CONFIG_BLOCK) == []
+
+
+def test_removed_glyph_gating_matches_set_command_variants():
+    """`set-option` / `setw` / extra flags all parse as a gate."""
+    for variant in (
+        "set-option -g allow-set-title off",
+        "setw -gq allow-set-title off",
+        "set allow-set-title off",
+        "set -g allow-set-title Off",  # case-insensitive value
+    ):
+        assert removed_glyph_gating_directives(variant + "\n", CONFIG_BLOCK) == [
+            "allow-set-title off"
+        ], variant
+
+
+def test_removed_glyph_gating_matches_quoted_value():
+    """A quoted gate value (`'off'` / `"off"`) is detected (kaizen#98 NIT)."""
+    for variant in ("set -g allow-set-title 'off'", 'set -g allow-set-title "off"'):
+        assert removed_glyph_gating_directives(variant + "\n", CONFIG_BLOCK) == [
+            "allow-set-title off"
+        ], variant
+
+
+def test_removed_glyph_gating_ignores_unset_line():
+    """An UNSET (`set -gu allow-set-title`, no value) is not a gate (kaizen#98 NIT).
+
+    The flag cluster `-gu` must not be misparsed as the option name and the
+    valueless line must not register as setting the gate to off.
+    """
+    assert removed_glyph_gating_directives("set -gu allow-set-title\n", CONFIG_BLOCK) == []
+
+
+def test_canonical_config_block_does_not_gate_the_glyph():
+    """Guardrail: the shipped v4 block must NOT set allow-set-title off."""
+    assert removed_glyph_gating_directives("", CONFIG_BLOCK) == []
+    assert "allow-set-title off" not in CONFIG_BLOCK
+
+
+# ── kaizen#98 Gap B — check_glyph_readiness ────────────────────────────────
+
+
+def test_check_glyph_readiness_fresh_v4_returns_empty(tmp_path):
+    """A current v4 install with no gate → no warnings."""
+    p = tmp_path / "tmux.conf"
+    apply_config_block(p, MARKER_VERSION)
+    assert check_glyph_readiness(p) == []
+
+
+def test_check_glyph_readiness_warns_on_stale_marker(tmp_path):
+    p = tmp_path / "tmux.conf"
+    p.write_text(f"{MARKER_START.format(2)}\n{_V2_BLOCK_BODY}{MARKER_END.format(2)}\n")
+    warnings = check_glyph_readiness(p)
+    # Stale-version warning AND the allow-set-title-off file warning fire.
+    assert any("v2" in w and f"v{MARKER_VERSION}" in w for w in warnings)
+    assert any("allow-set-title off" in w for w in warnings)
+
+
+def test_check_glyph_readiness_warns_on_live_allow_set_title_off(tmp_path):
+    """Fresh v4 file but the RUNNING server reports off → live warning."""
+    p = tmp_path / "tmux.conf"
+    apply_config_block(p, MARKER_VERSION)
+    warnings = check_glyph_readiness(p, live_allow_set_title="off")
+    assert len(warnings) == 1
+    assert "running tmux server" in warnings[0]
+    assert "allow-set-title off" in warnings[0]
+
+
+def test_check_glyph_readiness_tolerates_missing_file(tmp_path):
+    assert check_glyph_readiness(tmp_path / "nope.conf") == []
+
+
+def test_check_glyph_readiness_malformed_marker_is_warning_not_raise(tmp_path):
+    p = tmp_path / "tmux.conf"
+    p.write_text("# >>> agent-teams vXYZ >>>\nbody\n# <<< agent-teams vXYZ <<<\n")
+    warnings = check_glyph_readiness(p)
+    assert len(warnings) == 1
+    assert "malformed" in warnings[0].lower()

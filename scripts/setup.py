@@ -13,6 +13,8 @@ from scripts._tmux_config import (
     MARKER_VERSION,
     apply_config_block,
     detect_existing_marker,
+    extract_installed_block,
+    removed_glyph_gating_directives,
     show_diff,
 )
 from scripts.migrate import apply_migrations
@@ -158,6 +160,59 @@ def _prompt_yes(question: str) -> bool:
     return ans in ("", "y", "yes")
 
 
+def _tmux_server_running() -> bool:
+    """Best-effort: True if a tmux server is responding. Never raises.
+
+    Used by the kaizen#98 in-place-upgrade path to decide whether to ATTEMPT
+    a live ``tmux set -gu allow-set-title``. ``tmux list-sessions`` exits 0
+    only when a server is up with at least one session — good enough to gate
+    a best-effort, non-fatal unset.
+    """
+    if shutil.which("tmux") is None:
+        return False
+    try:
+        return _run(["tmux", "list-sessions"]).returncode == 0
+    except Exception:
+        return False
+
+
+def _warn_runtime_glyph_gating(removed: list[str], tmux_conf: Path) -> None:
+    """Warn (kaizen#98 Gap A) that an in-place upgrade left a live glyph gate.
+
+    When ``apply_config_block`` rewrites v2→v4 it removes ``allow-set-title
+    off`` from the FILE, but a RUNNING tmux server keeps the option set until
+    restart (``source-file`` does not unset a removed option) — so the live
+    session stays glyph-blocked after a correct file upgrade. We emit a clear,
+    actionable WARNING and, if a server is detectably up, ATTEMPT a best-effort
+    ``tmux set -gu allow-set-title`` (+ window variant). Always non-fatal.
+    """
+    joined = ", ".join(repr(d) for d in removed)
+    print(
+        _safe(
+            f"\nagent-teams tmux config: WARNING — the in-place upgrade removed "
+            f"glyph-gating directive(s) {joined} from {tmux_conf}, but a RUNNING "
+            f"tmux server keeps them set until restart. Restart tmux (or run "
+            f"`tmux set -gu allow-set-title`) so Claude's activity glyph renders "
+            f"in this session."
+        )
+    )
+    if "allow-set-title off" not in removed:
+        return
+    if not _tmux_server_running():
+        return
+    # Best-effort live unset — both the server-global and window variants.
+    for argv in (
+        ["tmux", "set", "-gu", "allow-set-title"],
+        ["tmux", "setw", "-gu", "allow-set-title"],
+    ):
+        try:
+            ok = _run(argv).returncode == 0
+        except Exception:
+            ok = False
+        status = "ok" if ok else "failed"
+        print(_safe(f"agent-teams tmux config: ran `{' '.join(argv)}` → {status}"))
+
+
 def _check_tmux_config() -> None:
     """Interactive consent flow for installing the agent-teams tmux block.
 
@@ -220,8 +275,15 @@ def _check_tmux_config() -> None:
             print(show_diff(tmux_conf, MARKER_VERSION))
             continue
         if ans in ("", "y", "yes"):
+            # kaizen#98 Gap A — capture the OLD block BEFORE the rewrite so we
+            # can warn about glyph-gating directives the upgrade removed from
+            # the file but that a running tmux server still has set.
+            old_block = extract_installed_block(tmux_conf)
             apply_config_block(tmux_conf, MARKER_VERSION)
             print(f"Updated {tmux_conf} from v{existing_version} to v{MARKER_VERSION}.")
+            removed = removed_glyph_gating_directives(old_block, CONFIG_BLOCK)
+            if removed:
+                _warn_runtime_glyph_gating(removed, tmux_conf)
             return
         # Anything else = decline.
         print(f"Kept v{existing_version}; re-run setup to update later.")

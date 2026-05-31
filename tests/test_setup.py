@@ -27,6 +27,11 @@ def _fail_result(stdout: str = "", stderr: str = "", code: int = 1) -> subproces
     return subprocess.CompletedProcess(args=[], returncode=code, stdout=stdout, stderr=stderr)
 
 
+def _fake_proc(returncode: int = 0) -> subprocess.CompletedProcess:
+    """Minimal CompletedProcess stub for _run patches (kaizen#98 Gap A tests)."""
+    return subprocess.CompletedProcess(args=[], returncode=returncode)
+
+
 def _all_present(monkeypatch, tmp_path=None) -> None:
     """Patch the world so every dep check passes."""
 
@@ -252,3 +257,74 @@ class TestVerifyAll:
         assert len(checks) == 4
         assert {c.name for c in checks} == {"git", "gh", "python", "atelier"}
         assert all(c.ok for c in checks)
+
+
+# ── kaizen#98 Gap A — in-place-upgrade runtime glyph-gating warning ─────────
+
+
+def _write_v2_block(path):
+    """Write a tmux.conf carrying an OLD v2 block with allow-set-title off."""
+    from scripts._tmux_config import MARKER_END, MARKER_START
+
+    body = (
+        "set -g pane-border-status top\n"
+        "set -g pane-border-format '#[fg=cyan]#{pane_title}#[default]'\n"
+        "set -g allow-set-title off\n"
+    )
+    path.write_text(f"{MARKER_START.format(2)}\n{body}{MARKER_END.format(2)}\n")
+
+
+def test_check_tmux_config_warns_and_unsets_on_v2_upgrade(tmp_path, monkeypatch, capsys):
+    """v2→v4 upgrade removing allow-set-title off → WARNING + live unset attempt."""
+    target = tmp_path / "tmux.conf"
+    _write_v2_block(target)
+    monkeypatch.setattr(setup_mod, "_locate_tmux_conf", lambda: target)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "y")
+    # Pretend a tmux server is running so the best-effort unset path runs.
+    monkeypatch.setattr(setup_mod, "_tmux_server_running", lambda: True)
+    ran: list = []
+
+    def _fake_run(cmd):
+        ran.append(list(cmd))
+        return _fake_proc(returncode=0)
+
+    monkeypatch.setattr(setup_mod, "_run", _fake_run)
+    setup_mod._check_tmux_config()
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert "allow-set-title off" in out
+    assert "restart tmux" in out.lower() or "set -gu allow-set-title" in out
+    # Best-effort live unset (global + window variant) was attempted.
+    assert ["tmux", "set", "-gu", "allow-set-title"] in ran
+    assert ["tmux", "setw", "-gu", "allow-set-title"] in ran
+
+
+def test_check_tmux_config_warns_without_unset_when_no_server(tmp_path, monkeypatch, capsys):
+    """Same upgrade, but no running server → warn, do NOT attempt the unset."""
+    target = tmp_path / "tmux.conf"
+    _write_v2_block(target)
+    monkeypatch.setattr(setup_mod, "_locate_tmux_conf", lambda: target)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "y")
+    monkeypatch.setattr(setup_mod, "_tmux_server_running", lambda: False)
+    ran: list = []
+    monkeypatch.setattr(setup_mod, "_run", lambda cmd: ran.append(list(cmd)) or _fake_proc())
+    setup_mod._check_tmux_config()
+    out = capsys.readouterr().out
+    assert "WARNING" in out
+    assert ["tmux", "set", "-gu", "allow-set-title"] not in ran
+
+
+def test_check_tmux_config_no_warning_when_v3_upgrade_had_no_gate(tmp_path, monkeypatch, capsys):
+    """A v3-style block without the gate → ordinary update, no glyph warning."""
+    from scripts._tmux_config import MARKER_END, MARKER_START
+
+    target = tmp_path / "tmux.conf"
+    body = "set -g pane-border-status top\nset -g main-pane-width 60\n"
+    target.write_text(f"{MARKER_START.format(3)}\n{body}{MARKER_END.format(3)}\n")
+    monkeypatch.setattr(setup_mod, "_locate_tmux_conf", lambda: target)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "y")
+    monkeypatch.setattr(setup_mod, "_tmux_server_running", lambda: True)
+    monkeypatch.setattr(setup_mod, "_run", lambda cmd: _fake_proc())
+    setup_mod._check_tmux_config()
+    out = capsys.readouterr().out
+    assert "WARNING" not in out

@@ -104,6 +104,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from scripts._tmux_config import check_glyph_readiness
 from scripts._tmux_workspace import (
     KAIZEN_TEAM_ID_OPTION,
     PANE_LABEL_PREFIX_RE,
@@ -593,6 +594,55 @@ def _pick_main_agent(roster: list[str]) -> str:
         if candidate in roster:
             return candidate
     return roster[0] if roster else ""
+
+
+# ── kaizen#98: activity-glyph readiness preflight ──────────────────────────
+#
+# At team-mode start we run a one-shot, advisory ``check_glyph_readiness``
+# (scripts._tmux_config) so a run launched on a STALE marker or with
+# ``allow-set-title off`` in effect logs WHY the live Claude idle/busy glyph
+# is not rendering, instead of silently showing no glyph. Never fatal.
+
+
+def _tmux_conf_path() -> Path:
+    """Return the tmux.conf path to check (mirrors setup.py's locator).
+
+    Prefers ``~/.tmux.conf``; falls back to ``~/.config/tmux/tmux.conf`` only
+    when THAT exists and the canonical one does not. Returns the canonical
+    path when neither exists (the file check tolerates a missing file).
+    """
+    home = Path(os.path.expanduser("~"))
+    canonical = home / ".tmux.conf"
+    xdg = home / ".config" / "tmux" / "tmux.conf"
+    if canonical.exists():
+        return canonical
+    if xdg.exists():
+        return xdg
+    return canonical
+
+
+def _live_allow_set_title() -> str | None:
+    """Best-effort read of the running server's global ``allow-set-title``.
+
+    Returns the value string (e.g. ``"off"`` / ``"on"``) or ``None`` when
+    tmux is absent, no server is running, or the value can't be read. Never
+    raises — the glyph-readiness check degrades to the file-only check.
+    """
+    if shutil.which("tmux") is None:
+        return None
+    try:
+        proc = subprocess.run(  # nosec - argv is a fixed list, no shell=True
+            ["tmux", "show-options", "-gv", "allow-set-title"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_CLEANUP_SUBPROC_TIMEOUT_S,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return (proc.stdout or "").strip() or None
 
 
 # ── kaizen#68: OS-level teammate cleanup (belt-and-suspenders) ─────────────
@@ -1545,6 +1595,17 @@ def team_cycle_executor(
         # post-first-wave fold). Subsequent spawn waves re-fold via the
         # ``needs_refold`` path in the ``_TrackedTools`` wrappers.
         _request_orchestrator_fold()
+        # kaizen#98 Gap B — ONE-SHOT advisory glyph-readiness check at
+        # team-mode start (gated by ``layout_applied`` like everything else in
+        # this function). Logs WHY the live glyph won't render on a stale /
+        # gated config. ADVISORY — never fatal.
+        try:
+            for warning in check_glyph_readiness(
+                _tmux_conf_path(), live_allow_set_title=_live_allow_set_title()
+            ):
+                _log.warning("kaizen#98 glyph-readiness: %s", warning)
+        except Exception as exc:  # pragma: no cover - defensive
+            _log.warning("kaizen#98 glyph-readiness check failed: %s", exc)
 
     def _retitle_on_first_send(recipient: str) -> None:
         """Apply layout (if not yet), label the recipient's pane, and flag a

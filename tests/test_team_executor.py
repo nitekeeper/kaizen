@@ -2283,3 +2283,63 @@ class TestLayoutStabilityRefold:
         assert [c[0] for c in tools.calls][-1] == "team_delete", (
             "team_delete must still fire last on the raising path"
         )
+
+
+# ── kaizen#98 Gap B — glyph-readiness preflight at team-mode start ──────────
+
+
+def test_glyph_readiness_logged_at_team_start(tmp_path, monkeypatch, caplog):
+    """check_glyph_readiness fires ONCE at layout setup; its warnings are logged."""
+    import logging
+
+    tools = MockTeamTools(scripted={"Phase 1": "ABANDON: scope unclear"})
+    monkeypatch.setattr(team_executor_mod, "apply_workspace_layout", lambda **kw: {})
+    monkeypatch.setattr(team_executor_mod, "set_pane_titles", lambda *a, **k: None)
+    # Stub the live tmux read so the test is hermetic (no real tmux).
+    monkeypatch.setattr(team_executor_mod, "_live_allow_set_title", lambda: "off")
+    calls: list = []
+
+    def _fake_check(path, *, live_allow_set_title=None):
+        calls.append((path, live_allow_set_title))
+        return ["STALE GLYPH SENTINEL"]
+
+    monkeypatch.setattr(team_executor_mod, "check_glyph_readiness", _fake_check)
+    with (
+        patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}),
+        caplog.at_level(logging.WARNING, logger="scripts.team_executor"),
+    ):
+        outcome = team_cycle_executor(
+            clone_dir=tmp_path,
+            project=_project(),
+            run_row=_run_row(),
+            cycle_n=1,
+            tools=tools,
+        )
+    assert outcome["status"] == "abandoned"
+    # Called exactly once (gated by layout_applied), with the live value threaded in.
+    assert len(calls) == 1
+    assert calls[0][1] == "off"
+    assert any("STALE GLYPH SENTINEL" in r.getMessage() for r in caplog.records)
+
+
+def test_glyph_readiness_no_log_when_ready(tmp_path, monkeypatch, caplog):
+    """When check returns [] (fresh config), nothing is logged."""
+    import logging
+
+    tools = MockTeamTools(scripted={"Phase 1": "ABANDON: scope unclear"})
+    monkeypatch.setattr(team_executor_mod, "apply_workspace_layout", lambda **kw: {})
+    monkeypatch.setattr(team_executor_mod, "set_pane_titles", lambda *a, **k: None)
+    monkeypatch.setattr(team_executor_mod, "_live_allow_set_title", lambda: None)
+    monkeypatch.setattr(team_executor_mod, "check_glyph_readiness", lambda *a, **k: [])
+    with (
+        patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}),
+        caplog.at_level(logging.WARNING, logger="scripts.team_executor"),
+    ):
+        team_cycle_executor(
+            clone_dir=tmp_path,
+            project=_project(),
+            run_row=_run_row(),
+            cycle_n=1,
+            tools=tools,
+        )
+    assert not any("glyph-readiness" in r.getMessage() for r in caplog.records)

@@ -18,8 +18,10 @@ string. One test per template for clear failure messages.
 from __future__ import annotations
 
 from scripts.dispatch_templates import (
+    _TERSE_OUTPUT_RULE,
     _TESTS_STATUS_REPLY_SUFFIX,
     TEAMMATE_REPLY_RULE,
+    _inject_terse_before_trailer,
     phase_1_agenda,
     phase_2_preanalysis,
     phase_3_close,
@@ -97,7 +99,10 @@ def test_phase_1_agenda_golden():
 
 def test_phase_2_preanalysis_golden():
     out = phase_2_preanalysis(agenda_items=["Item A", "Item B"], participant="be-1")
-    assert out == (
+    # B1 — `_TERSE_OUTPUT_RULE` is spliced in before the F7 trailer. The golden
+    # is the pre-B1 body wrapped by the same deterministic transform the
+    # wrapper applies, so the pin stays faithful to the actual wire bytes.
+    assert out == _inject_terse_before_trailer(
         "Phase 2 (Pre-analysis). You are be-1. Agenda from PM:\n"
         "- Item A\n"
         "- Item B\n"
@@ -105,6 +110,10 @@ def test_phase_2_preanalysis_golden():
         "Produce a short proposal touching each item from your domain lens. "
         "Prefix 'ABANDON:' to opt out." + _UNTRUSTED_INPUT + _RULE
     )
+    # B1 invariants: terse rule present, before the F7 trailer; trailer last.
+    assert _TERSE_OUTPUT_RULE.strip() in out
+    assert out.index(_TERSE_OUTPUT_RULE.strip()) < out.index(TEAMMATE_REPLY_RULE.strip())
+    assert out.endswith(TEAMMATE_REPLY_RULE.strip())
 
 
 def test_phase_3_open_golden():
@@ -156,7 +165,9 @@ def test_phase_4_implementer_golden():
     # universal F7 trailer. The block also carries a bridging sentence
     # ("Send this reply via the SendMessage protocol described below.")
     # that hands off to the trailer paragraph.
-    assert out == (
+    # B1 — `_TERSE_OUTPUT_RULE` is spliced in before the F7 trailer (wrapped by
+    # the same deterministic transform the wrapper applies).
+    assert out == _inject_terse_before_trailer(
         "Phase 4 wave 1 — implement Action Item AI-1. "
         "You own this item. Touches: ['foo.py']; "
         "reads: ['bar.py']. Apply the change to disk in the "
@@ -170,8 +181,9 @@ def test_phase_4_implementer_golden():
         + _TESTS_SUFFIX
         + _RULE
     )
-    # Universal terminal-trailer invariant (AI-3 will pin this
-    # parametrically across all teammate-bound templates in Wave-2).
+    # B1 invariants + universal terminal-trailer invariant.
+    assert _TERSE_OUTPUT_RULE.strip() in out
+    assert out.index(_TERSE_OUTPUT_RULE.strip()) < out.index(TEAMMATE_REPLY_RULE.strip())
     assert out.endswith(TEAMMATE_REPLY_RULE.strip())
 
 
@@ -184,13 +196,18 @@ def test_phase_5b_ci_failure_golden():
 
 def test_phase_5b_prime_reviewer_golden():
     out = phase_5b_prime_reviewer(iter_n=1, action_items=[{"id": "AI-1"}], prior_findings=None)
-    assert out == (
+    # B1 — `_TERSE_OUTPUT_RULE` is spliced in before the F7 trailer.
+    assert out == _inject_terse_before_trailer(
         "Phase 5b' iteration 1 — independent review. "
         "Review the implemented Action Items: ['AI-1']. Reply with either "
         "'NO ISSUES' (case-insensitive) OR one finding per line in the "
         "format: [severity] file:line — text  "
         "(severity ∈ blocker|major|minor|nit)." + _UNTRUSTED_INPUT + _RULE
     )
+    # B1 invariants: terse rule present, before the F7 trailer; trailer last.
+    assert _TERSE_OUTPUT_RULE.strip() in out
+    assert out.index(_TERSE_OUTPUT_RULE.strip()) < out.index(TEAMMATE_REPLY_RULE.strip())
+    assert out.endswith(TEAMMATE_REPLY_RULE.strip())
 
 
 def test_phase_5b_prime_fix_golden():

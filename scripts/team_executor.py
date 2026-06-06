@@ -113,6 +113,8 @@ from scripts._tmux_workspace import (
     set_pane_titles,
 )
 from scripts.agent_id_match import guarded_argv, team_agent_id_regex
+from scripts.caveman_codec import compress as _caveman_compress
+from scripts.caveman_codec import should_compress as _caveman_should_compress
 from scripts.cc_tool_bridge import quorum_for
 from scripts.ci_runner import run_ci_checks
 from scripts.cycle_git import commit_cycle
@@ -252,6 +254,79 @@ def _abandon_reason(response: str) -> str:
     if not stripped.startswith("ABANDON:"):
         return ""
     return stripped[len("ABANDON:") :].strip()
+
+
+# ── B2 — caveman compression at a MODEL-BOUND post-parse prose sink ───────
+#
+# Gate env var: KAIZEN_CAVEMAN_COMPRESS. Parsed defensively (mirrors the
+# CYCLE_WALL_S / EXPERIMENTAL_AGENT_TEAMS posture):
+#   unset / empty / "0" / "false" (any case)  → OFF   (M8: DEFAULT OFF, opt-in)
+#   "1" / "true" (any case) / other truthy     → ON
+#
+# DEFAULT = OFF (M8) — opt-in until efficacy is measured. This env-gate covers
+# ONLY the codec mutator (:func:`compress_reply_for_context`). The B1
+# `_TERSE_OUTPUT_RULE` prompt injection in dispatch_templates is a SEPARATE,
+# always-on lever and is NOT gated by this var.
+#
+# The ONLY place the codec is applied is :func:`compress_reply_for_context`,
+# wired at the Phase-3 Star-open broadcast (B2): the Phase-2 proposal PROSE
+# that kaizen concatenates back INTO a prompt every roster agent reads. It is
+# applied POST-PARSE (`_is_abandon` already ran on the raw Phase-2 text) and to
+# a SEPARATE copy — the stored `proposals` list stays byte-exact, so the codec
+# NEVER touches bytes a parser (`_parse_reviewer_response`,
+# `_parse_action_items`, `_parse_agenda_items`, `_is_abandon`), the DB, or git
+# reads. When the gate is OFF (the default), the helper returns its input
+# UNCHANGED (byte-identical), so OFF fully restores prior behavior.
+_CAVEMAN_ENV = "KAIZEN_CAVEMAN_COMPRESS"
+
+
+def _caveman_enabled() -> bool:
+    """Return True iff the caveman-compress codec sink is ON.
+
+    DEFAULT OFF (M8) — opt-in. Unset / empty / ``"0"`` / ``"false"`` / ``"no"``
+    / ``"off"`` (any case, whitespace-trimmed) ⇒ OFF; only an explicit truthy
+    value (``"1"`` / ``"true"`` / anything else non-falsey) turns it ON.
+    Mirrors the defensive parsing of the other kaizen env flags.
+    """
+    raw = os.environ.get(_CAVEMAN_ENV)
+    if raw is None:
+        return False  # unset → default OFF (M8)
+    val = raw.strip().lower()
+    # Explicit truthy markers → ON; falsey / unrecognised → OFF.
+    return val in ("1", "true", "yes", "on")
+
+
+def compress_reply_for_context(text: str, level: str = "full") -> str:
+    """Compress MODEL-BOUND prose for re-broadcast into a downstream prompt.
+
+    This is the B2 sink — the SOLE place :mod:`scripts.caveman_codec` is wired
+    into the live cycle path. It is applied ONLY to free-text that flows back
+    INTO a dispatch prompt an agent reads (the Phase-3 Star-open proposal
+    broadcast), on a SEPARATE copy. It is NEVER applied to:
+
+    - text fed to the byte-sensitive parsers (`_parse_reviewer_response`,
+      `_parse_action_items`, `_parse_agenda_items`, `_is_abandon`) — those
+      receive RAW reply text upstream of this call;
+    - the stored ``"raw"`` proposal field (kept byte-exact);
+    - structured fields stored in the DB or consumed by git / PR rendering.
+
+    Behavior:
+    - Feature gate OFF (:func:`_caveman_enabled`, the DEFAULT per M8) ⇒ return
+      ``text`` unchanged (byte-identical — OFF fully restores prior behavior).
+    - Auto-clarity tripwire (:func:`caveman_codec.should_compress` is False —
+      security / destructive / multi-step prose) ⇒ return ``text`` unchanged
+      (pass through verbatim; the codec must not flip meaning).
+    - Otherwise return :func:`caveman_codec.compress(text, level)`.
+
+    Non-string / empty input is returned unchanged.
+    """
+    if not isinstance(text, str) or text == "":
+        return text
+    if not _caveman_enabled():
+        return text
+    if not _caveman_should_compress(text):
+        return text
+    return _caveman_compress(text, level)
 
 
 def _parse_agenda_items(response: str) -> list[str]:
@@ -1718,6 +1793,12 @@ def team_cycle_executor(
                             ),
                         )
                         break
+                    # The RAW reply is stored verbatim into `proposals`. It is
+                    # never parsed (only `len(proposals)` reaches
+                    # `phase_3_close`), but it IS the source for the Phase 3
+                    # Star-open broadcast below — see B2 sink there, which
+                    # compresses a SEPARATE copy of this prose for the model-
+                    # bound broadcast while leaving this stored copy byte-exact.
                     proposals.append({"agent": participant, "raw": resp or ""})
 
         # ── Phase 3 — Synthesis meeting (Star → Mesh → Star) ──────────────
@@ -1726,14 +1807,28 @@ def team_cycle_executor(
         if not outcome_acc.abandoned:
             # Star open: brief every roster member with the proposals
             # GAP-4: batch-dispatch — one transaction, N parallel briefs.
+            #
+            # B2 — MODEL-BOUND caveman sink. The Phase-3 Star-open prompt
+            # broadcasts each Phase-2 proposal's PROSE back into a prompt that
+            # every roster agent READS. This is the one genuinely model-bound
+            # prose-broadcast sink in the subagent path. We compress a SEPARATE
+            # copy of each proposal's `raw` here (POST-PARSE: `_is_abandon` has
+            # already run on the raw text in Phase 2) — the stored `proposals`
+            # list is left byte-exact, so nothing parsed/DB/git-bound is
+            # touched. `compress_reply_for_context` is env-gated + auto-clarity
+            # gated, so a protected-token-only proposal comes through verbatim.
             if roster:
+                proposals_for_broadcast = [
+                    {"agent": p["agent"], "raw": compress_reply_for_context(p["raw"])}
+                    for p in proposals
+                ]
                 # #83: Star-open broadcast is a fungible fan-out — quorum-relaxed.
                 tools.send_message_many(
                     [
                         {
                             "team_id": team_id,
                             "to": participant,
-                            "message": phase_3_open(proposals=proposals),
+                            "message": phase_3_open(proposals=proposals_for_broadcast),
                         }
                         for participant in roster
                     ],
@@ -2059,6 +2154,14 @@ def team_cycle_executor(
                             suppress_batch_refold[0] = False
                             _phase_boundary_fold()
                         for reviewer, resp in zip(reviewers, reviewer_responses, strict=True):
+                            # AI-3: the parser receives the RAW reply (`resp`)
+                            # — caveman compression NEVER runs upstream of
+                            # `_parse_reviewer_response` (the `[severity]
+                            # file:line — text` finding grammar is byte-
+                            # sensitive). Reviewer prose is NOT re-broadcast
+                            # into a downstream prompt, so there is no
+                            # model-bound caveman sink here — the parser owns
+                            # the raw bytes outright.
                             findings.extend(
                                 _parse_reviewer_response(resp or "", reviewer, prefix=f"R{iter_n}")
                             )

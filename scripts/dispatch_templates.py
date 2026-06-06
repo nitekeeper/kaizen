@@ -180,6 +180,95 @@ _TESTS_STATUS_REPLY_SUFFIX = (
 )
 
 
+# AI-2 (kaizen caveman-token-compression) — additive terse output-contract.
+#
+# This is the "cavecrew" reply-shape directive: it asks the spawned
+# teammate/subagent to RETURN compact, fragment-style output (one line per
+# finding, no pleasantries, no hedging, no restating the prompt) so the
+# tool-result injected back into the orchestrator's context is smaller. It is
+# pure GUIDANCE to the agent — NOT a parser change and NOT a wire-protocol
+# change.
+#
+# DELIBERATELY SEPARATE from TEAMMATE_REPLY_RULE / _trailer.md: this constant
+# is NEVER concatenated into TEAMMATE_REPLY_RULE, so the F7/GAP-7 byte-frozen
+# trailer (enforced by tests/test_trailer_md_parity.py) is untouched. Callers
+# that want the terse shape APPEND this constant separately, AFTER the phase
+# body and (where present) BEFORE the F7 trailer, so the SendMessage/shutdown
+# protocol contract remains the prompt's last instruction.
+#
+# HARD CARVE-OUT (mirrors caveman_codec's protected segments): the directive
+# explicitly EXCLUDES code, file paths, identifiers, error strings, and the
+# SendMessage/shutdown JSON protocol from any terseness — those stay verbatim.
+# A literal-minded LLM must never "compress" a path, an error string, or the
+# shutdown JSON.
+_TERSE_OUTPUT_RULE = (
+    "\n\nIMPORTANT — Output shape (terse): keep your prose reply COMPACT to "
+    "save context. Talk like a smart caveman — brain stays big, only fluff "
+    "dies. Use fragments, one line per finding/decision, no pleasantries, no "
+    "hedging, no restating this prompt. Drop articles and filler where meaning "
+    "survives. This applies ONLY to your free-text prose. Do NOT compress or "
+    "alter, and reproduce VERBATIM: code (fenced or inline), file paths, "
+    "identifiers (CONST_CASE, dotted.names, fn() calls), version numbers, "
+    "quoted error strings, and the required SendMessage / shutdown_response "
+    "JSON protocol body. Those stay byte-exact. If terseness would create "
+    "technical ambiguity (security, destructive/irreversible actions, "
+    "ordered multi-step sequences), write that part in full."
+)
+
+
+def _inject_terse_before_trailer(rendered: str) -> str:
+    """Splice :data:`_TERSE_OUTPUT_RULE` into ``rendered`` so it sits AFTER
+    the phase body and IMMEDIATELY BEFORE the F7 reply-rule trailer.
+
+    Contractual placement (F7): the F7 reply-rule (``TEAMMATE_REPLY_RULE`` /
+    ``_trailer.md`` body) MUST remain the prompt's LAST instruction. Every
+    teammate-bound .md template ends with ``{{ include: _trailer.md }}``, so
+    the rendered body's terminal paragraph is ``TEAMMATE_REPLY_RULE.strip()``.
+    We locate that trailing trailer span and insert the terse-output guidance
+    just before it — never after it.
+
+    The injection is ALWAYS-ON (not env-gated): it is pure additive prompt
+    text that asks the agent to emit compact replies, which is where the real
+    token savings come from. It does not alter any byte of the F7 trailer, so
+    ``tests/test_trailer_md_parity.py`` stays green.
+
+    N3 — FAIL LOUD on a missing trailer. The trailer is located by its byte-
+    frozen body (``TEAMMATE_REPLY_RULE.strip()``). This helper is ONLY ever
+    called on teammate-bound templates, whose rendered body MUST end with the
+    F7 trailer (every such template includes ``{{ include: _trailer.md }}``).
+    If the trailer span is absent, silently appending the terse rule at the end
+    would mis-order it AFTER the F7 position — so we raise ``ValueError``
+    instead. A future trailer-less teammate template then breaks visibly here
+    rather than shipping a prompt whose last instruction is the terse rule.
+
+    Raises:
+        ValueError: if ``rendered`` does not contain the F7 reply-rule trailer.
+    """
+    trailer = TEAMMATE_REPLY_RULE.strip()
+    idx = rendered.rfind(trailer)
+    if idx == -1:
+        # N3 — fail loud: this helper is teammate-bound-only and every such
+        # template MUST carry the F7 trailer. Mis-ordering the terse rule after
+        # the F7 position is a silent F7 violation, so refuse rather than guess.
+        raise ValueError(
+            "dispatch_templates._inject_terse_before_trailer: the rendered body "
+            "does not contain the F7 reply-rule trailer "
+            "(TEAMMATE_REPLY_RULE.strip()). This helper is teammate-bound-only "
+            "and MUST be called on a template that ends with "
+            "`{{ include: _trailer.md }}`; appending the terse-output rule "
+            "without the trailer would mis-order it after the F7 position. Fix "
+            "the calling template/wrapper, or do not route this body through "
+            "the terse injection."
+        )
+    # `_TERSE_OUTPUT_RULE` begins with "\n\n"; strip the leading newlines so we
+    # control the exact separator between the body and the inserted block, then
+    # re-add a clean paragraph break on each side so the terse block reads as
+    # its own paragraph sitting above the trailer.
+    terse_block = _TERSE_OUTPUT_RULE.lstrip("\n")
+    head = rendered[:idx].rstrip()
+    return f"{head}\n\n{terse_block}\n\n{trailer}"
+
+
 # ── kwarg validator ───────────────────────────────────────────────────────
 
 
@@ -575,11 +664,13 @@ def phase_2_preanalysis(*, agenda_items: list[str], participant: str) -> str:
         return f"- {first_unquoted}\n{rest}" if rest else f"- {first_unquoted}"
 
     agenda_items_as_bullets = "\n".join(_bullet(item) for item in agenda_items)
-    return _render(
+    rendered = _render(
         "phase_2_audit.md",
         participant=participant,
         agenda_items_as_bullets=agenda_items_as_bullets,
     )
+    # B1 — always-on terse-output guidance, inserted before the F7 trailer.
+    return _inject_terse_before_trailer(rendered)
 
 
 def phase_3_open(*, proposals: list[dict]) -> str:
@@ -650,7 +741,7 @@ def phase_4_implementer(*, item: dict, wave_n: int) -> str:
     # behavior — `touches=None` and `reads=None` previously rendered as
     # the bare word ``None`` and we preserve that to avoid silent breakage
     # in callers that haven't yet started passing the fields.
-    return _render(
+    rendered = _render(
         "phase_4_implementation.md",
         wave_n=wave_n,
         **{
@@ -659,6 +750,8 @@ def phase_4_implementer(*, item: dict, wave_n: int) -> str:
             "item.reads": item.get("reads"),
         },
     )
+    # B1 — always-on terse-output guidance, inserted before the F7 trailer.
+    return _inject_terse_before_trailer(rendered)
 
 
 def phase_5b_ci_failure(*, wave_n: int, failed_checks: list[str]) -> str:
@@ -733,7 +826,7 @@ def phase_5b_prime_reviewer(
     # strict-equality rewrite, conditional-only kwargs MUST be declared
     # in the sibling `<!--vars-conditional:-->` frontmatter; the
     # `phase_5_review.md` template carries `prior_findings` there.
-    return _render(
+    rendered = _render(
         "phase_5_review.md",
         iter_n=iter_n,
         action_items_ids=action_items_ids,
@@ -741,6 +834,8 @@ def phase_5b_prime_reviewer(
         prior_findings_as_bullets=prior_findings_as_bullets,
         prior_findings=prior_findings,
     )
+    # B1 — always-on terse-output guidance, inserted before the F7 trailer.
+    return _inject_terse_before_trailer(rendered)
 
 
 def phase_5b_prime_fix(*, finding: Finding) -> str:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -208,16 +209,16 @@ class TestBuildAndIngestHappyPath:
         clone.mkdir()
         graph_json = clone / "graphify-out" / "graph.json"
 
-        bridge_argvs: list[list] = []
+        calls: list[tuple[list, dict]] = []
 
         def fake_run(argv, **k):
+            calls.append((argv, k))
             if argv[0] == "graphify":
                 # Simulate graphify writing the artifact into the clone.
                 graph_json.parent.mkdir(parents=True, exist_ok=True)
                 graph_json.write_text("{}")
                 return CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
             # The ingest bridge.
-            bridge_argvs.append(argv)
             return CompletedProcess(
                 args=argv,
                 returncode=0,
@@ -228,12 +229,27 @@ class TestBuildAndIngestHappyPath:
         monkeypatch.setattr(codegraph_recon.subprocess, "run", fake_run)
         out = codegraph_recon.build_and_ingest(clone, "o/r", built_at_commit="HEAD")
         assert out == {"status": "ingested", "nodes": 5, "edges": 7, "repo": "o/r"}
+
+        graphify_call = next(c for c in calls if c[0][0] == "graphify")
+        bridge_call = next(c for c in calls if c[0][0] == sys.executable)
+        g_argv, g_kw = graphify_call
+        b_argv, b_kw = bridge_call
+
         # The bridge argv uses sys.executable and the -c inline script, no shell.
-        assert len(bridge_argvs) == 1
-        bridge = bridge_argvs[0]
-        assert bridge[0] == sys.executable
-        assert bridge[1] == "-c"
-        assert "o/r" in bridge
+        assert b_argv[1] == "-c"
+        assert "o/r" in b_argv
+        # REGRESSION (bridge cwd): the `-c` memex-import bridge MUST run with
+        # cwd == memex_root, else sys.path[0] ("" == caller cwd) shadows it and
+        # `from scripts import code_graph` imports the caller's scripts/ package
+        # (kaizen has one). This was the production failure the mocked happy-path
+        # missed. Both PYTHONPATH and cwd must point at memex.
+        assert b_kw["cwd"] == str(memex_root)
+        assert b_kw["env"]["PYTHONPATH"] == str(memex_root)
+        # REGRESSION (graphify env + abs path): graphify is a standalone tool —
+        # it must NOT be handed the scrubbed memex PYTHONPATH, and the target
+        # path must be absolute (it runs in a different cwd).
+        assert g_argv[2] == str(clone.resolve())
+        assert g_kw["env"].get("PYTHONPATH") != str(memex_root)
         # Clone kept clean: graphify-out removed after ingest.
         assert not (clone / "graphify-out").exists()
 
@@ -322,10 +338,10 @@ class TestBuildAndIngestHappyPath:
 class TestQueryHelpers:
     def test_where_is_passes_args_and_parses_json(self, monkeypatch, tmp_path):
         monkeypatch.setattr(codegraph_recon, "find_memex_root", lambda: tmp_path)
-        seen: list[list] = []
+        seen: list[tuple[list, dict]] = []
 
         def fake_run(argv, **k):
-            seen.append(argv)
+            seen.append((argv, k))
             return CompletedProcess(
                 args=argv, returncode=0, stdout='[{"file":"a.py","line":3}]', stderr=""
             )
@@ -333,12 +349,17 @@ class TestQueryHelpers:
         monkeypatch.setattr(codegraph_recon.subprocess, "run", fake_run)
         result = codegraph_recon.where_is("o/r", "myfn")
         assert result == [{"file": "a.py", "line": 3}]
-        argv = seen[0]
+        argv, kw = seen[0]
         assert argv[0] == sys.executable
         assert argv[1] == "-c"
         assert "where_is" in argv
         assert "o/r" in argv
         assert "myfn" in argv
+        # REGRESSION (bridge cwd): the query bridge MUST run with cwd == memex_root
+        # so `from scripts import code_graph` resolves to memex, not the caller's
+        # scripts/ package (same shadowing bug as the ingest bridge).
+        assert kw["cwd"] == str(tmp_path)
+        assert kw["env"]["PYTHONPATH"] == str(tmp_path)
 
     def test_query_helper_raises_when_memex_missing(self, monkeypatch):
         monkeypatch.setattr(codegraph_recon, "find_memex_root", lambda: None)
@@ -380,3 +401,53 @@ class TestCli:
         assert proc.returncode == 0, proc.stderr
         status = json.loads(proc.stdout.strip())
         assert status["status"] == "skipped"
+
+
+# ── Real integration (only when graphify + memex>=2.9.0 are installed) ───────
+#
+# These exercise the ACTUAL production caller end-to-end — the path the mocked
+# tests above cannot reach (real graphify subprocess + real memex code_graph
+# import bridge). They are the regression guard for the cwd/PYTHONPATH-shadow
+# and graphify-env bugs that only surfaced once the deps were installed. They
+# skip cleanly in CI (deps absent), so they never make CI flaky.
+
+_GRAPHIFY = shutil.which("graphify")
+_MEMEX = codegraph_recon.find_memex_root()
+_DEPS_PRESENT = _GRAPHIFY is not None and _MEMEX is not None
+
+
+@pytest.mark.skipif(not _DEPS_PRESENT, reason="graphify + memex>=2.9.0 not installed")
+class TestRealEndToEnd:
+    def test_build_and_query_against_a_real_tree(self, tmp_path, monkeypatch):
+        """Real graphify build -> real memex ingest -> real query, run from a cwd
+        that has its OWN scripts/ package (reproducing the kaizen-root shadow).
+        Isolated MEMEX_HOME so it never touches the user's real code_graph.db."""
+        monkeypatch.delenv(codegraph_recon._CODEGRAPH_ENV, raising=False)
+        # Isolate the memex store under tmp so we don't write the real one.
+        home = tmp_path / "memexhome"
+        home.mkdir()
+        monkeypatch.setenv("MEMEX_HOME", str(home))
+        monkeypatch.setenv("MEMEX_HOME_ALLOW_UNUSUAL", "1")
+
+        # A tiny target with a couple of Python symbols + a call edge.
+        target = tmp_path / "target"
+        (target / "pkg").mkdir(parents=True)
+        (target / "pkg" / "a.py").write_text("def foo():\n    return bar()\n")
+        (target / "pkg" / "b.py").write_text("def bar():\n    return 1\n")
+
+        # Decoy scripts/ in cwd to reproduce the shadow: run from a dir that has
+        # its own (non-memex) scripts package, exactly like the kaizen root.
+        decoy = tmp_path / "decoy"
+        (decoy / "scripts").mkdir(parents=True)
+        (decoy / "scripts" / "__init__.py").write_text("")
+        monkeypatch.chdir(decoy)
+
+        out = codegraph_recon.build_and_ingest(target, "octo/widget", built_at_commit="HEAD")
+        assert out["status"] == "ingested", out
+        assert out["nodes"] > 0
+        # graphify-out must not be left in the target.
+        assert not (target / "graphify-out").exists()
+
+        # Real query bridge round-trips (would ImportError if cwd shadow regressed).
+        hits = codegraph_recon.where_is("octo/widget", "foo")
+        assert any(h.get("label", "").startswith("foo") for h in hits), hits

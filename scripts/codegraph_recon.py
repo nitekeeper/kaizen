@@ -238,7 +238,10 @@ def build_and_ingest(
         if memex_root is None:
             return {"status": "skipped", "reason": "memex>=2.9.0 not found"}
 
-        clone_dir = Path(clone_dir)
+        # Resolve to absolute: the graphify subprocess runs in a *different*
+        # cwd (tmp_cwd), so a relative clone_dir would resolve against the wrong
+        # directory (the empty tmp_cwd) and graphify would target nothing.
+        clone_dir = Path(clone_dir).resolve()
         graphify_out = clone_dir / "graphify-out"
         graph_json = graphify_out / "graph.json"
 
@@ -247,10 +250,15 @@ def build_and_ingest(
         # outside the clone, but graphify still targets <clone_dir>/graphify-out.
         tmp_cwd = tempfile.mkdtemp(prefix="kaizen-codegraph-")
         try:
+            # graphify is a standalone external CLI — it inherits the full
+            # environment (NOT _memex_env, which is the scrubbed PYTHONPATH-bridge
+            # env meant only for the `python -c` memex-import subprocesses below;
+            # forcing PYTHONPATH=<memex> and stripping graphify's own env is both
+            # wrong and unnecessary for an independent tool).
             proc = subprocess.run(
                 ["graphify", "update", str(clone_dir), "--no-cluster"],
                 cwd=tmp_cwd,
-                env=_memex_env(memex_root),
+                env=os.environ.copy(),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -281,6 +289,11 @@ def build_and_ingest(
                     str(graph_json),
                     built_at_commit or "",
                 ],
+                # cwd=memex_root so the `-c` script's sys.path[0] ("" == cwd)
+                # IS the memex root: `from scripts import code_graph` must resolve
+                # to memex's package, not whatever scripts/ sits in the caller's
+                # cwd (kaizen has its own scripts/, which would shadow PYTHONPATH).
+                cwd=str(memex_root),
                 env=_memex_env(memex_root),
                 capture_output=True,
                 text=True,
@@ -330,6 +343,10 @@ def _query(memex_root: Path, fn: str, owner_repo: str, *args: str) -> object:
     """
     proc = subprocess.run(
         [sys.executable, "-c", _QUERY_BRIDGE, fn, owner_repo, *[str(a) for a in args]],
+        # cwd=memex_root so `from scripts import code_graph` in the `-c` bridge
+        # resolves to memex's package (sys.path[0] == cwd), not a scripts/ in the
+        # caller's cwd that would shadow PYTHONPATH. See build_and_ingest.
+        cwd=str(memex_root),
         env=_memex_env(memex_root),
         capture_output=True,
         text=True,

@@ -116,6 +116,30 @@ def test_phase_2_preanalysis_golden():
     assert out.endswith(TEAMMATE_REPLY_RULE.strip())
 
 
+def test_phase_2_preanalysis_codegraph_conditional():
+    """The code-nav-graph guidance block is gated on `codegraph_available`.
+
+    codegraph_available=False (the default) → guidance ABSENT and the body is
+    byte-identical to the default golden. codegraph_available=True → the
+    guidance block (with the query-CLI invocation) is PRESENT, still before the
+    F7 trailer.
+    """
+    off = phase_2_preanalysis(agenda_items=["Item A"], participant="be-1")
+    off_explicit = phase_2_preanalysis(
+        agenda_items=["Item A"], participant="be-1", codegraph_available=False
+    )
+    on = phase_2_preanalysis(agenda_items=["Item A"], participant="be-1", codegraph_available=True)
+    # Default == explicit-False (the kwarg defaults to False).
+    assert off == off_explicit
+    # OFF: guidance absent.
+    assert "codegraph_recon.py" not in off
+    # ON: guidance present, distinctive substring, still before the F7 trailer.
+    assert "codegraph_recon.py" in on
+    assert "code-nav graph" in on
+    assert on.index("codegraph_recon.py") < on.index(TEAMMATE_REPLY_RULE.strip())
+    assert on.endswith(TEAMMATE_REPLY_RULE.strip())
+
+
 def test_phase_3_open_golden():
     out = phase_3_open(proposals=[{"agent": "be-1", "raw": "proposal text"}])
     assert out == (

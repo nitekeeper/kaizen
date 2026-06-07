@@ -629,7 +629,9 @@ def phase_1_agenda(*, subject: str | None, cycle_n: int) -> str:
     )
 
 
-def phase_2_preanalysis(*, agenda_items: list[str], participant: str) -> str:
+def phase_2_preanalysis(
+    *, agenda_items: list[str], participant: str, codegraph_available: bool = False
+) -> str:
     """Renders templates/phase_2_audit.md; see that file for the kwargs contract.
 
     AI-5 Layer B — sanitize teammate-authored agenda items. The agenda
@@ -646,6 +648,13 @@ def phase_2_preanalysis(*, agenda_items: list[str], participant: str) -> str:
     placeholder in the .md body is the single-line backstop: even if a
     single-line agenda item smuggles an injection directive, the
     boundary clause is the prompt's last instruction.
+
+    ``codegraph_available`` rides as the truthiness signal for the .md
+    template's ``{{# if CODEGRAPH_AVAILABLE #}}`` block (declared in the
+    sibling ``<!--vars-conditional:-->`` frontmatter, never substituted).
+    Default False keeps every existing caller valid under strict equality
+    and the rendered body byte-identical to the pre-codegraph golden; True
+    appends the code-nav-graph query-CLI guidance.
     """
     _require("agenda_items", agenda_items, list)
     _require("participant", participant, str)
@@ -668,6 +677,11 @@ def phase_2_preanalysis(*, agenda_items: list[str], participant: str) -> str:
         "phase_2_audit.md",
         participant=participant,
         agenda_items_as_bullets=agenda_items_as_bullets,
+        # Conditional-signal kwarg (declared in `<!--vars-conditional:-->`):
+        # toggles the code-nav-graph query-CLI guidance block. Default False
+        # so every existing caller stays valid under strict equality and the
+        # rendered body is byte-identical to the pre-codegraph golden.
+        CODEGRAPH_AVAILABLE=codegraph_available,
     )
     # B1 — always-on terse-output guidance, inserted before the F7 trailer.
     return _inject_terse_before_trailer(rendered)

@@ -105,6 +105,7 @@ If `internal/pm-agenda` returns no agenda items (e.g., the PM finds nothing wort
 Dispatch every participant in parallel (one agent per role from the resolved roster). Each agent independently:
 
 1. Reads the files in `project["read_paths"]` that are relevant to their domain (no need to re-read every file).
+   - **Code-nav graph (best-effort).** If a code-nav graph was built for this repo (Step 3.5 in `internal/run/SKILL.md`), PREFER it over grep + full-file reads for where-is / callers / dependencies / neighbors / module-map: run `python3 scripts/codegraph_recon.py where-is <repo> <symbol>` (and `callers` / `deps` / `neighbors` / `module-map`) from the kaizen root. It returns locations (file:line) as JSON, not file bodies — read a file only when you need its contents. If the graph was skipped (graphify/memex>=2.9.0 absent, or `KAIZEN_CODEGRAPH=0`), fall back to grep as usual.
 2. Writes a structured proposal addressing the agenda items they have an opinion on:
    - **Finding** — specific files, patterns, problems they observed.
    - **Proposal** — concrete change and rationale.

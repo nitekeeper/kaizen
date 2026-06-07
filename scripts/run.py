@@ -25,6 +25,7 @@ This lets a test or recovery flow inspect the clone before teardown.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from datetime import UTC, datetime
@@ -457,6 +458,26 @@ def orchestrate_run(
         except Exception:
             cleanup_experiment(experiment_dir)
             raise
+
+        # 3.5 Code-graph recon (best-effort, ON-by-default, auto-skip).
+        #
+        # Build an AST-only code-nav graph of the freshly-seeded clone and
+        # ingest it into memex's code_graph.db so Phase 2 recon agents can
+        # navigate the graph instead of grep + full-file reads. This is a
+        # NON-hard dependency accelerator: `build_and_ingest` NEVER raises
+        # (it returns a skip dict when graphify/memex>=2.9.0 are absent or
+        # KAIZEN_CODEGRAPH is disabled), so no try/suppress is needed. We
+        # thread the built-vs-skipped signal to Phase 2 via the
+        # `KAIZEN_CODEGRAPH_AVAILABLE` env var the team executor reads at
+        # phase_2 dispatch time.
+        from scripts import codegraph_recon
+
+        owner, repo = parse_owner_repo(git_url)
+        codegraph_status = codegraph_recon.build_and_ingest(
+            experiment_dir, f"{owner}/{repo}", built_at_commit="HEAD"
+        )
+        codegraph_available = codegraph_status.get("status") == "ingested"
+        os.environ["KAIZEN_CODEGRAPH_AVAILABLE"] = "1" if codegraph_available else "0"
 
         # 4. Branch
         branch = create_branch(experiment_dir, subject)

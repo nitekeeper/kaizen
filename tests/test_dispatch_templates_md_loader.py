@@ -78,10 +78,13 @@ _WIRING_CASES = [
     ),
     (
         "phase_2_audit.md",
-        lambda: phase_2_preanalysis(agenda_items=["Item A", "Item B"], participant="be-1"),
+        lambda: phase_2_preanalysis(
+            agenda_items=["Item A", "Item B"], participant="be-1", codegraph_available=False
+        ),
         {
             "participant": "be-1",
             "agenda_items_as_bullets": "- Item A\n- Item B",
+            "CODEGRAPH_AVAILABLE": False,
         },
     ),
     (

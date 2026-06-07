@@ -1767,7 +1767,9 @@ def team_cycle_executor(
                         "team_id": team_id,
                         "to": participant,
                         "message": phase_2_preanalysis(
-                            agenda_items=agenda_items, participant=participant
+                            agenda_items=agenda_items,
+                            participant=participant,
+                            codegraph_available=os.environ.get("KAIZEN_CODEGRAPH_AVAILABLE") == "1",
                         ),
                     }
                     for participant in phase_2_recipients

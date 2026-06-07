@@ -34,6 +34,18 @@ Read `internal/clone-target/SKILL.md` and follow its `setup` operation with `git
 - Atelier's full schema + role roster seeded into `<clone>/.ai/memex.db`
 - `<clone>/.ai/wiki/` directory present
 
+### Step 3.5 — Build code-nav graph (best-effort, auto-skip)
+
+Build an AST-only code-navigation graph of the freshly-seeded clone so Phase 2 recon agents can navigate the graph instead of grep + full-file reads:
+
+```
+python3 scripts/codegraph_recon.py build <clone_dir> <git_url>
+```
+
+This is **best-effort and ON by default.** It prints a JSON status and exits 0 even when it skips. It auto-skips (logging one stderr note, continuing the run) whenever `graphify` is not on PATH, memex >= 2.9.0 is not installed, the build/ingest fails, or `KAIZEN_CODEGRAPH` is set to `0`/`false`/`no`/`off`. It never writes into the PR diff — the `graphify-out/` artifact is removed from the clone after ingest. The graph is ingested into memex's `~/.memex/code_graph.db`, keyed by `owner/repo`.
+
+`scripts.run.orchestrate_run` performs this step automatically between seed and branch (it never raises, so no try/suppress is needed) and threads the built-vs-skipped signal to Phase 2 via the `KAIZEN_CODEGRAPH_AVAILABLE` env var. When hand-driving the steps, **record whether the graph was built or skipped** (parse the printed `status`): Phase 2 agents only invoke the query CLI when the graph is available, and fall back to grep when it was skipped.
+
 ### Step 4 — Create the run branch
 
 Compute and check out the kaizen branch in the clone:

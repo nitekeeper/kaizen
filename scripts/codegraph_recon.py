@@ -40,12 +40,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+try:
+    from scripts.plugin_cache import newest_version_dir, parse_version
+except ImportError:  # standalone `python3 scripts/codegraph_recon.py ...`
+    # (sys.path[0] is scripts/, so the sibling module imports flat).
+    from plugin_cache import newest_version_dir, parse_version
 
 # ── Feature gate ───────────────────────────────────────────────────────────
 
@@ -76,20 +81,10 @@ _AGORA_MEMEX = Path.home() / ".claude" / "plugins" / "cache" / "agora" / "memex"
 _MEMEX_CONFIG = Path.home() / ".memex" / "config.json"
 _MEMEX_MARKER = "scripts/code_graph.py"
 _MEMEX_MIN_VERSION = (2, 9, 0)
-# X.Y.Z prefix (tolerates a trailing pre-release/build suffix on the dir name).
-_VERSION_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
 
-
-def _parse_version(name: str) -> tuple[int, int, int] | None:
-    """Parse an ``X.Y.Z`` prefix from a version-dir name; None if unparseable.
-
-    Robust to non-semver names (returns None so the caller skips them) and to a
-    trailing suffix (e.g. ``2.9.0-rc1`` → ``(2, 9, 0)``).
-    """
-    m = _VERSION_RE.match(name.strip())
-    if not m:
-        return None
-    return (int(m.group(1)), int(m.group(2)), int(m.group(3)))
+# Alias of the shared resolver's parser (see scripts/plugin_cache.py); the
+# config.json pin branch in find_memex_root uses it directly.
+_parse_version = parse_version
 
 
 def _has_marker(candidate: Path) -> bool:
@@ -130,21 +125,9 @@ def find_memex_root() -> Path | None:
                 # Malformed config / unreadable pointer — fall through to scan.
                 pass
 
-        # 2. Scan the Agora plugin cache for the highest valid version.
-        if not _AGORA_MEMEX.is_dir():
-            return None
-        best: tuple[tuple[int, int, int], Path] | None = None
-        for child in _AGORA_MEMEX.iterdir():
-            if not child.is_dir():
-                continue
-            ver = _parse_version(child.name)
-            if ver is None or ver < _MEMEX_MIN_VERSION:
-                continue
-            if not _has_marker(child):
-                continue
-            if best is None or ver > best[0]:
-                best = (ver, child)
-        return best[1] if best is not None else None
+        # 2. Scan the Agora plugin cache for the highest valid version
+        #    (numeric semver max — shared resolver, scripts/plugin_cache.py).
+        return newest_version_dir(_AGORA_MEMEX, _has_marker, min_version=_MEMEX_MIN_VERSION)
     except Exception:
         return None
 
@@ -164,6 +147,35 @@ def _memex_env(memex_root: Path) -> dict[str, str]:
         if val is not None:
             env[key] = val
     env["PYTHONPATH"] = str(memex_root)
+    return env
+
+
+def _graphify_env() -> dict[str, str]:
+    """Return a credential-free allowlist environment for the graphify CLI.
+
+    graphify processes an UNTRUSTED clone, so it must not inherit ambient
+    credentials (GH_TOKEN, API keys, ...). Forwards only PATH, HOME,
+    locale/temp-dir vars, and graphify's own knobs (GRAPHIFY_OUT,
+    GRAPHIFY_REBUILD_MEMORY_LIMIT_MB). NEVER sets PYTHONPATH — graphify is a
+    standalone external tool, and forcing memex's PYTHONPATH onto it broke the
+    build (PR #102); the PYTHONPATH bridge belongs to :func:`_memex_env` only.
+    """
+    env: dict[str, str] = {}
+    for key in (
+        "PATH",
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TMPDIR",
+        "TEMP",
+        "TMP",
+        "GRAPHIFY_OUT",
+        "GRAPHIFY_REBUILD_MEMORY_LIMIT_MB",
+    ):
+        val = os.environ.get(key)
+        if val is not None:
+            env[key] = val
     return env
 
 
@@ -250,15 +262,16 @@ def build_and_ingest(
         # outside the clone, but graphify still targets <clone_dir>/graphify-out.
         tmp_cwd = tempfile.mkdtemp(prefix="kaizen-codegraph-")
         try:
-            # graphify is a standalone external CLI — it inherits the full
-            # environment (NOT _memex_env, which is the scrubbed PYTHONPATH-bridge
-            # env meant only for the `python -c` memex-import subprocesses below;
-            # forcing PYTHONPATH=<memex> and stripping graphify's own env is both
-            # wrong and unnecessary for an independent tool).
+            # graphify is a standalone external CLI processing an UNTRUSTED
+            # clone — it gets the credential-free allowlist env (_graphify_env:
+            # PATH/HOME/locale/tmp + GRAPHIFY_* knobs, NO tokens or keys, and
+            # NO PYTHONPATH — the memex PYTHONPATH bridge in _memex_env is only
+            # for the `python -c` memex-import subprocesses below; forcing it
+            # onto graphify broke the build, PR #102).
             proc = subprocess.run(
                 ["graphify", "update", str(clone_dir), "--no-cluster"],
                 cwd=tmp_cwd,
-                env=os.environ.copy(),
+                env=_graphify_env(),
                 capture_output=True,
                 text=True,
                 encoding="utf-8",

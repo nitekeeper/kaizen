@@ -249,6 +249,24 @@ def _register_cli(git_url: str, db_path: str) -> int:
     from scripts.clone import cleanup_experiment, clone_repo  # local to avoid import-time cost
     from scripts.detect_config import detect_all
 
+    # Function-local import: scripts.run already imports scripts.project
+    # (function-locally, in _cmd_create_run_only and the orchestrator) — keep
+    # this pair cycle-proof even if those imports are ever promoted to
+    # module level.
+    from scripts.run import validate_git_url
+
+    # Gate the URL up front: a URL the run layer can never parse would
+    # otherwise register a dead project row that every later run rejects.
+    try:
+        validate_git_url(git_url)
+    except ValueError as exc:
+        print(f"Cannot register: {exc}", file=sys.stderr)
+        print(
+            "Accepted forms: https://host/owner/repo[.git] or git@host:owner/repo[.git]",
+            file=sys.stderr,
+        )
+        return 1
+
     existing = get_project_by_url(db_path, git_url)
     if existing is not None:
         print(json.dumps(existing, indent=2))

@@ -40,7 +40,7 @@ Priority order when instructions conflict:
 Run from the Kaizen repo root:
 
 ```
-python3 scripts/setup.py
+PYTHONPATH=. python3 scripts/setup.py
 ```
 
 This verifies `git`, `gh` (authenticated), `memex`, atelier on disk, and Python ≥ 3.11. If any check fails, the script prints actionable instructions and exits non-zero. **Abort** — do not proceed. Surface the script's output to the user verbatim and stop.
@@ -140,7 +140,7 @@ When Step 3 (subagent mode) or Step 3b (team mode) returns, surface the summary 
 - `run_id` (Kaizen DB)
 - PR URL (if the PR was opened)
 - `S succeeded / A abandoned out of N requested`
-- Memex slugs for any abandonment reports and cycle minutes, so the user can read them later via `memex ask`
+- Memex slugs for any abandonment reports and cycle minutes, so the user can read them later via `memex:run ask`
 
 ## Hard rules
 
@@ -179,7 +179,7 @@ After Step 3b's create-run-only returns `run_id` and Step 3b spawns Python detac
      ON CONFLICT(run_id) DO UPDATE SET
        last_polled_at = datetime('now'),
        polled_count = polled_count + 1;
-   SELECT id, kind, args_json FROM bridge_requests
+   SELECT id, kind, args_json, created_at FROM bridge_requests
      WHERE run_id = <RUN_ID> AND status = 'pending'
      ORDER BY id LIMIT 8;
    ATTACH DATABASE '.ai/memex.db' AS m;
@@ -249,14 +249,18 @@ After Step 3b's create-run-only returns `run_id` and Step 3b spawns Python detac
      If the result is ≤ 60 → Python is alive; just service the row normally (Python is slow, not crashed).
    - If the result is > 60 OR no row exists → Python has stalled. Mark this row error via the write-back helper (see step 4) with status='error' and a one-line diagnostic. Continue to next row.
 
-4. **Write back (one Bash call per row, via the audited helper):**
+4. **Write back (Write-tool temp file + one Bash call per row, via the audited helper):**
+
+   **NEVER inline agent-authored prose into a shell command** — not even single-quoted. A single apostrophe in a teammate's reply (e.g. `don't`) terminates the shell quote and the rest of the prose executes as shell. The payload must reach the helper via a file written by the **Write tool**, which performs no shell interpolation:
 
    On success:
+   1. Build the JSON response (response contract below) and write it with the **Write tool** to `$KAIZEN_ROOT/.ai/bridge_response_<row.id>.json` — do NOT build the file via `echo`/`printf`/heredoc.
+   2. Feed the file to the helper on stdin:
    ```bash
-   cd "$KAIZEN_ROOT" && printf '%s' '<JSON-encoded response>' | \
-     python3 scripts/bridge_write.py --row-id <row.id> --status ready
+   cd "$KAIZEN_ROOT" && python3 scripts/bridge_write.py --row-id <row.id> --status ready \
+     < .ai/bridge_response_<row.id>.json && rm -f .ai/bridge_response_<row.id>.json
    ```
-   The `<JSON-encoded response>` is built by you using the response contract:
+   The JSON response is built by you using the response contract:
    - team_create: `{"team_id":"..."}`
    - send_message: `{"response":"..."}`
    - team_delete: `{}`
@@ -264,16 +268,26 @@ After Step 3b's create-run-only returns `run_id` and Step 3b spawns Python detac
    - cycle_done: `{}`
    - aborted: `{"cleaned_team_ids":["...","..."]}`
 
-   On failure (the session tool errored or returned a refusal):
+   On failure (the session tool errored or returned a refusal): same shape — write the one-line error text to `.ai/bridge_response_<row.id>.txt` via the **Write tool** (error text may quote agent prose, so the no-shell-interpolation rule applies here too), then:
    ```bash
-   cd "$KAIZEN_ROOT" && printf '%s' '<one-line error text>' | \
-     python3 scripts/bridge_write.py --row-id <row.id> --status error
+   cd "$KAIZEN_ROOT" && python3 scripts/bridge_write.py --row-id <row.id> --status error \
+     < .ai/bridge_response_<row.id>.txt && rm -f .ai/bridge_response_<row.id>.txt
    ```
 
    NEVER write back via raw `sqlite3 "UPDATE ..."`. The helper uses parameter binding and is the only write path that is safe against agent-authored prose containing quotes, newlines, or SQL syntax.
 
 5. **Check run status (already in step 1's output).** If the `RUN_STATUS:` line is NOT `running` → exit the loop, proceed to open the PR.
 
-6. **If step 1's SELECT returned zero rows AND status was 'running':** `Bash: sleep 2`. Then go to step 1.
+6. **If step 1's SELECT returned zero rows AND status was 'running':** before sleeping, check that the detached Python process is still alive — otherwise an empty queue + a permanently-`running` run row spins this loop forever (dead-run trap). Run the same `python_heartbeat` query as step 3:
+
+   ```bash
+   cd "$KAIZEN_ROOT" && sqlite3 .ai/bridge.db \
+     "PRAGMA busy_timeout = 5000; \
+      SELECT (julianday('now') - julianday(last_beat_at)) * 86400 \
+      FROM python_heartbeat WHERE run_id = <RUN_ID>;"
+   ```
+
+   - Result ≤ 60 (or the run just started and Python has not had time to beat yet — allow a 120s grace from the detached spawn) → Python is alive: `Bash: sleep 2`, then go to step 1.
+   - Result > 60 OR no row after the grace period → the detached Python process is dead. **Exit the poll loop.** Surface the dead-run diagnostic to the user (last heartbeat age, run_id, pointer to the `nohup` log), finalize the run as failed if the run row is still `running`, and proceed to the PR-open / teardown decision with the clone preserved for recovery. Do NOT keep polling a dead run.
 
 **Parallel-tool-call note.** Rev 4 default: SEQUENTIAL per row. The upgrade trigger is documented in the "Decisions pinned in Rev 4" section: when the Phase 4 wave-dispatch parallel-fanout test lands in `team_executor.py`, switch to **option (b) — parallel for `send_message` only** (idempotent failure mode, independent recipients). Until then, the queue is drained one row at a time per turn.

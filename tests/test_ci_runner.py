@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import subprocess as real_subprocess
 import types
+from pathlib import Path
+
+import pytest
 
 from scripts import ci_runner
 from scripts.ci_runner import (
@@ -584,3 +587,200 @@ def test_all_results_use_uniform_dict_shape(tmp_path, monkeypatch):
 
 # Sentinel: keep linter happy about an otherwise-unused import.
 assert isinstance(types.ModuleType, type)
+
+
+# ── subprocess timeouts (Finding 1) ───────────────────────────────────────
+#
+# Every subprocess.run call site must pass a positive ``timeout=`` and convert
+# subprocess.TimeoutExpired into the module's reason-coded FAIL pattern
+# (tests_timeout / ruff_check_timeout / ruff_format_timeout / bandit_timeout /
+# pip_audit_timeout) instead of letting the exception propagate.
+
+
+def test_tests_check_passes_positive_timeout(tmp_path, monkeypatch):
+    """The pytest/tests subprocess.run call must carry a positive timeout."""
+    clone = tmp_path / "c"
+    clone.mkdir()
+    (clone / "pyproject.toml").write_text('[project]\nname = "x"\n')
+
+    seen_kwargs: list[dict] = []
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "pytest":
+            seen_kwargs.append(kwargs)
+        return _mk_completed(0, "", "")
+
+    monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
+    monkeypatch.setenv("KAIZEN_SKIP_PIP_AUDIT", "1")
+    run_ci_checks(clone, "pytest -q")
+    assert len(seen_kwargs) == 1
+    timeout = seen_kwargs[0].get("timeout")
+    assert timeout is not None, "tests subprocess.run has no timeout="
+    assert timeout > 0
+    assert timeout == ci_runner._TESTS_TIMEOUT_S
+
+
+def test_ruff_bandit_pip_audit_pass_expected_timeouts(tmp_path, monkeypatch):
+    """ruff + bandit use _TOOL_TIMEOUT_S; pip-audit uses _AUDIT_TIMEOUT_S."""
+    clone = tmp_path / "c"
+    (clone / ".github" / "workflows").mkdir(parents=True)
+    (clone / ".github" / "workflows" / "ci.yml").write_text("run: pip-audit\n")
+    (clone / "requirements.txt").write_text("a==1.0\n")
+    (clone / "pyproject.toml").write_text(
+        '[project]\nname = "x"\n\n[tool.ruff]\nline-length = 100\n\n[tool.bandit]\nskips = []\n'
+    )
+
+    seen: dict[str, object] = {}
+
+    def fake_run(argv, *args, **kwargs):
+        if argv:
+            seen.setdefault(argv[0], kwargs.get("timeout"))
+        return _mk_completed(0, "", "")
+
+    monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
+    monkeypatch.delenv("KAIZEN_SKIP_PIP_AUDIT", raising=False)
+    run_ci_checks(clone, "true")
+    assert seen["ruff"] == ci_runner._TOOL_TIMEOUT_S
+    assert seen["bandit"] == ci_runner._TOOL_TIMEOUT_S
+    assert seen["pip-audit"] == ci_runner._AUDIT_TIMEOUT_S
+    for binary in ("ruff", "bandit", "pip-audit"):
+        assert seen[binary] is not None and seen[binary] > 0
+
+
+def _clone_tests_only(tmp_path):
+    clone = tmp_path / "c"
+    clone.mkdir()
+    (clone / "pyproject.toml").write_text('[project]\nname = "x"\n')
+    return clone
+
+
+def _clone_bandit_only(tmp_path):
+    clone = tmp_path / "c"
+    clone.mkdir()
+    (clone / "bandit.yaml").write_text("skips: []\n")
+    return clone
+
+
+def _clone_pip_audit_only(tmp_path):
+    clone = tmp_path / "c"
+    (clone / ".github" / "workflows").mkdir(parents=True)
+    (clone / ".github" / "workflows" / "ci.yml").write_text("run: pip-audit\n")
+    (clone / "requirements.txt").write_text("a==1.0\n")
+    return clone
+
+
+def _clone_ruff_only(tmp_path):
+    clone = tmp_path / "c"
+    clone.mkdir()
+    (clone / "pyproject.toml").write_text(
+        '[project]\nname = "x"\n\n[tool.ruff]\nline-length = 100\n'
+    )
+    return clone
+
+
+@pytest.mark.parametrize(
+    ("builder", "binary", "result_key", "reason"),
+    [
+        (_clone_tests_only, "pytest", "tests", "tests_timeout"),
+        (_clone_bandit_only, "bandit", "bandit", "bandit_timeout"),
+        (_clone_pip_audit_only, "pip-audit", "pip_audit", "pip_audit_timeout"),
+        (_clone_ruff_only, "ruff", "ruff_check", "ruff_check_timeout"),
+        (_clone_ruff_only, "ruff", "ruff_format", "ruff_format_timeout"),
+    ],
+)
+def test_timeout_expired_converts_to_reason_coded_fail(
+    tmp_path, monkeypatch, builder, binary, result_key, reason
+):
+    """TimeoutExpired must become a FAIL with a *_timeout reason and partial
+    output (bytes streams decoded defensively), and all_passed must be False.
+
+    Pre-fix: subprocess.TimeoutExpired propagates out of run_ci_checks.
+    """
+    clone = builder(tmp_path)
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == binary:
+            raise real_subprocess.TimeoutExpired(
+                cmd=argv,
+                timeout=kwargs.get("timeout") or 1,
+                output=b"partial stdout bytes",
+                stderr=b"partial stderr bytes",
+            )
+        return _mk_completed(0, "", "")
+
+    monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
+    monkeypatch.delenv("KAIZEN_SKIP_PIP_AUDIT", raising=False)
+    monkeypatch.delenv("KAIZEN_SKIP_CHECKS", raising=False)
+
+    test_command = "pytest -q" if binary == "pytest" else "true"
+    all_passed, results = run_ci_checks(clone, test_command)
+    assert results[result_key]["status"] == "fail"
+    assert results[result_key]["reason"] == reason
+    # Partial output captured by TimeoutExpired must be surfaced (decoded).
+    assert "partial stdout bytes" in results[result_key]["output"]
+    assert "partial stderr bytes" in results[result_key]["output"]
+    assert all_passed is False
+
+
+def test_timeout_env_helper_parses_override_and_falls_back(monkeypatch):
+    """_parse_timeout_env: valid positive int wins; invalid / <=0 fall back."""
+    monkeypatch.setenv("KAIZEN_CI_TESTS_TIMEOUT_S", "42")
+    assert ci_runner._parse_timeout_env("KAIZEN_CI_TESTS_TIMEOUT_S", 1800) == 42
+    monkeypatch.setenv("KAIZEN_CI_TESTS_TIMEOUT_S", "not-a-number")
+    assert ci_runner._parse_timeout_env("KAIZEN_CI_TESTS_TIMEOUT_S", 1800) == 1800
+    monkeypatch.setenv("KAIZEN_CI_TESTS_TIMEOUT_S", "0")
+    assert ci_runner._parse_timeout_env("KAIZEN_CI_TESTS_TIMEOUT_S", 1800) == 1800
+    monkeypatch.setenv("KAIZEN_CI_TESTS_TIMEOUT_S", "-5")
+    assert ci_runner._parse_timeout_env("KAIZEN_CI_TESTS_TIMEOUT_S", 1800) == 1800
+    monkeypatch.delenv("KAIZEN_CI_TESTS_TIMEOUT_S", raising=False)
+    assert ci_runner._parse_timeout_env("KAIZEN_CI_TESTS_TIMEOUT_S", 1800) == 1800
+
+
+def test_timeout_defaults(monkeypatch):
+    """Documented defaults: tests=1800, tool=300, audit=600. Asserted via
+    _parse_timeout_env with the env vars cleared, so the test asserts the
+    same thing regardless of host environment."""
+    monkeypatch.delenv("KAIZEN_CI_TESTS_TIMEOUT_S", raising=False)
+    monkeypatch.delenv("KAIZEN_CI_TOOL_TIMEOUT_S", raising=False)
+    monkeypatch.delenv("KAIZEN_CI_AUDIT_TIMEOUT_S", raising=False)
+    assert ci_runner._parse_timeout_env("KAIZEN_CI_TESTS_TIMEOUT_S", 1800) == 1800
+    assert ci_runner._parse_timeout_env("KAIZEN_CI_TOOL_TIMEOUT_S", 300) == 300
+    assert ci_runner._parse_timeout_env("KAIZEN_CI_AUDIT_TIMEOUT_S", 600) == 600
+    # Module constants are sane positive ints whatever the host env says.
+    assert ci_runner._TESTS_TIMEOUT_S > 0
+    assert ci_runner._TOOL_TIMEOUT_S > 0
+    assert ci_runner._AUDIT_TIMEOUT_S > 0
+
+
+# ── parse_pytest_pass_count (Finding 2 — asset migrated from test_runner) ──
+
+
+def test_parse_pytest_pass_count_multiline_output():
+    output = (
+        "============================= test session starts =====\n"
+        "collected 5 items\n"
+        "tests/test_x.py .....\n"
+        "============================== 5 passed in 0.12s ======\n"
+    )
+    assert ci_runner.parse_pytest_pass_count(output) == 5
+
+
+def test_parse_pytest_pass_count_with_warnings_variant():
+    output = "======================== 7 passed, 1 warning in 0.34s ========================\n"
+    assert ci_runner.parse_pytest_pass_count(output) == 7
+
+
+def test_parse_pytest_pass_count_no_match_returns_zero():
+    assert ci_runner.parse_pytest_pass_count("cargo test: ok. 12 passed; 0 failed\n") == 0
+    assert ci_runner.parse_pytest_pass_count("") == 0
+
+
+# ── anti-resurrection guard (Finding 2 — test_runner.py deleted) ──────────
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def test_test_runner_module_stays_deleted():
+    """scripts/test_runner.py was dead code, deleted after migrating its one
+    asset (parse_pytest_pass_count) into ci_runner. Keep it deleted."""
+    assert not (REPO_ROOT / "scripts" / "test_runner.py").exists()

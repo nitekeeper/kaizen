@@ -200,6 +200,9 @@ class TestBuildAndIngestSkips:
 class TestBuildAndIngestHappyPath:
     def test_ingested_with_parsed_counts(self, monkeypatch, tmp_path):
         monkeypatch.delenv(codegraph_recon._CODEGRAPH_ENV, raising=False)
+        # Canary credentials: must NOT leak into the graphify subprocess env.
+        monkeypatch.setenv("GH_TOKEN", "ghp_canary-token")
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-canary-key")
         monkeypatch.setattr(codegraph_recon.shutil, "which", lambda n: "/usr/bin/graphify")
         memex_root = tmp_path / "memex"
         memex_root.mkdir()
@@ -250,6 +253,15 @@ class TestBuildAndIngestHappyPath:
         # path must be absolute (it runs in a different cwd).
         assert g_argv[2] == str(clone.resolve())
         assert g_kw["env"].get("PYTHONPATH") != str(memex_root)
+        # SECURITY (graphify env allowlist): graphify processes an UNTRUSTED
+        # clone — ambient credentials must not reach it. PATH must still be
+        # forwarded verbatim (allowlisted, not over-scrubbed), and PYTHONPATH
+        # must never be set at all (PR #102: forcing memex's PYTHONPATH broke
+        # graphify).
+        assert "GH_TOKEN" not in g_kw["env"], "GH_TOKEN leaked into graphify env"
+        assert "ANTHROPIC_API_KEY" not in g_kw["env"], "API key leaked into graphify env"
+        assert g_kw["env"]["PATH"] == os.environ["PATH"]
+        assert "PYTHONPATH" not in g_kw["env"]
         # Clone kept clean: graphify-out removed after ingest.
         assert not (clone / "graphify-out").exists()
 
@@ -391,6 +403,24 @@ class TestCli:
         # exit 0 and print a JSON status (the skip path), never a traceback.
         repo_root = Path(__file__).resolve().parent.parent
         env = {**os.environ, "PYTHONPATH": ".", "KAIZEN_CODEGRAPH": "0"}
+        proc = subprocess.run(
+            [sys.executable, "scripts/codegraph_recon.py", "build", str(tmp_path), "o/r"],
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 0, proc.stderr
+        status = json.loads(proc.stdout.strip())
+        assert status["status"] == "skipped"
+
+    def test_subprocess_invocation_without_pythonpath(self, tmp_path):
+        """REGRESSION: internal/cycle/SKILL.md invokes the CLI as bare
+        `python3 scripts/codegraph_recon.py ...` (no PYTHONPATH). The
+        plugin_cache import must not break that entrypoint."""
+        repo_root = Path(__file__).resolve().parent.parent
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        env["KAIZEN_CODEGRAPH"] = "0"
         proc = subprocess.run(
             [sys.executable, "scripts/codegraph_recon.py", "build", str(tmp_path), "o/r"],
             cwd=repo_root,

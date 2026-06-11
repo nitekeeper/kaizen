@@ -34,7 +34,7 @@ Phase 2 (Pre-analysis). You are {{ participant }}. Agenda from PM:
 Produce a short proposal touching each item from your domain lens. Prefix 'ABANDON:' to opt out.
 
 {{# if CODEGRAPH_AVAILABLE #}}
-A code-nav graph was built for this repo (Step 3.5). PREFER it over grep + full-file reads for where-is / callers / dependencies / neighbors / module-map: run `python3 scripts/codegraph_recon.py where-is <repo> <symbol>` (and callers / deps / neighbors / module-map) from the kaizen root. It returns locations (file:line) as JSON, not file bodies — read a file only when you need its contents.
+A code-nav graph was built for this repo (Step 3.5). PREFER it over grep + full-file reads for where-is / callers / dependencies / neighbors / module-map: run `PYTHONPATH=. python3 scripts/codegraph_recon.py where-is <repo> <symbol>` (and callers / deps / neighbors / module-map) from the kaizen root. It returns locations (file:line) as JSON, not file bodies — read a file only when you need its contents.
 {{# endif #}}
 
 {{ include: _untrusted_input_boundary.md }}

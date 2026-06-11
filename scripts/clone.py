@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from scripts.git_utils import GitCommandError
 from scripts.git_utils import git as _git
 from scripts.platform_utils import safe_rmtree
 
@@ -28,13 +29,24 @@ def clone_repo(remote_url: str, dest: Path, branch: str) -> None:
     if not branch:
         raise ValueError("branch must be a non-empty string")
     dest.parent.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
+    # Raw call (no cwd — dest does not exist yet) with the same enrichment as
+    # git_utils.git(): clone failures (auth/bad URL/network) are the worst
+    # offender for opaque str(exc) on the run.py critical path.
+    result = subprocess.run(
         ["git", "clone", "-b", branch, remote_url, str(dest)],
-        check=True,
+        check=False,
         capture_output=True,
         text=True,
         encoding="utf-8",
     )
+    if result.returncode != 0:
+        raise GitCommandError(
+            result.returncode,
+            result.args,
+            cwd=dest.parent,
+            output=result.stdout,
+            stderr=result.stderr,
+        )
     _git(["config", "user.email", "kaizen@kaizen.local"], dest)
     _git(["config", "user.name", "Kaizen"], dest)
 

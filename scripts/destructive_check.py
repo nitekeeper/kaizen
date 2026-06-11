@@ -73,8 +73,19 @@ def _check_deleted_files(diff_text: str, repo_dir: Path) -> list[dict]:
 
 
 def _check_removed_public_functions(diff_text: str) -> list[dict]:
-    """Flag removed top-level public function definitions (not starting with _)."""
-    issues = []
+    """Flag removed top-level public function definitions (not starting with _).
+
+    Two-pass per-file pairing: a ``-def name`` line is only flagged when the
+    SAME file's diff does not also add a ``+def name`` — a removed/added pair
+    is a signature change (or in-file move), not a removal. Renames still
+    flag the old name; a cross-file move still flags the removal in the
+    source file (a same-name ``+def`` in another file does not suppress it).
+    """
+    removed_re = re.compile(r"^-(?:async\s+)?def ([a-zA-Z][a-zA-Z0-9_]*)\(")
+    added_re = re.compile(r"^\+(?:async\s+)?def ([a-zA-Z][a-zA-Z0-9_]*)\(")
+    # Pass 1 — collect removed/added def names per file.
+    removed_by_file: dict[str, list[str]] = {}
+    added_by_file: dict[str, set[str]] = {}
     current_file = "unknown"
     for line in diff_text.splitlines():
         header = re.match(r"^diff --git a/(.+?) b/\1$", line)
@@ -82,13 +93,25 @@ def _check_removed_public_functions(diff_text: str) -> list[dict]:
             current_file = header.group(1)
         if Path(current_file).suffix.lower() != ".py":
             continue
-        m = re.match(r"^-(?:async\s+)?def ([a-zA-Z][a-zA-Z0-9_]*)\(", line)
+        m = removed_re.match(line)
         if m:
+            removed_by_file.setdefault(current_file, []).append(m.group(1))
+            continue
+        m = added_re.match(line)
+        if m:
+            added_by_file.setdefault(current_file, set()).add(m.group(1))
+    # Pass 2 — flag only removals with no same-name +def in the same file.
+    issues = []
+    for filepath, names in removed_by_file.items():
+        added_names = added_by_file.get(filepath, set())
+        for name in names:
+            if name in added_names:
+                continue
             issues.append(
                 {
                     "type": "removed_public_function",
-                    "description": f"Public function '{m.group(1)}' was removed",
-                    "file": current_file,
+                    "description": f"Public function '{name}' was removed",
+                    "file": filepath,
                 }
             )
     return issues

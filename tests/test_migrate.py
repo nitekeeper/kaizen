@@ -83,6 +83,90 @@ def test_apply_migrations_closes_connection_on_error(tmp_path, monkeypatch):
         conn.close()
 
 
+# ── Atomic per-migration bookkeeping ───────────────────────────────────────
+
+
+def test_applied_but_unrecorded_migration_recovers(tmp_path):
+    """Iron-Law test: a DB where 001 ran but its bookkeeping row was never
+    written (the historic crash window) must recover on the next
+    apply_migrations instead of wedging on 'table projects already exists'."""
+    db_path = str(tmp_path / "test.db")
+    sql_001 = (MIGRATIONS_DIR / "001_kaizen_schema.sql").read_text()
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.executescript(sql_001)  # applied, but NOT recorded
+    finally:
+        conn.close()
+
+    apply_migrations(db_path, MIGRATIONS_DIR)  # must not raise
+
+    with closing(get_connection(db_path)) as conn:
+        count = conn.execute("SELECT COUNT(*) FROM migrations").fetchone()[0]
+    assert count == 6
+
+
+def test_failed_migration_leaves_no_partial_state(tmp_path):
+    """Iron-Law test: a migration that fails mid-script must roll back its own
+    statements AND must not be recorded as applied."""
+    db_path = str(tmp_path / "test.db")
+    bad_dir = tmp_path / "migrations"
+    bad_dir.mkdir()
+    (bad_dir / "001_ok.sql").write_text("CREATE TABLE ok_table (x INTEGER);\n")
+    # Second CREATE of the same table fails after the first succeeded.
+    (bad_dir / "002_bad.sql").write_text(
+        "CREATE TABLE partial_table (x INTEGER);\nCREATE TABLE partial_table (x INTEGER);\n"
+    )
+
+    with pytest.raises(sqlite3.Error):
+        apply_migrations(db_path, bad_dir)
+
+    with closing(get_connection(db_path)) as conn:
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        recorded = {r[0] for r in conn.execute("SELECT filename FROM migrations")}
+    assert "ok_table" in tables  # earlier migration committed
+    assert "partial_table" not in tables  # pre-fix: first statement autocommitted
+    assert "001_ok.sql" in recorded
+    assert "002_bad.sql" not in recorded
+
+
+def test_statement_path_yields_same_schema_as_executescript(tmp_path):
+    """Safety net: the statement-splitting path produces byte-identical schema
+    to a plain executescript of all six shipped migrations."""
+    baseline_path = str(tmp_path / "baseline.db")
+    conn = sqlite3.connect(baseline_path)
+    try:
+        for f in sorted(MIGRATIONS_DIR.glob("*.sql")):
+            conn.executescript(f.read_text())
+    finally:
+        conn.close()
+
+    db_path = str(tmp_path / "new.db")
+    apply_migrations(db_path, MIGRATIONS_DIR)
+
+    def schema(path):
+        with closing(sqlite3.connect(path)) as c:
+            return {
+                (r[0], r[1], r[2])
+                for r in c.execute(
+                    "SELECT type, name, sql FROM sqlite_master "
+                    "WHERE name NOT LIKE 'sqlite_%' AND name != 'migrations'"
+                )
+            }
+
+    assert schema(db_path) == schema(baseline_path)
+
+
+def test_split_sql_handles_every_shipped_migration():
+    """Each shipped migration splits into at least one executable statement."""
+    from scripts.migrate import _split_sql
+
+    files = sorted(MIGRATIONS_DIR.glob("*.sql"))
+    assert len(files) == 6
+    for f in files:
+        statements = _split_sql(f.read_text())
+        assert len(statements) >= 1, f.name
+
+
 def _insert_project(conn, git_url="https://github.com/owner/repo.git", name="repo"):
     conn.execute(
         "INSERT INTO projects (git_url, name, test_command, read_paths, expert_roster, registered_at) "

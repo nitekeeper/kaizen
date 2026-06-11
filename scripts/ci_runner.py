@@ -1,8 +1,8 @@
 """Run target-repo CI checks locally in a clone (tests + lint + security).
 
-Separate from scripts/test_runner.py — that module's contract is "run the test
-command and count passed tests"; this module's contract is "run every CI check
-the target repo defines and return per-check results."
+This module's contract is "run every CI check the target repo defines and
+return per-check results" (plus ``parse_pytest_pass_count`` for callers that
+need a pass-count from captured pytest output).
 
 Supports:
 
@@ -48,6 +48,30 @@ from typing import Any
 _KAIZEN_SKIP_CHECKS_ENV = "KAIZEN_SKIP_CHECKS"
 _KAIZEN_SKIP_PIP_AUDIT_ENV = "KAIZEN_SKIP_PIP_AUDIT"
 _SKIP_OPT_OUT_REASON = "opted out via KAIZEN_SKIP_CHECKS"
+
+
+def _parse_timeout_env(env_var: str, default: int) -> int:
+    """Parse a positive-integer timeout (seconds) from ``env_var``.
+
+    Falls back to ``default`` when the variable is unset, not an integer,
+    or <= 0 — a misconfigured override must never disable the timeout.
+    """
+    raw = os.environ.get(env_var, "").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+# Subprocess timeouts (seconds). Every subprocess.run call site in this module
+# passes one of these so a hung tool cannot wedge the whole CI mirror; on
+# expiry the check FAILs with a reason-coded ``*_timeout`` result instead of
+# the exception propagating. Env-overridable per class of check (read once at
+# import time — set KAIZEN_CI_*_TIMEOUT_S before the process starts).
+_TESTS_TIMEOUT_S = _parse_timeout_env("KAIZEN_CI_TESTS_TIMEOUT_S", 1800)
+_TOOL_TIMEOUT_S = _parse_timeout_env("KAIZEN_CI_TOOL_TIMEOUT_S", 300)  # ruff + bandit
+_AUDIT_TIMEOUT_S = _parse_timeout_env("KAIZEN_CI_AUDIT_TIMEOUT_S", 600)  # pip-audit
 
 # F3 — pip-audit infra-failure detection. pip-audit shells out to build a
 # temp venv; on hosts that lack `python3-venv` (or whose pip cannot reach
@@ -105,6 +129,49 @@ def _result(status: str, output: str = "", reason: str | None = None) -> CheckRe
     if reason is not None:
         r["reason"] = reason
     return r
+
+
+def _decode_stream(value: str | bytes | None) -> str:
+    """Defensively decode a captured stream from TimeoutExpired.
+
+    ``TimeoutExpired.stdout`` / ``.stderr`` may be BYTES even when the run
+    used ``text=True`` (the partial buffers are handed back raw), so decode
+    with errors="replace" rather than assuming str.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def _timeout_output(exc: subprocess.TimeoutExpired) -> str:
+    """Render a TimeoutExpired into a check ``output`` string.
+
+    Includes whatever partial stdout/stderr the process produced before it
+    was killed — that partial output is usually the only triage signal.
+    """
+    partial = _decode_stream(exc.stdout) + _decode_stream(exc.stderr)
+    header = f"command timed out after {exc.timeout}s: {exc.cmd!r}\n"
+    return header + partial
+
+
+def parse_pytest_pass_count(output: str) -> int:
+    """Parse the number of passed tests from captured pytest output.
+
+    Matches pytest's summary separator line (e.g. ``=== 5 passed in 0.12s ===``
+    or ``=== 7 passed, 1 warning in 0.34s ===``) via ``r"={3,}\\s+(\\d+) passed"``
+    and returns the first match; returns 0 when no match is found.
+
+    NOTE: pytest-specific. Other test runners (npm, cargo, go test) produce
+    different output and will yield 0 even when passing. When kaizen supports
+    non-pytest runners, add per-runner parsers here.
+    """
+    for line in output.splitlines():
+        m = re.search(r"={3,}\s+(\d+) passed", line)
+        if m:
+            return int(m.group(1))
+    return 0
 
 
 def _has_ruff_config(clone_dir: Path) -> bool:
@@ -211,7 +278,10 @@ def _run_bandit(clone_dir: Path, config: Path) -> CheckResult:
             encoding="utf-8",
             errors="replace",
             check=False,
+            timeout=_TOOL_TIMEOUT_S,
         )
+    except subprocess.TimeoutExpired as exc:
+        return _result(FAIL, output=_timeout_output(exc), reason="bandit_timeout")
     except FileNotFoundError:
         # F2 (audit cleanup): a missing bandit binary is a HOST tooling gap,
         # not a finding in the target's code — return SKIP so the cycle does
@@ -296,7 +366,10 @@ def _run_pip_audit(clone_dir: Path) -> CheckResult:
             encoding="utf-8",
             errors="replace",
             check=False,
+            timeout=_AUDIT_TIMEOUT_S,
         )
+    except subprocess.TimeoutExpired as exc:
+        return _result(FAIL, output=_timeout_output(exc), reason="pip_audit_timeout")
     except FileNotFoundError:
         # F2 parity: a missing pip-audit binary is a HOST tooling gap, not
         # a finding — return SKIP so the cycle does not abandon. Install
@@ -379,10 +452,17 @@ def run_ci_checks(
                 encoding="utf-8",
                 errors="replace",
                 check=False,
+                timeout=_TESTS_TIMEOUT_S,
             )
             results["tests"] = _result(
                 PASS if proc.returncode == 0 else FAIL,
                 output=(proc.stdout or "") + (proc.stderr or ""),
+            )
+        except subprocess.TimeoutExpired as exc:
+            results["tests"] = _result(
+                FAIL,
+                output=_timeout_output(exc),
+                reason="tests_timeout",
             )
         except FileNotFoundError:
             # F5: the test-runner binary isn't on PATH. This is a host
@@ -426,10 +506,17 @@ def run_ci_checks(
                     encoding="utf-8",
                     errors="replace",
                     check=False,
+                    timeout=_TOOL_TIMEOUT_S,
                 )
                 results[name] = _result(
                     PASS if r.returncode == 0 else FAIL,
                     output=(r.stdout or "") + (r.stderr or ""),
+                )
+            except subprocess.TimeoutExpired as exc:
+                results[name] = _result(
+                    FAIL,
+                    output=_timeout_output(exc),
+                    reason=f"{name}_timeout",
                 )
             except FileNotFoundError:
                 # F1 (audit cleanup): a missing ruff binary is a HOST tooling

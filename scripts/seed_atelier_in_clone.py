@@ -16,6 +16,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+try:
+    from scripts.plugin_cache import newest_version_dir
+except ImportError:  # standalone `python3 scripts/seed_atelier_in_clone.py ...`
+    # (sys.path[0] is scripts/, so the sibling module imports flat).
+    from plugin_cache import newest_version_dir
+
 # ── Locate atelier ─────────────────────────────────────────────────────────
 
 _AGORA_ATELIER = Path.home() / ".claude" / "plugins" / "cache" / "agora" / "atelier"
@@ -29,8 +35,10 @@ def _looks_like_atelier(candidate: Path) -> bool:
 def find_atelier_root() -> Path:
     """Resolve atelier's root from the Agora plugin cache.
 
-    Picks the highest-sorted version directory under
-    ~/.claude/plugins/cache/agora/atelier/ that contains the required markers.
+    Picks the numerically-highest version directory under
+    ~/.claude/plugins/cache/agora/atelier/ that contains the required markers
+    (numeric semver compare via :func:`scripts.plugin_cache.newest_version_dir`
+    — lexicographic sort would rank ``2.9.0`` above ``2.10.0``).
     Raises RuntimeError when not found.
     """
     if not _AGORA_ATELIER.is_dir():
@@ -38,14 +46,9 @@ def find_atelier_root() -> Path:
             f"Atelier plugin cache not found at {_AGORA_ATELIER}. "
             "Install Atelier via Agora before running Kaizen."
         )
-    versions = sorted(
-        (d for d in _AGORA_ATELIER.iterdir() if d.is_dir()),
-        key=lambda p: p.name,
-        reverse=True,
-    )
-    for candidate in versions:
-        if _looks_like_atelier(candidate):
-            return candidate
+    candidate = newest_version_dir(_AGORA_ATELIER, _looks_like_atelier)
+    if candidate is not None:
+        return candidate
     raise RuntimeError(
         f"No valid Atelier installation found in {_AGORA_ATELIER}. Reinstall Atelier via Agora."
     )

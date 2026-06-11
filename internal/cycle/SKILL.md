@@ -75,7 +75,7 @@ Return a dict:
   "subject": "<cycle subject or None>",
   "participants": ["<agent_name>", ...],
   "phase_reached": "agenda" | "meeting" | "implementation" | "test" | "review" | "push",
-  "reason": "no_consensus" | "destructive_rejected" | "tests_unrecoverable" | "review_unrecoverable" | "other",
+  "reason": "no_consensus" | "destructive_rejected" | "tests_unrecoverable" | "review_unrecoverable" | "lint_failed" | "security_failed" | "sca_failed" | "bridge_timeout" | "other",
   "detail": "<free-text describing what was attempted and what blocked it>",
   "artifacts": ["<memex slug or path>", ...],
 }
@@ -105,7 +105,7 @@ If `internal/pm-agenda` returns no agenda items (e.g., the PM finds nothing wort
 Dispatch every participant in parallel (one agent per role from the resolved roster). Each agent independently:
 
 1. Reads the files in `project["read_paths"]` that are relevant to their domain (no need to re-read every file).
-   - **Code-nav graph (best-effort).** If a code-nav graph was built for this repo (Step 3.5 in `internal/run/SKILL.md`), PREFER it over grep + full-file reads for where-is / callers / dependencies / neighbors / module-map: run `python3 scripts/codegraph_recon.py where-is <repo> <symbol>` (and `callers` / `deps` / `neighbors` / `module-map`) from the kaizen root. It returns locations (file:line) as JSON, not file bodies — read a file only when you need its contents. If the graph was skipped (graphify/memex>=2.9.0 absent, or `KAIZEN_CODEGRAPH=0`), fall back to grep as usual.
+   - **Code-nav graph (best-effort).** If a code-nav graph was built for this repo (Step 3.5 in `internal/run/SKILL.md`), PREFER it over grep + full-file reads for where-is / callers / dependencies / neighbors / module-map: run `PYTHONPATH=. python3 scripts/codegraph_recon.py where-is <repo> <symbol>` (and `callers` / `deps` / `neighbors` / `module-map`) from the kaizen root. It returns locations (file:line) as JSON, not file bodies — read a file only when you need its contents. If the graph was skipped (graphify/memex>=2.9.0 absent, or `KAIZEN_CODEGRAPH=0`), fall back to grep as usual.
 2. Writes a structured proposal addressing the agenda items they have an opinion on:
    - **Finding** — specific files, patterns, problems they observed.
    - **Proposal** — concrete change and rationale.
@@ -211,7 +211,7 @@ If, after all rejections, the working tree is clean (no remaining changes), aban
 ### Phase 5b — Tests (with in-cycle fix iteration)
 
 ```
-python3 -c "
+PYTHONPATH=. python3 -c "
 from pathlib import Path
 from scripts.ci_runner import run_ci_checks
 all_passed, results = run_ci_checks(Path(r'<clone_dir>'), '<project[\"test_command\"]>')
@@ -362,7 +362,7 @@ When abandoning, also revert the working tree (`git reset --hard HEAD`) so the n
 Compile the decisions and participants into the inputs the commit helper expects, then:
 
 ```
-python3 -c "
+PYTHONPATH=. python3 -c "
 from pathlib import Path
 from scripts.cycle_git import commit_cycle
 commit_cycle(
@@ -379,7 +379,7 @@ commit_cycle(
 
 Capture the resulting commit sha (`git -C <clone_dir> rev-parse HEAD`).
 
-Also write the full meeting minutes into the clone at the same relative path before committing — the commit message references it.
+Do **NOT** write the minutes file into the clone before committing — `commit_cycle` runs `git add -A` in the clone, so a minutes file there would land in the target repo's PR diff. Minutes are process artifacts whose canonical store is **Memex** (Phase 5d); the `minutes_rel_path` in the commit message is a reference label naming the Memex-captured artifact, not a file in the commit.
 
 ### Phase 5d — Minutes (captured to Memex; not committed to git)
 
@@ -402,7 +402,7 @@ Return the success dict described under "Outcome (return)" with the slug, commit
 ## Hard rules
 
 - **In-cycle test fix iteration is mandatory.** Do not escalate a test failure to "next cycle" until the agents have actually attempted to repair it (typically up to 3 rounds).
-- **Abandonment is structured.** Always return a dict with a `reason` from the five named codes (`no_consensus`, `destructive_rejected`, `tests_unrecoverable`, `review_unrecoverable`, `other`). The orchestrator depends on this for the abandonment report.
+- **Abandonment is structured.** Always return a dict with a `reason` from the nine named codes mirrored in `scripts/abandonment.py::VALID_REASONS` (`no_consensus`, `destructive_rejected`, `tests_unrecoverable`, `review_unrecoverable`, `lint_failed`, `security_failed`, `sca_failed`, `bridge_timeout`, `other`). The orchestrator depends on this for the abandonment report.
 - **Working tree must be clean at cycle end** — committed (success path) or reset (abandon path). The next cycle inherits the same clone; an unclean tree leaks state.
 - **Unanimous consensus is required** (synthesis meeting). Anything less drops the item; if every item drops, the cycle abandons.
 - **Destructive changes require explicit user approval** — never bypass the destructive check, even when the user has pre-authorized other parts of the flow.

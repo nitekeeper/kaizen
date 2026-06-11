@@ -60,6 +60,48 @@ def create_branch(clone_dir: Path, subject: str | None) -> str:
     return branch
 
 
+def _tracked_under(clone_dir: Path, rel: str) -> bool:
+    """Return True when git tracks any file at/under ``rel`` in the clone.
+
+    Uses ``git ls-files -- <rel>`` (empty stdout ⇒ nothing tracked).
+    """
+    result = _git(["ls-files", "--", rel], clone_dir)
+    return bool(result.stdout.strip())
+
+
+def _strip_transient_dirs(clone_dir: Path) -> None:
+    """Delete kaizen-transient dirs from the clone — but ONLY untracked ones.
+
+    The target repo may legitimately track files under ``.ai/`` (or even a
+    checked-in ``__pycache__``-named path); deleting tracked files before
+    ``git add -A`` would commit destructive DELETIONS of target-owned files
+    into the kaizen PR. Tracked paths are left in place (with a stderr
+    warning for ``.ai``). ``__pycache__`` / ``.pytest_cache`` are stripped
+    RECURSIVELY (they nest under packages), skipping anything inside .git/.
+    """
+    ai_dir = clone_dir / ".ai"
+    if ai_dir.exists():
+        if _tracked_under(clone_dir, ".ai"):
+            print(
+                f"kaizen: warning — leaving {ai_dir} in place: the target repo "
+                f"tracks files under .ai/ and kaizen must not commit their deletion",
+                file=sys.stderr,
+            )
+        else:
+            shutil.rmtree(ai_dir, ignore_errors=True)
+    for name in ("__pycache__", ".pytest_cache"):
+        # Materialize before deleting — rglob is lazy and we mutate the tree.
+        for path in list(clone_dir.rglob(name)):
+            rel_parts = path.relative_to(clone_dir).parts
+            if ".git" in rel_parts:
+                continue
+            if not path.is_dir():
+                continue
+            if _tracked_under(clone_dir, path.relative_to(clone_dir).as_posix()):
+                continue
+            shutil.rmtree(path, ignore_errors=True)
+
+
 def commit_cycle(
     clone_dir: Path,
     cycle_n: int,
@@ -70,11 +112,9 @@ def commit_cycle(
     minutes_rel_path: str,
 ) -> None:
     """Stage all changes and produce the standard kaizen cycle commit."""
-    # Strip transient dirs so they never reach the PR diff
-    for transient in (".ai", "__pycache__", ".pytest_cache"):
-        path = clone_dir / transient
-        if path.exists():
-            shutil.rmtree(path, ignore_errors=True)
+    # Strip transient dirs so they never reach the PR diff (untracked only —
+    # see _strip_transient_dirs for the tracked-file safety contract).
+    _strip_transient_dirs(clone_dir)
     _git(["add", "-A"], clone_dir)
     summary = decisions[0] if decisions else "improvements applied"
     decisions_text = "\n".join(f"  {i + 1}. {d}" for i, d in enumerate(decisions))

@@ -213,6 +213,59 @@ def test_cli_list_against_empty_db_returns_empty_array(tmp_path):
     assert json.loads(proc.stdout) == []
 
 
+# ── _register_cli URL validation gate ──────────────────────────────────────
+
+
+def _arm_register_sentinels(monkeypatch):
+    """Sentinels that blow up if _register_cli proceeds past URL validation."""
+    from scripts import clone as clone_mod
+    from scripts import project as project_mod
+
+    def _detect_sentinel(*args, **kwargs):
+        raise AssertionError("_detect_base_branch must not be reached for a rejected URL")
+
+    def _clone_sentinel(*args, **kwargs):
+        raise AssertionError("clone_repo must not be reached for a rejected URL")
+
+    monkeypatch.setattr(project_mod, "_detect_base_branch", _detect_sentinel)
+    monkeypatch.setattr(clone_mod, "clone_repo", _clone_sentinel)
+
+
+def test_register_cli_rejects_unparseable_url(db, monkeypatch, capsys):
+    """Iron-Law test: a GitLab subgroup (3-segment) URL the run layer can never
+    parse must be rejected up front — no clone, no detect, no project row."""
+    from scripts import project as project_mod
+
+    _arm_register_sentinels(monkeypatch)
+    rc = project_mod._register_cli("https://gitlab.com/group/subgroup/repo.git", db)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "Cannot register" in err
+    assert list_projects(db) == []
+
+
+def test_register_cli_rejects_metachar_url(db, monkeypatch, capsys):
+    """Shell-metacharacter URLs are rejected before any subprocess is spawned."""
+    from scripts import project as project_mod
+
+    _arm_register_sentinels(monkeypatch)
+    rc = project_mod._register_cli("https://x/a/b;rm -rf", db)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "Cannot register" in err
+    assert list_projects(db) == []
+
+
+def test_register_cli_accepted_url_passes_validation_gate(db, monkeypatch):
+    """A well-formed URL passes the gate and reaches the existing flow
+    (proven by hitting the _detect_base_branch sentinel, not the gate)."""
+    from scripts import project as project_mod
+
+    _arm_register_sentinels(monkeypatch)
+    with pytest.raises(AssertionError, match="_detect_base_branch"):
+        project_mod._register_cli("https://github.com/owner/repo.git", db)
+
+
 # ── _detect_base_branch ────────────────────────────────────────────────────
 
 

@@ -67,6 +67,11 @@ _NO_SERVER_HINTS = (
     "no such session",
 )
 
+# Upper bound for any single tmux invocation. tmux commands complete in
+# milliseconds; a wedged server must not hang the run indefinitely. Local to
+# this module by design (no cross-imports between subprocess wrappers).
+_TMUX_TIMEOUT_S = 10.0
+
 # kaizen#66 — orchestrator pane identity.
 #
 # When kaizen runs in a tmux pane (the typical interactive case), tmux sets
@@ -233,15 +238,29 @@ def _run_tmux(argv: list[str]) -> subprocess.CompletedProcess:
     Always uses check=False so the caller can inspect returncode + stderr.
     Captures both streams as text so the no-server signature checks can
     look at stderr.
+
+    A wedged tmux server is bounded by ``_TMUX_TIMEOUT_S``; on expiry a
+    synthetic non-zero CompletedProcess is returned (returncode 124, the
+    coreutils ``timeout`` convention) so the timeout rides the existing
+    soft-failure paths instead of propagating TimeoutExpired.
     """
-    return subprocess.run(
-        ["tmux", *argv],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            ["tmux", *argv],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=_TMUX_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(
+            args=["tmux", *argv],
+            returncode=124,
+            stdout="",
+            stderr=f"tmux command timed out after {int(_TMUX_TIMEOUT_S)}s",
+        )
 
 
 def _tmux_unavailable(proc: subprocess.CompletedProcess) -> bool:

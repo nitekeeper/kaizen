@@ -42,6 +42,65 @@ class TestFindAtelierRoot:
         assert (root / "scripts" / "seed_roles.py").exists()
 
 
+class TestFindAtelierRootVersionOrdering:
+    def _mk_atelier_version(self, cache: Path, name: str) -> None:
+        d = cache / name / "scripts"
+        d.mkdir(parents=True)
+        (d / "migrate.py").write_text("# marker\n")
+        (d / "seed_roles.py").write_text("# marker\n")
+
+    def test_find_atelier_root_prefers_numeric_newest(self, tmp_path, monkeypatch):
+        """REGRESSION: '2.9.0' > '2.10.0' lexicographically — the resolver must
+        compare numerically and pick 2.10.0."""
+        import scripts.seed_atelier_in_clone as mod
+
+        cache = tmp_path / "atelier"
+        cache.mkdir()
+        self._mk_atelier_version(cache, "2.9.0")
+        self._mk_atelier_version(cache, "2.10.0")
+        monkeypatch.setattr(mod, "_AGORA_ATELIER", cache)
+        assert mod.find_atelier_root().name == "2.10.0"
+
+    def test_raises_when_cache_dir_missing(self, tmp_path, monkeypatch):
+        import scripts.seed_atelier_in_clone as mod
+
+        monkeypatch.setattr(mod, "_AGORA_ATELIER", tmp_path / "nope")
+        with pytest.raises(RuntimeError, match="plugin cache not found"):
+            mod.find_atelier_root()
+
+    def test_raises_when_no_valid_install(self, tmp_path, monkeypatch):
+        import scripts.seed_atelier_in_clone as mod
+
+        cache = tmp_path / "atelier"
+        (cache / "2.9.0").mkdir(parents=True)  # no marker files
+        monkeypatch.setattr(mod, "_AGORA_ATELIER", cache)
+        with pytest.raises(RuntimeError, match="No valid Atelier installation"):
+            mod.find_atelier_root()
+
+
+class TestStandaloneInvocation:
+    def test_script_imports_without_pythonpath(self):
+        """REGRESSION: internal/clone-target/SKILL.md invokes the script as bare
+        `python3 scripts/seed_atelier_in_clone.py <clone-dir>` (no PYTHONPATH).
+        The plugin_cache import must not break that entrypoint — a no-arg run
+        must reach the usage message (exit 1), not die on ImportError."""
+        import os
+        import sys
+
+        repo_root = Path(__file__).resolve().parent.parent
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        proc = subprocess.run(
+            [sys.executable, "scripts/seed_atelier_in_clone.py"],
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert proc.returncode == 1, proc.stderr
+        assert "Usage:" in proc.stderr
+        assert "Traceback" not in proc.stderr
+
+
 class TestEnsureWikiDir:
     def test_creates_wiki_dir(self, tmp_path):
         clone = _init_clone(tmp_path)

@@ -21,7 +21,7 @@ All operations use the kaizen DB at `.ai/memex.db`.
 ### create
 
 ```
-python3 -c "
+PYTHONPATH=. python3 -c "
 import json
 from scripts.run import create_run
 row = create_run(
@@ -44,7 +44,7 @@ The orchestrator (`internal/run/SKILL.md`) records `run_id = row["id"]` for the 
 Currently only `branch` is mutable mid-run. If needed:
 
 ```
-python3 -c "
+PYTHONPATH=. python3 -c "
 from scripts.db import get_connection
 conn = get_connection('.ai/memex.db')
 conn.execute('UPDATE runs SET branch = ? WHERE id = ?', ('<new_branch>', <run_id>))
@@ -58,7 +58,7 @@ In the typical Wave 7 flow, the branch is computed before `create`, so `update` 
 ### finalize
 
 ```
-python3 -c "
+PYTHONPATH=. python3 -c "
 import json
 from scripts.run import finalize_run
 row = finalize_run(
@@ -78,7 +78,7 @@ Sets `ended_at` to the current UTC ISO timestamp, writes the cycle counts, the P
 ### get
 
 ```
-python3 -c "
+PYTHONPATH=. python3 -c "
 import json
 from scripts.run import get_run
 row = get_run('.ai/memex.db', <run_id>)
@@ -91,7 +91,7 @@ Returns the row dict or `None`.
 ### list
 
 ```
-python3 -c "
+PYTHONPATH=. python3 -c "
 import json
 from scripts.run import list_runs
 print(json.dumps(list_runs('.ai/memex.db', <project_id or None>), default=str))

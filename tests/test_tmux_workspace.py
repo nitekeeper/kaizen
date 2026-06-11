@@ -1505,3 +1505,34 @@ def test_apply_workspace_layout_team_id_tag_runs_in_grid_branch(
 
     tagged = sorted(call[call.index("-t") + 1] for call in set_option_calls)
     assert tagged == ["%1", "%2", "%3"]
+
+
+# ── _run_tmux subprocess timeout guard ────────────────────────────────────
+
+
+def test_run_tmux_passes_10s_timeout_to_subprocess(monkeypatch):
+    """Iron-Law (pre-fix failure): every tmux invocation must carry a 10.0s
+    subprocess timeout so a wedged tmux server cannot hang the run."""
+    recorded: dict = {}
+
+    def fake_run(argv, **kwargs):
+        recorded.update(kwargs)
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace._run_tmux(["list-panes"])
+    assert recorded.get("timeout") == 10.0
+
+
+def test_run_tmux_timeout_returns_synthetic_completed_process(monkeypatch):
+    """Iron-Law (pre-fix failure): TimeoutExpired must NOT propagate — it is
+    converted to a synthetic non-zero CompletedProcess that rides the existing
+    soft-failure paths (returncode inspection, _tmux_unavailable, etc.)."""
+
+    def fake_run(argv, **kwargs):
+        raise real_subprocess.TimeoutExpired(cmd=argv, timeout=10.0)
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    proc = _tmux_workspace._run_tmux(["list-panes"])
+    assert proc.returncode == 124
+    assert "timed out" in proc.stderr

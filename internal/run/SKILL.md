@@ -39,7 +39,7 @@ Read `internal/clone-target/SKILL.md` and follow its `setup` operation with `git
 Build an AST-only code-navigation graph of the freshly-seeded clone so Phase 2 recon agents can navigate the graph instead of grep + full-file reads:
 
 ```
-python3 scripts/codegraph_recon.py build <clone_dir> <git_url>
+PYTHONPATH=. python3 scripts/codegraph_recon.py build <clone_dir> <git_url>
 ```
 
 This is **best-effort and ON by default.** It prints a JSON status and exits 0 even when it skips. It auto-skips (logging one stderr note, continuing the run) whenever `graphify` is not on PATH, memex >= 2.9.0 is not installed, the build/ingest fails, or `KAIZEN_CODEGRAPH` is set to `0`/`false`/`no`/`off`. It never writes into the PR diff — the `graphify-out/` artifact is removed from the clone after ingest. The graph is ingested into memex's `~/.memex/code_graph.db`, keyed by `owner/repo`.
@@ -51,7 +51,7 @@ This is **best-effort and ON by default.** It prints a JSON status and exits 0 e
 Compute and check out the kaizen branch in the clone:
 
 ```
-python3 -c "
+PYTHONPATH=. python3 -c "
 from pathlib import Path
 from scripts.cycle_git import create_branch
 print(create_branch(Path(r'<clone_dir>'), '<subject-or-empty>'))
@@ -74,7 +74,7 @@ For each `cycle_n` in `1..cycles_requested`:
 2. **If `outcome["status"] == "success"`:** call
 
    ```
-   python3 -c "
+   PYTHONPATH=. python3 -c "
    from scripts.cycle import record_cycle_success
    record_cycle_success(
        db_path='.ai/memex.db',
@@ -92,7 +92,7 @@ For each `cycle_n` in `1..cycles_requested`:
 3. **If `outcome["status"] == "abandoned"`:** record the cycle row, then write the report:
 
    ```
-   python3 -c "
+   PYTHONPATH=. python3 -c "
    from scripts.cycle import record_cycle_abandoned
    row = record_cycle_abandoned(
        db_path='.ai/memex.db',
@@ -113,7 +113,7 @@ For each `cycle_n` in `1..cycles_requested`:
 ### Step 7 — Push the run branch
 
 ```
-python3 -c "
+PYTHONPATH=. python3 -c "
 from pathlib import Path
 from scripts.cycle_git import push_branch
 push_branch(Path(r'<clone_dir>'), '<branch>')
@@ -168,7 +168,7 @@ Run <run_id> complete.
   CI status: <line from Step 10.5>
   Cycles:    <S> succeeded / <A> abandoned out of <N> requested
   Project:   <project name> (<git_url>)
-Abandonment memex slugs (read with `memex ask <slug>`):
+Abandonment memex slugs (read with `memex:run ask <slug>`):
   - <slug 1>
   - <slug 2>
 Cycle minutes slugs:
@@ -178,7 +178,7 @@ Cycle minutes slugs:
 
 ## Skip-and-continue policy
 
-A cycle that abandons (no_consensus, destructive_rejected, tests_unrecoverable, other) writes its abandonment report and the loop continues. The next cycle runs from the same clone, on the same branch, with a clean working tree (the abandoning cycle should have left no staged changes — see `internal/cycle/SKILL.md`'s cleanup rule).
+A cycle that abandons (any reason in `scripts/abandonment.py::VALID_REASONS` — no_consensus, destructive_rejected, tests_unrecoverable, review_unrecoverable, lint_failed, security_failed, sca_failed, bridge_timeout, other) writes its abandonment report and the loop continues. The next cycle runs from the same clone, on the same branch, with a clean working tree (the abandoning cycle should have left no staged changes — see `internal/cycle/SKILL.md`'s cleanup rule).
 
 Only these conditions halt the run before the cycle count is exhausted:
 

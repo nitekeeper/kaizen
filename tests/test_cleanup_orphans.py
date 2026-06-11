@@ -214,3 +214,85 @@ def test_cli_default_is_dry_run(bridge_path, capsys):
     out = capsys.readouterr().out
     assert "mode=dry-run" in out
     assert "team-xyz" in out
+
+
+# -------------------------------------------------------------------------
+# Subprocess timeout guards (pgrep / tmux list-panes / tmux kill-pane).
+# -------------------------------------------------------------------------
+
+
+def test_pgrep_passes_10s_timeout_kwarg():
+    """Iron-Law (pre-fix failure): pgrep must carry a 10.0s timeout."""
+    recorded: dict = {}
+
+    def fake_run(argv, **kwargs):
+        recorded.update(kwargs)
+        return mock.Mock(returncode=1, stdout="", stderr="")
+
+    with mock.patch("scripts.cleanup_orphans.subprocess.run", side_effect=fake_run):
+        assert co._pgrep_agent_processes("xyz") == []
+    assert recorded.get("timeout") == 10.0
+
+
+def test_pgrep_timeout_raises_runtime_error():
+    """Iron-Law (pre-fix failure): a pgrep timeout must surface LOUDLY as
+    RuntimeError (matching the existing non-(0,1) exit contract), not as a
+    raw TimeoutExpired."""
+    import subprocess
+
+    with (
+        mock.patch(
+            "scripts.cleanup_orphans.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd=["pgrep"], timeout=10.0),
+        ),
+        pytest.raises(RuntimeError, match="pgrep timed out"),
+    ):
+        co._pgrep_agent_processes("xyz")
+
+
+def test_list_panes_passes_10s_timeout_kwarg():
+    recorded: dict = {}
+
+    def fake_run(argv, **kwargs):
+        recorded.update(kwargs)
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("scripts.cleanup_orphans.subprocess.run", side_effect=fake_run):
+        assert co._tmux_panes_for_pids({1}) == []
+    assert recorded.get("timeout") == 10.0
+
+
+def test_list_panes_timeout_returns_empty_list():
+    """A tmux list-panes timeout is a soft failure — same as no-server."""
+    import subprocess
+
+    with mock.patch(
+        "scripts.cleanup_orphans.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd=["tmux"], timeout=10.0),
+    ):
+        assert co._tmux_panes_for_pids({1}) == []
+
+
+def test_kill_pane_passes_10s_timeout_kwarg():
+    recorded: dict = {}
+
+    def fake_run(argv, **kwargs):
+        recorded.update(kwargs)
+        return mock.Mock(returncode=0, stdout="", stderr="")
+
+    with mock.patch("scripts.cleanup_orphans.subprocess.run", side_effect=fake_run):
+        results = co._kill_panes(["%1"])
+    assert results == {"%1": "killed"}
+    assert recorded.get("timeout") == 10.0
+
+
+def test_kill_pane_timeout_reports_per_pane_error():
+    """A kill-pane timeout is recorded per-pane, not raised."""
+    import subprocess
+
+    with mock.patch(
+        "scripts.cleanup_orphans.subprocess.run",
+        side_effect=subprocess.TimeoutExpired(cmd=["tmux"], timeout=10.0),
+    ):
+        results = co._kill_panes(["%1"])
+    assert results == {"%1": "error: tmux kill-pane timed out"}

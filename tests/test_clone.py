@@ -61,6 +61,19 @@ class TestCloneRepo:
         )
         assert head.stdout.strip() == "trunk"
 
+    def test_clone_failure_raises_enriched_error(self, tmp_path):
+        """Clone failures (auth/bad URL/network) must surface stderr in str(exc):
+        run.py persists str(exc) on the critical path."""
+        from scripts.clone import clone_repo
+
+        missing = tmp_path / "no-such-remote.git"
+        with pytest.raises(subprocess.CalledProcessError) as excinfo:
+            clone_repo(str(missing), tmp_path / "dest", "main")
+        msg = str(excinfo.value)
+        assert str(missing) in msg
+        # Pre-fix str(CalledProcessError) carries no stderr at all.
+        assert "fatal" in msg.lower() or "does not exist" in msg.lower()
+
     def test_clone_rejects_empty_branch(self, tmp_path):
         """Empty branch string must surface a clear ValueError, not a vague git error."""
         from scripts.clone import clone_repo

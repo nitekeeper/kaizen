@@ -125,6 +125,74 @@ def test_apply_config_block_is_idempotent_at_same_version(tmp_path):
     assert first == second
 
 
+# ── apply_config_block — safe-write semantics (backup / symlink / atomic) ──
+
+
+def test_apply_creates_backup_of_prior_content(tmp_path):
+    """Iron-Law (pre-fix failure): replacing an existing conf must first copy
+    the PRIOR state to <name>.kaizen.bak — the .bak holds the original bytes."""
+    p = tmp_path / "tmux.conf"
+    original = f"set -g status on\n\n{MARKER_START.format(1)}\nOLD BLOCK\n{MARKER_END.format(1)}\n"
+    p.write_text(original)
+    apply_config_block(p, MARKER_VERSION)
+    bak = tmp_path / "tmux.conf.kaizen.bak"
+    assert bak.exists(), "expected a .kaizen.bak backup of the prior conf"
+    assert bak.read_text() == original, "backup must equal the ORIGINAL bytes"
+
+
+def test_apply_creates_backup_when_appending_to_unmarked_file(tmp_path):
+    """The append branch (existing content, no marker) also backs up first."""
+    p = tmp_path / "tmux.conf"
+    p.write_text("set -g status on\n")
+    apply_config_block(p, MARKER_VERSION)
+    bak = tmp_path / "tmux.conf.kaizen.bak"
+    assert bak.exists()
+    assert bak.read_text() == "set -g status on\n"
+
+
+def test_apply_no_backup_when_creating_fresh_file(tmp_path):
+    """The create branch has no prior state — no .bak is produced."""
+    p = tmp_path / "tmux.conf"
+    apply_config_block(p, MARKER_VERSION)
+    assert not (tmp_path / "tmux.conf.kaizen.bak").exists()
+
+
+def test_apply_preserves_symlinked_conf(tmp_path):
+    """A symlinked ~/.tmux.conf must STAY a symlink with the block landing in
+    the real file (and the .bak beside the real file).
+
+    DELIBERATE anti-regression: the symlink-preservation half of this test is
+    green pre-fix (write_text follows symlinks) — it exists to pin the
+    behaviour against a naive ``os.replace(tmp, path)`` implementation, which
+    would silently replace the symlink itself with a regular file.
+    """
+    real = tmp_path / "real" / "conf"
+    real.parent.mkdir()
+    real.write_text("set -g status on\n")
+    link = tmp_path / "tmux.conf"
+    link.symlink_to(real)
+
+    apply_config_block(link, MARKER_VERSION)
+
+    assert link.is_symlink(), "the symlink must survive apply_config_block"
+    text = real.read_text()
+    assert MARKER_START.format(MARKER_VERSION) in text, "block must land in the REAL file"
+    assert "set -g status on" in text
+    bak = real.parent / "conf.kaizen.bak"
+    assert bak.exists(), "backup must land beside the REAL file, not the symlink"
+    assert bak.read_text() == "set -g status on\n"
+
+
+def test_apply_leaves_no_tmp_droppings(tmp_path):
+    """The atomic-write temp file must never survive a successful apply."""
+    p = tmp_path / "tmux.conf"
+    p.write_text("set -g status on\n")
+    apply_config_block(p, MARKER_VERSION)
+    apply_config_block(p, MARKER_VERSION)  # replace branch too
+    droppings = list(tmp_path.rglob("*.kaizen.tmp*"))
+    assert droppings == [], f"temp-file droppings left behind: {droppings}"
+
+
 # ── CONFIG_BLOCK content (kaizen#76 — dual-signal pane-border-format) ─────
 
 

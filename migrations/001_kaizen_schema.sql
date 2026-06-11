@@ -1,4 +1,4 @@
-CREATE TABLE projects (
+CREATE TABLE IF NOT EXISTS projects (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   git_url           TEXT NOT NULL UNIQUE,
   name              TEXT NOT NULL,
@@ -12,7 +12,7 @@ CREATE TABLE projects (
   notes             TEXT
 );
 
-CREATE TABLE runs (
+CREATE TABLE IF NOT EXISTS runs (
   id                INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id        INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   branch            TEXT NOT NULL,
@@ -26,7 +26,7 @@ CREATE TABLE runs (
   status            TEXT NOT NULL CHECK (status IN ('running', 'complete', 'failed'))
 );
 
-CREATE TABLE cycles (
+CREATE TABLE IF NOT EXISTS cycles (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
   run_id              INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
   cycle_n             INTEGER NOT NULL,
@@ -39,7 +39,7 @@ CREATE TABLE cycles (
   UNIQUE (run_id, cycle_n)
 );
 
-CREATE TABLE abandonments (
+CREATE TABLE IF NOT EXISTS abandonments (
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
   cycle_id            INTEGER NOT NULL REFERENCES cycles(id) ON DELETE CASCADE,
   phase_reached       TEXT NOT NULL CHECK (phase_reached IN ('agenda','meeting','implementation','test')),

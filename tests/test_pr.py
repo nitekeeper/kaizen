@@ -669,6 +669,108 @@ def test_wait_and_report_ci_returns_timeout_when_a_check_is_pending(monkeypatch)
     assert "https://github.com/x/y/pull/1" in result
 
 
+# Mock fidelity note (gh failure paths): the fake stderr strings below mirror
+# what the real `gh pr checks` CLI emits. On a PR whose repo reports no checks
+# the live CLI exits non-zero with:
+#   no checks reported on the 'branch' branch
+# and on bad auth it emits an HTTP error line such as:
+#   HTTP 401: Bad credentials (https://api.github.com/graphql)
+
+
+def test_wait_and_report_ci_persistent_no_checks_returns_info_not_timeout(monkeypatch):
+    """Iron-Law (pre-fix failure): every poll failing with gh's 'no checks
+    reported' stderr must short-circuit to the info (U+2139) no-CI-configured
+    message after the consecutive-failure threshold — NOT spin to ⌛."""
+    from scripts.pr import wait_and_report_ci
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="no checks reported on the 'kaizen/x-2026-06-10-0147' branch\n",
+        )
+
+    monkeypatch.setattr("scripts.pr.subprocess.run", fake_run)
+    result = wait_and_report_ci(
+        "https://github.com/x/y/pull/1", timeout_seconds=60, poll_interval_seconds=0
+    )
+    assert "ℹ" in result  # noqa: RUF001
+    assert "no CI checks reported" in result
+    assert "repo may have no CI configured" in result
+    assert "⌛" not in result
+
+
+def test_wait_and_report_ci_transient_no_checks_then_green(monkeypatch):
+    """Pins the caveat: 'no checks reported' is TRANSIENT right after PR
+    creation — a few failures followed by a green poll must still return
+    ✓ CI green (no immediate-return on the first no-checks stderr)."""
+    import json
+
+    from scripts.pr import wait_and_report_ci
+
+    calls = {"n": 0}
+
+    def fake_run(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] <= 3:
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="no checks reported on the 'kaizen/x-2026-06-10-0147' branch\n",
+            )
+        return SimpleNamespace(
+            returncode=0,
+            stdout=json.dumps([{"state": "SUCCESS", "bucket": "pass", "name": "Tests"}]),
+            stderr="",
+        )
+
+    monkeypatch.setattr("scripts.pr.subprocess.run", fake_run)
+    result = wait_and_report_ci(
+        "https://github.com/x/y/pull/1", timeout_seconds=60, poll_interval_seconds=0
+    )
+    assert "✓ CI green" in result
+
+
+def test_wait_and_report_ci_persistent_gh_error_surfaces_stderr(monkeypatch):
+    """Iron-Law (pre-fix failure): a persistent hard gh failure (e.g. bad
+    credentials) must surface the stderr in a ⚠ message instead of silently
+    retrying to the deadline."""
+    from scripts.pr import wait_and_report_ci
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(
+            returncode=1,
+            stdout="",
+            stderr="HTTP 401: Bad credentials (https://api.github.com/graphql)\n",
+        )
+
+    monkeypatch.setattr("scripts.pr.subprocess.run", fake_run)
+    result = wait_and_report_ci(
+        "https://github.com/x/y/pull/1", timeout_seconds=60, poll_interval_seconds=0
+    )
+    assert "⚠" in result
+    assert "Bad credentials" in result
+    assert "⌛" not in result
+
+
+def test_wait_and_report_ci_timeout_message_surfaces_last_gh_stderr(monkeypatch):
+    """When the deadline expires before the failure threshold is hit, the ⌛
+    message must surface the last non-empty gh stderr for diagnosability."""
+    from scripts.pr import wait_and_report_ci
+
+    def fake_run(*args, **kwargs):
+        return SimpleNamespace(returncode=1, stdout="", stderr="HTTP 502 Bad Gateway\n")
+
+    monkeypatch.setattr("scripts.pr.subprocess.run", fake_run)
+    # timeout_seconds=0 → deadline expires after the FIRST poll (1 failure < threshold).
+    result = wait_and_report_ci(
+        "https://github.com/x/y/pull/1", timeout_seconds=0, poll_interval_seconds=0
+    )
+    assert "⌛" in result
+    assert "CI did not complete" in result
+    assert "HTTP 502 Bad Gateway" in result
+
+
 # ── render_pr_body refusal path (MAJOR-NEW-PR-SIGNATURE) ─────────────────
 
 

@@ -332,6 +332,12 @@ def open_pr_for_run(db_path: str, run_id: int, clone_dir: Path) -> str:
 
 # ── CI polling ─────────────────────────────────────────────────────────────
 
+# Consecutive `gh pr checks` failures tolerated before giving up on polling.
+# "no checks reported" is TRANSIENT right after PR creation (checks register
+# asynchronously), so a single failure must never short-circuit; N in a row
+# means the condition is persistent (no CI configured, or a hard gh error).
+_MAX_CONSECUTIVE_GH_FAILURES = 6
+
 
 def wait_and_report_ci(
     pr_url: str,
@@ -350,6 +356,11 @@ def wait_and_report_ci(
         "✗ CI failing on <pr_url> (1 of 3 checks failed: Lint & format (Ruff))"
         "⌛ CI did not complete within 120s on <pr_url> — check manually"
 
+    Persistent `gh` failures (six in a row) return an info line ("no CI
+    checks reported ... repo may have no CI configured", U+2139-prefixed)
+    or a ⚠ line surfacing the last gh stderr, instead of retrying to the
+    misleading ⌛ deadline.
+
     Args:
         pr_url: full GitHub PR URL.
         timeout_seconds: max wall-clock seconds to poll.
@@ -360,6 +371,8 @@ def wait_and_report_ci(
 
     deadline = time.monotonic() + timeout_seconds
     start = time.monotonic()
+    consecutive_failures = 0
+    last_stderr = ""
     while True:
         result = subprocess.run(
             ["gh", "pr", "checks", pr_url, "--json", "state,bucket,name"],
@@ -372,12 +385,30 @@ def wait_and_report_ci(
         elapsed = int(time.monotonic() - start)
 
         if result.returncode == 0:
+            consecutive_failures = 0
             try:
                 checks = json.loads(result.stdout or "[]")
             except json.JSONDecodeError:
                 checks = []
         else:
             checks = []
+            consecutive_failures += 1
+            stderr = (result.stderr or "").strip()
+            if stderr:
+                last_stderr = stderr
+            if consecutive_failures >= _MAX_CONSECUTIVE_GH_FAILURES:
+                # Persistent failure — stop retrying to the deadline and tell
+                # the user something useful instead of a misleading ⌛.
+                # Informational only: always return a string, never raise.
+                if "no checks reported" in last_stderr.lower():
+                    return (
+                        f"ℹ no CI checks reported on {pr_url} after {elapsed}s "  # noqa: RUF001
+                        f"— repo may have no CI configured"
+                    )
+                return (
+                    f"⚠ `gh pr checks` failed {consecutive_failures} times in a "
+                    f"row on {pr_url} — last error: {last_stderr or '(no stderr)'}"
+                )
 
         if checks:
             # `bucket` is the authoritative classifier used by `gh pr checks`
@@ -399,7 +430,11 @@ def wait_and_report_ci(
                 )
 
         if time.monotonic() >= deadline:
-            return f"⌛ CI did not complete within {timeout_seconds}s on {pr_url} — check manually"
+            suffix = f" (last gh error: {last_stderr})" if last_stderr else ""
+            return (
+                f"⌛ CI did not complete within {timeout_seconds}s on {pr_url} "
+                f"— check manually{suffix}"
+            )
         time.sleep(poll_interval_seconds)
 
 

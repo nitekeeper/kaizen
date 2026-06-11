@@ -298,3 +298,149 @@ def test_claude_md_invariants_from_fixture():
             "Transitional xfail for pre-A6 checks (will clear once "
             "PERSONAL_CLEANUP_AFTER_MERGE.md lands):\n  - " + "\n  - ".join(xfailed)
         )
+
+
+# ---------------------------------------------------------------------------
+# Run-75 cycle-2 doc-parity guards (documentation/SKILL audit findings).
+# Each test pins a fixed doc line so the corresponding regression goes red.
+# ---------------------------------------------------------------------------
+
+_IMPROVE_SKILL = REPO_ROOT / "skills" / "improve" / "SKILL.md"
+
+
+def _doc_command_lines():
+    """Yield (path, lineno, line) for every shell-invocation line of python3
+    in skills/ + internal/ docs (fenced commands and inline prose commands)."""
+    for base in ("skills", "internal"):
+        for path in sorted((REPO_ROOT / base).rglob("*.md")):
+            for i, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+                if "python3 scripts/" in line or re.search(r"python3 -c\s*\"?$", line):
+                    yield path, i, line
+
+
+def test_documented_python3_commands_carry_pythonpath():
+    """Every documented `python3 scripts/...` / `python3 -c` invocation that
+    imports kaizen's `scripts.*` package must set `PYTHONPATH=.` — without it
+    the command fails with ModuleNotFoundError when run as documented.
+
+    Whitelist: stdlib-only helpers (`bridge_write.py`), the stdlib-only
+    sqlite3 snippet in expert-roster, and `nohup python3 -m scripts.run_bridged`
+    (covered by the `export PYTHONPATH=.` line above it in Step 3b).
+    """
+    offenders = []
+    for path, lineno, line in _doc_command_lines():
+        rel = path.relative_to(REPO_ROOT).as_posix()
+        if "python3 scripts/bridge_write.py" in line:
+            continue  # stdlib-only by design (see its module docstring)
+        if rel == "internal/expert-roster/SKILL.md" and line.strip().startswith("python3 -c"):
+            continue  # this snippet imports json+sqlite3 only (stdlib)
+        if "PYTHONPATH=." in line:
+            continue
+        offenders.append(f"{rel}:{lineno}: {line.strip()}")
+    assert not offenders, (
+        "Documented python3 invocations missing PYTHONPATH=. "
+        "(they import scripts.* and fail as written):\n  - " + "\n  - ".join(offenders)
+    )
+
+
+def test_setup_command_documented_with_pythonpath():
+    text = _IMPROVE_SKILL.read_text(encoding="utf-8")
+    assert "PYTHONPATH=. python3 scripts/setup.py" in text, (
+        "Step 1 must document `PYTHONPATH=. python3 scripts/setup.py` — "
+        "setup.py imports scripts._tmux_config and fails without it."
+    )
+
+
+def test_bridge_writeback_uses_write_tool_not_shell_interpolation():
+    """The team-mode write-back recipe must route agent-authored prose through
+    a Write-tool temp file, never through shell interpolation (a single
+    apostrophe in teammate prose breaks out of `printf '%s' '<prose>'`)."""
+    text = _IMPROVE_SKILL.read_text(encoding="utf-8")
+    assert "printf '%s'" not in text, (
+        "The printf-single-quote write-back recipe reintroduces shell "
+        "interpolation of untrusted agent prose."
+    )
+    assert "bridge_response_<row.id>.json" in text
+    assert "Write tool" in text
+    # The helper invocation must read the payload from the temp file on stdin.
+    assert "--status ready \\\n     < .ai/bridge_response_<row.id>.json" in text
+    assert "--status error \\\n     < .ai/bridge_response_<row.id>.txt" in text
+
+
+def test_bridge_write_docstring_matches_skill_recipe():
+    """scripts/bridge_write.py's documented invocation must match the SKILL's
+    Write-tool temp-file recipe (doc drift guard)."""
+    head = (REPO_ROOT / "scripts" / "bridge_write.py").read_text(encoding="utf-8")
+    assert "printf" not in head.split('"""')[1], (
+        "bridge_write.py docstring still documents the retired printf pipe."
+    )
+    assert "bridge_response_<row_id>.json" in head
+    assert "Write tool" in head
+
+
+def test_poll_loop_select_includes_created_at():
+    text = _IMPROVE_SKILL.read_text(encoding="utf-8")
+    assert "SELECT id, kind, args_json, created_at FROM bridge_requests" in text, (
+        "Step 1's documented SELECT must return created_at — step 3's "
+        "stale-row handling reads row.created_at."
+    )
+
+
+def test_poll_loop_has_dead_run_exit():
+    """Step 6 (empty queue) must check python_heartbeat and exit the loop
+    when the detached Python process is dead — otherwise S1 spins forever."""
+    text = _IMPROVE_SKILL.read_text(encoding="utf-8")
+    assert "the detached Python process is dead. **Exit the poll loop.**" in text
+    # The dead-run check must reuse the python_heartbeat age query.
+    assert text.count("FROM python_heartbeat WHERE run_id = <RUN_ID>") >= 2, (
+        "Expected the python_heartbeat age query in BOTH step 3 (stale row) "
+        "and step 6 (empty-queue dead-run exit)."
+    )
+
+
+def test_abandonment_reason_taxonomy_is_nine_codes_in_docs():
+    """Docs must list the full 9-reason taxonomy from
+    scripts/abandonment.py::VALID_REASONS, not the legacy 5."""
+    from scripts.abandonment import VALID_REASONS
+
+    assert len(VALID_REASONS) == 9  # if this moves, update the doc lists too
+    for rel in (
+        "internal/abandonment-report/SKILL.md",
+        "internal/cycle/SKILL.md",
+        "internal/run/SKILL.md",
+    ):
+        text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        missing = sorted(r for r in VALID_REASONS if r not in text)
+        assert not missing, f"{rel} is missing reason code(s): {missing}"
+        assert "five named codes" not in text, f"{rel} still claims the legacy five-code taxonomy."
+
+
+def test_phase_5c_minutes_not_committed_to_clone():
+    """Phase 5c must NOT instruct writing minutes into the clone pre-commit:
+    commit_cycle runs `git add -A`, so the minutes would land in the target
+    repo's PR diff. Memex is the canonical store (Phase 5d / CLAUDE.md)."""
+    text = (REPO_ROOT / "internal" / "cycle" / "SKILL.md").read_text(encoding="utf-8")
+    assert "Also write the full meeting minutes into the clone" not in text
+    assert "Do **NOT** write the minutes file into the clone" in text
+
+
+def test_clone_target_registration_note_matches_project_py():
+    """project.py auto-detects the default branch (`_detect_base_branch` via
+    `git ls-remote --symref`); the old 'hardcodes main' limitation note is
+    stale and must stay gone."""
+    text = (REPO_ROOT / "internal" / "clone-target" / "SKILL.md").read_text(encoding="utf-8")
+    assert "hardcodes" not in text
+    assert "_detect_base_branch" in text
+    assert "ls-remote --symref" in text
+
+
+def test_memex_run_ask_reference_form():
+    """User-facing read path is the `memex:run ask` skill, not a `memex ask`
+    CLI (memex is a Claude Code plugin, not a CLI binary)."""
+    for base in ("skills", "internal"):
+        for path in sorted((REPO_ROOT / base).rglob("*.md")):
+            text = path.read_text(encoding="utf-8")
+            assert re.search(r"\bmemex ask\b", text) is None, (
+                f"{path.relative_to(REPO_ROOT)} references the nonexistent "
+                "`memex ask` CLI form; use `memex:run ask`."
+            )

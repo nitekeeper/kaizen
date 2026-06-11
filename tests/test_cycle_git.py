@@ -163,6 +163,82 @@ class TestCommitCycle:
             f".ai/ files must not be staged: {staged_files}"
         )
 
+    def test_commit_cycle_preserves_tracked_ai_files(self, tmp_path, bare_remote, source_repo):
+        """Iron-Law (pre-fix failure): when the TARGET repo tracks files under
+        .ai/, commit_cycle must not delete them — the old unconditional rmtree
+        + `git add -A` committed destructive deletions of target-owned files."""
+        dest = tmp_path / "clone"
+        clone_repo(str(bare_remote), dest, "main")
+        create_branch(dest, "tracked-ai")
+        # Simulate a target repo that legitimately tracks a file under .ai/.
+        (dest / ".ai").mkdir()
+        (dest / ".ai" / "config.json").write_text('{"target": "owned"}\n')
+        subprocess.run(["git", "add", ".ai/config.json"], cwd=dest, check=True)
+        subprocess.run(
+            ["git", "commit", "-m", "target repo tracks .ai/config.json"],
+            cwd=dest,
+            check=True,
+            capture_output=True,
+        )
+        (dest / "CHANGES.txt").write_text("a real change")
+        commit_cycle(
+            clone_dir=dest,
+            cycle_n=1,
+            decisions=["real change"],
+            participants=["Dr. Test"],
+            n_tests=1,
+            subject="tracked ai preservation",
+            minutes_rel_path="docs/kaizen/minutes.md",
+        )
+        # The tracked file survives on disk…
+        assert (dest / ".ai" / "config.json").exists(), (
+            "tracked .ai/config.json must not be deleted by commit_cycle"
+        )
+        # …and the cycle commit contains NO deletions.
+        result = subprocess.run(
+            ["git", "show", "--name-status", "--pretty=format:"],
+            cwd=dest,
+            capture_output=True,
+            text=True,
+        )
+        entries = [line for line in result.stdout.strip().splitlines() if line]
+        assert not any(line.startswith("D") for line in entries), (
+            f"cycle commit must not contain deletions: {entries}"
+        )
+        assert any("CHANGES.txt" in line for line in entries)
+
+    def test_commit_cycle_strips_nested_pycache(self, tmp_path, bare_remote, source_repo):
+        """Iron-Law (pre-fix failure): __pycache__ nested below the clone root
+        must be stripped before staging — the old code only removed the
+        TOP-LEVEL __pycache__, letting nested .pyc files reach the PR diff."""
+        dest = tmp_path / "clone"
+        clone_repo(str(bare_remote), dest, "main")
+        create_branch(dest, "nested-pycache")
+        pkg = dest / "pkg"
+        (pkg / "__pycache__").mkdir(parents=True)
+        (pkg / "__pycache__" / "x.pyc").write_bytes(b"\x00fake-bytecode")
+        (pkg / "mod.py").write_text("x = 1\n")
+        commit_cycle(
+            clone_dir=dest,
+            cycle_n=1,
+            decisions=["add pkg"],
+            participants=["Dr. Test"],
+            n_tests=1,
+            subject="nested pycache",
+            minutes_rel_path="docs/kaizen/minutes.md",
+        )
+        result = subprocess.run(
+            ["git", "show", "--name-only", "--pretty=format:"],
+            cwd=dest,
+            capture_output=True,
+            text=True,
+        )
+        committed = result.stdout.strip().splitlines()
+        assert "pkg/mod.py" in committed
+        assert not any("__pycache__" in f for f in committed), (
+            f"nested __pycache__ contents must not be committed: {committed}"
+        )
+
 
 # ── push_branch ────────────────────────────────────────────────────────────
 

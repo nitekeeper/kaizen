@@ -874,3 +874,70 @@ def test_pane_label_prefix_regex_is_importable_and_supports_case_insensitive():
     assert not PANE_LABEL_PREFIX_RE.match("backend-engineer-1")
     # No match — wrong bracket shape.
     assert not PANE_LABEL_PREFIX_RE.match("(w2) role")
+
+
+# ── team_delete failure must not mask the cycle exception or skip L4 ──────
+
+
+def test_team_delete_failure_does_not_mask_cycle_exception_or_skip_l4(monkeypatch, tmp_path):
+    """A non-BridgeError raised by `tools.team_delete` in the finally block
+    must NOT replace the in-flight cycle exception, and the L4
+    `_cleanup_verify_config_dir` step must still run.
+
+    Pre-fix bug: `tools.team_delete(team_id)` was bare, so e.g. an
+    sqlite3.OperationalError from the team registry replaced the original
+    cycle exception and skipped L4 verification.
+    """
+    import sqlite3
+
+    from tests.test_team_executor import MockTeamTools, _project, _run_row
+
+    verify_calls: list[str] = []
+
+    def fake_cleanup_artifacts(
+        team_name, *, team_id=None, team_role_ids=None, shutdown_was_attempted=True
+    ):
+        return {
+            "team_name": team_name,
+            "team_id": team_id,
+            "l1_survivors": 0,
+            "l2_sigterm_sent": 0,
+            "l2_sigkill_needed": 0,
+            "l3_panes_killed": 0,
+            "l3_panes_skipped_orchestrator": 0,
+            "l3_panes_skipped_other_team": 0,
+            "l3_tmux_available": False,
+            "l4_config_dir_cleaned_by_fallback": False,
+        }
+
+    def fake_verify_config_dir(team_id):
+        verify_calls.append(team_id)
+        return False
+
+    monkeypatch.setattr(tx, "_cleanup_team_artifacts", fake_cleanup_artifacts)
+    monkeypatch.setattr(tx, "_cleanup_verify_config_dir", fake_verify_config_dir)
+
+    class _DeleteRaisesTools(MockTeamTools):
+        def team_delete(self, team_id):
+            super().team_delete(team_id)  # record the call FIRST
+            raise sqlite3.OperationalError("database is locked")
+
+    # The first send_message raises RuntimeError — the ORIGINAL cycle failure.
+    tools = _DeleteRaisesTools(raise_on_send_call_n=1)
+    with (
+        patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}),
+        pytest.raises(RuntimeError, match="injected send_message failure"),
+    ):
+        tx.team_cycle_executor(
+            clone_dir=tmp_path,
+            project=_project(),
+            run_row=_run_row(),
+            cycle_n=1,
+            tools=tools,
+        )
+
+    delete_calls = [c for c in tools.calls if c[0] == "team_delete"]
+    assert delete_calls, "team_delete must still be attempted (invariant preserved)"
+    assert verify_calls == ["team-kaizen-cycle-1-1"], (
+        f"L4 _cleanup_verify_config_dir must run despite team_delete failure: {verify_calls}"
+    )

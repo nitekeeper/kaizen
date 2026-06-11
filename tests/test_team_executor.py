@@ -1033,6 +1033,81 @@ class TestPhase5CCommit:
         assert outcome["commit_sha"] != "(skeleton)"
         assert len(commit_calls) == 1, "commit_cycle must be invoked exactly once"
 
+    def test_phase5c_commit_carries_real_test_count_and_memex_minutes_ref(
+        self, tmp_path, monkeypatch
+    ):
+        """Phase 5c must pass the REAL pytest pass count (parsed from the last
+        wave-boundary CI gate's captured output) and the Memex minutes slug —
+        not the hardcoded ``n_tests=0`` / never-written ``docs/kaizen/...`` path
+        (which is banned from git per CLAUDE.md Process-artifact storage).
+
+        Multi-mechanism rule: both assertions are exact and independent so a
+        silent revert of either mechanism stays red.
+        """
+
+        def fake_run_ci_checks(clone_dir, test_command):
+            return True, {
+                "tests": {"status": "pass", "output": "==== 7 passed in 0.12s ===="},
+                "lint": {"status": "pass", "output": ""},
+            }
+
+        monkeypatch.setattr(team_executor_mod, "run_ci_checks", fake_run_ci_checks)
+
+        commit_calls: list = []
+
+        def fake_commit_cycle(**kwargs):
+            commit_calls.append(kwargs)
+
+        monkeypatch.setattr(team_executor_mod, "commit_cycle", fake_commit_cycle)
+
+        class _FakeProc:
+            stdout = "1234567890abcdef\n"
+            returncode = 0
+
+        def fake_run(cmd, **kwargs):
+            return _FakeProc()
+
+        monkeypatch.setattr(team_executor_mod.subprocess, "run", fake_run)
+
+        roster = ["pm-1", "be-1", "security-engineer-1", "software-architect-1"]
+        ai_json = (
+            "ok\n```json\n["
+            '{"id": "A", "touches": ["a.py"], "reads": [], "depends_on": [], '
+            '"wave": 1, "owner": "be-1"}'
+            "]\n```"
+        )
+        tools = MockTeamTools(
+            scripted={
+                "Phase 1": "do x",
+                "Phase 2": "proposal",
+                "Phase 3 close": ai_json,
+                "Phase 4 wave": "applied",
+                "Phase 5b'": "NO ISSUES",
+            }
+        )
+        with patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}):
+            outcome = team_cycle_executor(
+                clone_dir=tmp_path,
+                project=_project(roster=roster),
+                run_row=_run_row(run_id=42),
+                cycle_n=3,
+                tools=tools,
+            )
+        assert outcome["status"] == "success"
+        assert len(commit_calls) == 1, "commit_cycle must be invoked exactly once"
+        kwargs = commit_calls[0]
+        # Mechanism 1: real pytest pass count parsed from the CI gate output.
+        assert kwargs["n_tests"] == 7, (
+            f"n_tests must be parsed from the last CI gate's pytest output, "
+            f"got {kwargs['n_tests']!r}"
+        )
+        # Mechanism 2: Memex minutes slug, never the banned docs/kaizen/ path.
+        assert kwargs["minutes_rel_path"].startswith("kaizen:cycle:"), (
+            f"minutes_rel_path must be the Memex slug, got {kwargs['minutes_rel_path']!r}"
+        )
+        assert "docs/kaizen/" not in kwargs["minutes_rel_path"]
+        assert kwargs["minutes_rel_path"] == "kaizen:cycle:42-3"
+
 
 # ── Outcome shapes (preserved + adapted) ──────────────────────────────────
 
@@ -2343,3 +2418,41 @@ def test_glyph_readiness_no_log_when_ready(tmp_path, monkeypatch, caplog):
             tools=tools,
         )
     assert not any("glyph-readiness" in r.getMessage() for r in caplog.records)
+
+
+# ── _parse_reviewer_response — mixed prose + finding lines (F9-critical) ───
+
+
+class TestParseReviewerResponseMixedReply:
+    """Finding lines must win over incidental 'no issues' prose.
+
+    Pre-fix bug: the parser short-circuited on a case-insensitive
+    'no issues' SUBSTRING before scanning for `[severity] file:line — text`
+    lines, so a mixed reply ('...no issues..., but\\n[blocker] ...')
+    parsed to [] and collapsed the review loop (P2/F9).
+    """
+
+    def test_mixed_reply_no_issues_prose_plus_blocker_yields_finding(self):
+        from scripts.team_executor import _parse_reviewer_response
+
+        reply = (
+            "I found no issues in the codec changes, but\n"
+            "[blocker] scripts/x.py:10 — the finally block swallows the cycle exception"
+        )
+        findings = _parse_reviewer_response(reply, "reviewer-1", prefix="R1")
+        assert len(findings) == 1, f"mixed reply must yield the blocker finding, got: {findings!r}"
+        f = findings[0]
+        assert f.severity == "blocker"
+        assert f.file_line == "scripts/x.py:10"
+        assert f.finding_id == "R1-1"
+        assert f.reviewer == "reviewer-1"
+
+    def test_pure_no_issues_reply_still_yields_empty(self):
+        """Anti-regression companion: the §4 contract is preserved — a pure
+        NO ISSUES reply contains no finding lines, so it still parses to [].
+        """
+        from scripts.team_executor import _parse_reviewer_response
+
+        assert _parse_reviewer_response("NO ISSUES", "reviewer-1", prefix="R1") == []
+        assert _parse_reviewer_response("no issues found.", "reviewer-1", prefix="R1") == []
+        assert _parse_reviewer_response("", "reviewer-1", prefix="R1") == []

@@ -26,7 +26,9 @@ v{new} available" to the user.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 from pathlib import Path
 
 # MARKER_VERSION is the installed-config schema, NOT the tmux binary version.
@@ -225,6 +227,38 @@ def _strip_existing_block(text: str) -> str:
     return joined
 
 
+def _safe_write(path: Path, content: str, *, backup: bool) -> None:
+    """Atomically write ``content`` to ``path``, writing THROUGH symlinks.
+
+    When ``path`` exists, the write targets ``path.resolve()`` so a symlinked
+    ``~/.tmux.conf`` stays a symlink and the REAL file receives the content —
+    a naive ``os.replace(tmp, path)`` would clobber the symlink itself with a
+    regular file.
+
+    Backup semantics: when ``backup`` is True and the target already exists,
+    the target's PRIOR state (the bytes in place before this write) is copied
+    to ``<name>.kaizen.bak`` beside the target first. The .bak therefore
+    always holds the pre-write content of the most recent write — on an
+    idempotent re-apply it simply equals the (unchanged) current content.
+
+    The write itself goes to a temp file beside the target (suffix
+    ``.kaizen.tmp<pid>``) followed by ``os.replace`` so a crash mid-write can
+    never leave a truncated conf.
+    """
+    # is_symlink() first: a dangling symlink reports exists() == False, but
+    # os.replace on the un-resolved path would clobber the symlink itself.
+    target = path.resolve() if (path.is_symlink() or path.exists()) else path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if backup and target.exists():
+        shutil.copy2(target, target.with_name(target.name + ".kaizen.bak"))
+    tmp = target.with_name(f"{target.name}.kaizen.tmp{os.getpid()}")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def apply_config_block(tmux_conf_path: Path, version: int) -> None:
     """Install or replace the agent-teams block in ``tmux_conf_path``.
 
@@ -236,12 +270,16 @@ def apply_config_block(tmux_conf_path: Path, version: int) -> None:
 
     Idempotent: calling twice at the same version with no edits between
     leaves the file byte-identical the second time.
+
+    Writes go through :func:`_safe_write` (atomic, symlink-preserving). The
+    replace/append branches first back up the PRIOR file state to
+    ``<name>.kaizen.bak`` beside the (resolved) target; the create branch has
+    no prior state, so no backup is made.
     """
     existing = _read_text(tmux_conf_path)
     block = _full_block(version)
     if not existing:
-        tmux_conf_path.parent.mkdir(parents=True, exist_ok=True)
-        tmux_conf_path.write_text(block, encoding="utf-8")
+        _safe_write(tmux_conf_path, block, backup=False)
         return
     if detect_existing_marker(tmux_conf_path) is not None:
         # Replace in place.
@@ -253,7 +291,7 @@ def apply_config_block(tmux_conf_path: Path, version: int) -> None:
             sep = "\n\n"
         elif stripped:
             sep = "\n"
-        tmux_conf_path.write_text(stripped + sep + block, encoding="utf-8")
+        _safe_write(tmux_conf_path, stripped + sep + block, backup=True)
         return
     # No marker — append with one blank line separator.
     sep = ""
@@ -261,7 +299,7 @@ def apply_config_block(tmux_conf_path: Path, version: int) -> None:
         sep = "\n\n"
     elif not existing.endswith("\n\n"):
         sep = "\n"
-    tmux_conf_path.write_text(existing + sep + block, encoding="utf-8")
+    _safe_write(tmux_conf_path, existing + sep + block, backup=True)
 
 
 def show_diff(tmux_conf_path: Path, version: int) -> str:

@@ -236,6 +236,59 @@ class TestCheckRemovedPublicFunctionsPyExtensionGate:
         assert issues == [], f"Expected no issues for unknown file context, got: {issues}"
 
 
+# ── _check_removed_public_functions: per-file removed/added pairing ─────────
+
+
+class TestCheckRemovedPublicFunctionsSignatureChangePairing:
+    """A `-def foo(...)` paired with a same-file `+def foo(...)` is a signature
+    change (or in-file move), not a removal — it must NOT be flagged."""
+
+    def test_signature_change_not_flagged(self):
+        """Iron-Law (pre-fix failure): -def foo(a): / +def foo(a, b): → no issues."""
+        diff = _make_modify_diff(
+            "scripts/api.py",
+            ["def foo(a):"],
+            ["def foo(a, b):"],
+        )
+        issues = _check_removed_public_functions(diff)
+        assert issues == [], f"signature change must not be flagged, got: {issues}"
+
+    def test_async_signature_change_not_flagged(self):
+        diff = _make_modify_diff(
+            "scripts/api.py",
+            ["async def fetch(url):"],
+            ["async def fetch(url, timeout):"],
+        )
+        assert _check_removed_public_functions(diff) == []
+
+    def test_pure_removal_still_flagged(self):
+        diff = _make_modify_diff("scripts/api.py", ["def foo(a):"])
+        issues = _check_removed_public_functions(diff)
+        assert len(issues) == 1
+        assert issues[0]["type"] == "removed_public_function"
+        assert "foo" in issues[0]["description"]
+
+    def test_rename_flags_old_name(self):
+        diff = _make_modify_diff(
+            "scripts/api.py",
+            ["def old_name(a):"],
+            ["def new_name(a):"],
+        )
+        issues = _check_removed_public_functions(diff)
+        assert len(issues) == 1
+        assert "old_name" in issues[0]["description"]
+
+    def test_cross_file_add_does_not_suppress_removal(self):
+        """A removal in file A is NOT suppressed by a same-name +def in file B
+        (cross-file moves still flag)."""
+        diff = _make_modify_diff("scripts/a.py", ["def foo(a):"]) + _make_modify_diff(
+            "scripts/b.py", [], ["def foo(a):"]
+        )
+        issues = _check_removed_public_functions(diff)
+        assert len(issues) == 1
+        assert issues[0]["file"] == "scripts/a.py"
+
+
 # ── get_diff library error path ────────────────────────────────────────────
 
 

@@ -55,6 +55,12 @@ _DEFAULT_TEAMS_DIR = Path.home() / ".claude" / "teams"
 # scripts. Module-level so tests can override.
 _DEFAULT_BRIDGE_DB = ".ai/bridge.db"
 
+# Upper bound for any single subprocess call (pgrep / tmux). Both complete
+# in milliseconds; a wedged tmux server or stuck pgrep must not hang the
+# cleanup indefinitely. Local to this module by design (no cross-imports
+# between subprocess wrappers).
+_SUBPROCESS_TIMEOUT_S = 10.0
+
 
 def _pgrep_agent_processes(pattern: str) -> list[tuple[int, str]]:
     """Layer 1 — return list of (pid, full_command) for matching procs.
@@ -69,12 +75,18 @@ def _pgrep_agent_processes(pattern: str) -> list[tuple[int, str]]:
     # (kaizen#82) stops getopt parsing the leading `--agent-id` as an
     # option; `guarded_argv` is the single enforcement point.
     expr = substring_agent_id_regex(pattern)
-    proc = subprocess.run(
-        guarded_argv("pgrep", ["-af"], expr),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            guarded_argv("pgrep", ["-af"], expr),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_SUBPROCESS_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired as e:
+        # Loud, matching the non-(0,1)-exit contract below — Layer 1 results
+        # gate Layer 2, so a silent empty list here would be unsafe.
+        raise RuntimeError(f"pgrep timed out after {int(_SUBPROCESS_TIMEOUT_S)}s") from e
     if proc.returncode not in (0, 1):
         raise RuntimeError(f"pgrep failed (exit {proc.returncode}): {proc.stderr.strip()}")
     out: list[tuple[int, str]] = []
@@ -110,12 +122,17 @@ def _tmux_panes_for_pids(pids: set[int]) -> list[tuple[str, int]]:
     tmux is not installed / no server running."""
     if not pids:
         return []
-    proc = subprocess.run(
-        ["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    try:
+        proc = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", "#{pane_id} #{pane_pid}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_SUBPROCESS_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        # Soft failure — same treatment as "no server running" below.
+        return []
     # tmux exits non-zero when no server is running — treat as "no
     # panes" rather than crashing the cleanup.
     if proc.returncode != 0:
@@ -138,12 +155,18 @@ def _kill_panes(pane_ids: list[str]) -> dict[str, str]:
     """tmux kill-pane each pane_id; return {pane_id: 'killed'|'error: …'}."""
     results: dict[str, str] = {}
     for pane in pane_ids:
-        proc = subprocess.run(
-            ["tmux", "kill-pane", "-t", pane],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        try:
+            proc = subprocess.run(
+                ["tmux", "kill-pane", "-t", pane],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=_SUBPROCESS_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            # Per-pane soft failure — record and keep killing the rest.
+            results[pane] = "error: tmux kill-pane timed out"
+            continue
         if proc.returncode == 0:
             results[pane] = "killed"
         else:

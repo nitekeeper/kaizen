@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -23,6 +24,10 @@ from scripts.seed_atelier_in_clone import find_atelier_root
 REPO_ROOT = Path(__file__).parent.parent
 MIGRATIONS_DIR = REPO_ROOT / "migrations"
 DB_PATH = REPO_ROOT / ".ai" / "memex.db"
+
+# Memex Brain registry — written by the memex plugin install. Module-level so
+# tests can point the check at a tmp registry instead of the host's ~/.memex.
+_MEMEX_REGISTRY = Path.home() / ".memex" / "registry.json"
 
 
 class DepCheck:
@@ -101,6 +106,26 @@ def check_atelier() -> DepCheck:
     return DepCheck(name, True, str(root), fix)
 
 
+def check_memex() -> DepCheck:
+    """Memex is a CLAUDE.md hard dependency (abandonment reports + cycle minutes).
+
+    Pass = ``~/.memex/registry.json`` exists, parses as JSON, and exposes a
+    readable ``registry["agents"]["path"]`` string. No version floor.
+    """
+    name = "memex"
+    fix = "Install Memex via Agora: run `agora install memex` in Claude Code"
+    try:
+        registry = json.loads(_MEMEX_REGISTRY.read_text(encoding="utf-8"))
+        agents_path = registry["agents"]["path"]
+        if not isinstance(agents_path, str) or not agents_path:
+            raise ValueError(
+                f"registry['agents']['path'] must be a non-empty string, got {agents_path!r}"
+            )
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return DepCheck(name, False, f"memex registry unusable at {_MEMEX_REGISTRY}: {exc}", fix)
+    return DepCheck(name, True, agents_path, fix)
+
+
 def verify_all() -> list[DepCheck]:
     """Run every check and return the results. Does not raise."""
     return [
@@ -108,6 +133,7 @@ def verify_all() -> list[DepCheck]:
         check_gh(),
         check_python_version(),
         check_atelier(),
+        check_memex(),
     ]
 
 

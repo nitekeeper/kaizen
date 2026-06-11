@@ -91,7 +91,6 @@ together.
 
 from __future__ import annotations
 
-import datetime
 import json
 import logging
 import os
@@ -116,7 +115,7 @@ from scripts.agent_id_match import guarded_argv, team_agent_id_regex
 from scripts.caveman_codec import compress as _caveman_compress
 from scripts.caveman_codec import should_compress as _caveman_should_compress
 from scripts.cc_tool_bridge import quorum_for
-from scripts.ci_runner import run_ci_checks
+from scripts.ci_runner import parse_pytest_pass_count, run_ci_checks
 from scripts.cycle_git import commit_cycle
 from scripts.dag import validate_dag
 from scripts.dispatch_templates import (
@@ -393,16 +392,18 @@ def _parse_reviewer_response(
 ) -> list[Finding]:
     """Parse a reviewer's response into `Finding` objects.
 
-    Per the wire protocol (§4): a literal ``NO ISSUES`` substring (case
-    insensitive) → empty list. Otherwise each line matching
+    Finding lines are parsed FIRST: each line matching
     ``[severity] file:line — text`` becomes a `Finding`. Lines that don't
     match are silently skipped — reviewers may include prose before/after
-    their finding list. `prefix` is used to build stable per-iteration
-    finding ids (e.g. ``R1-1``, ``R1-2``).
+    their finding list. The wire-protocol §4 contract is preserved: a pure
+    ``NO ISSUES`` reply contains no finding lines, so it still parses to
+    ``[]``. Crucially, a MIXED reply ("...no issues..., but\\n[blocker]
+    ...") yields its findings — a 'no issues' substring must never
+    short-circuit past explicit finding lines (P2/F9: the review loop must
+    not collapse). `prefix` is used to build stable per-iteration finding
+    ids (e.g. ``R1-1``, ``R1-2``).
     """
     if not response:
-        return []
-    if "no issues" in response.lower():
         return []
     findings: list[Finding] = []
     seq = 0
@@ -1938,6 +1939,9 @@ def team_cycle_executor(
         # pytest run (which would be unfaithful to the cycle's eventual
         # post-wave invocation that uses the project's real test_command).
         ci_baseline: dict[str, dict] | None = None
+        # Captured at each wave-boundary CI gate; Phase 5c parses the real
+        # pytest pass count from the LAST gate's output for the commit message.
+        last_ci_results: dict | None = None
         if not outcome_acc.abandoned and waves:
             try:
                 _baseline_passed, ci_baseline = run_ci_checks(clone_dir, "true")
@@ -2018,6 +2022,7 @@ def team_cycle_executor(
                 # CI mirror at every wave boundary
                 test_command = project.get("test_command") or "pytest"
                 all_passed, results = run_ci_checks(clone_dir, test_command)
+                last_ci_results = results
                 if not all_passed:
                     # F10 (audit cleanup): diff against the pre-wave-1
                     # baseline so a pre-existing host failure does NOT
@@ -2271,17 +2276,23 @@ def team_cycle_executor(
 
         # ── Phase 5c — Commit ────────────────────────────────────────────
         if not outcome_acc.abandoned:
-            minutes_rel = (
-                f"docs/kaizen/{datetime.date.today().isoformat()}-cycle-{cycle_n}-minutes.md"
+            # Real pass count from the LAST wave-boundary CI gate. Caveat:
+            # this reflects that gate, not a post-fix-loop re-run — acceptable
+            # for a commit-message stat.
+            n_tests = parse_pytest_pass_count(
+                (last_ci_results or {}).get("tests", {}).get("output", "")
             )
+            # Minutes live in Memex (docs/kaizen/* is banned from git per
+            # CLAUDE.md); reference the Memex slug, mirroring the success dict.
+            minutes_ref = f"kaizen:cycle:{run_row['id']}-{cycle_n}"
             commit_cycle(
                 clone_dir=clone_dir,
                 cycle_n=cycle_n,
                 decisions=outcome_acc.decisions or ["team-mode cycle"],
                 participants=outcome_acc.participants,
-                n_tests=0,
+                n_tests=n_tests,
                 subject=subject or "team-mode",
-                minutes_rel_path=minutes_rel,
+                minutes_rel_path=minutes_ref,
             )
             # F13 (audit cleanup): check=True would raise CalledProcessError
             # with no captured stdout/stderr in the message, masking the
@@ -2408,8 +2419,21 @@ def team_cycle_executor(
             )
         # CRITICAL INVARIANT: team_delete ALWAYS fires — even on exception
         # or abandonment — so the user's Claude Code session does not leak
-        # named teams across cycles.
-        tools.team_delete(team_id)
+        # named teams across cycles. Guarded like its neighbors above: a
+        # non-BridgeError raised here (e.g. sqlite3.OperationalError from
+        # the team registry) must NOT replace the in-flight cycle exception
+        # nor skip the L4 verification below.
+        try:
+            tools.team_delete(team_id)
+        except Exception as exc:
+            _log.warning(
+                "team_delete raised for team %s: %s. The team may be leaked — "
+                "next-run sweep: rm -rf ~/.claude/teams/%s/. Proceeding with "
+                "L4 config-dir verification.",
+                team_id,
+                exc,
+                team_id,
+            )
         # kaizen#68 — L4 verification AFTER team_delete. TeamDelete is
         # supposed to remove ~/.claude/teams/<team_id>/; this fallback
         # handles the rare case where it doesn't. Keyed by team_id (UUID),

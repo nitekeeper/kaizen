@@ -6,7 +6,8 @@ Covers:
     team_delete.
   * `python_heartbeat` is written every poll tick.
   * `BridgeStallError` when `bridge_heartbeat.last_polled_at` is older
-    than HEARTBEAT_STALL_S.
+    than HEARTBEAT_STALL_S — both the immediate both-clocks raise and
+    the STALL_CONFIRM_S confirmed (dead-S1) raise.
   * `BridgeRemoteError` on `status='error'`.
   * Long-SendMessage no-stall regression guard — when S1's heartbeat
     advances per-row before each dispatch (the design's step-2a
@@ -241,13 +242,19 @@ def test_python_heartbeat_written_every_poll_tick(bridge_path):
 
 
 def test_bridge_stall_raises_when_s1_heartbeat_old(bridge_path):
-    """Issue #41 + SDET-review-PR follow-up: the stall predicate now
-    requires BOTH clocks to agree. To exercise the raise branch we
-    pre-seed `_last_python_tick_monotonic[run_id]` with an OLD monotonic
-    timestamp BEFORE constructing the wrapper, simulating "Python was
-    ticking, then stopped" (a real S1 stall, not a suspend-resume).
-    Without the pre-seed, mono_gap would be None and the predicate
-    correctly falls through to the suspend-resume branch."""
+    """Issue #41 + SDET-review-PR follow-up: the IMMEDIATE stall raise
+    requires BOTH clocks to agree. To exercise that branch we pre-seed
+    `_last_python_tick_monotonic[run_id]` with an OLD monotonic timestamp
+    BEFORE constructing the wrapper, so the FIRST iteration observes a
+    large mono_gap alongside the stale heartbeat and raises immediately.
+
+    NB this pre-seed is an artificial single-reading construction — a
+    REAL dead-S1 (Python loop ticking normally, mono_gap ~POLL_INTERVAL_S)
+    never satisfies the both-clocks branch; that case is covered by the
+    STALL_CONFIRM_S confirmation-window path
+    (test_dead_s1_with_live_python_raises_stall). Without the pre-seed,
+    mono_gap would be None and the predicate correctly falls through to
+    the stall-anchor branch."""
     run_id = 5
     # Simulate prior monotonic activity that then went silent.
     bridge_mod._last_python_tick_monotonic[run_id] = time.monotonic() - 600.0
@@ -715,11 +722,16 @@ def test_hybrid_stall_no_raise_on_wall_clock_skew_alone(bridge_path):
 
 def test_hybrid_stall_raises_when_both_clocks_agree(bridge_path):
     """Issue #41 companion: when BOTH the SQLite wall clock gap AND the
-    monotonic gap exceed HEARTBEAT_STALL_S, the predicate raises as before.
+    monotonic gap exceed HEARTBEAT_STALL_S, the predicate raises immediately.
 
-    This is the "real S1 stall on a machine that was NOT suspended" case —
-    Python kept ticking the whole time (mono_gap large), and S1 also went
-    silent (julianday gap large). Abandonment is the correct call.
+    The pre-seeded 600s-old monotonic tick simulates "Python itself was
+    unable to tick for 600s" (e.g. a frozen/paused Python process that
+    woke to find S1 also silent) — NOT a normally-polling loop, whose
+    per-tick heartbeat keeps mono_gap at ~POLL_INTERVAL_S. The
+    normally-polling dead-S1 case is covered by the STALL_CONFIRM_S
+    confirmation window (test_dead_s1_with_live_python_raises_stall).
+    Abandonment on the first reading is correct here because both clocks
+    independently corroborate the stall.
     """
     run_id = 301
     # Pre-seed: pretend a PRIOR tick happened LONG ago (mono_gap will be
@@ -1009,6 +1021,245 @@ def test_reset_cycle_deadline_clears_state(bridge_path):
     wrapper.team_create(name="y", members=[])
     t.join(timeout=5)
     assert wrapper._cycle_deadline is not None
+
+
+# ── Dead-S1 stall confirmation window (stall-anchor fix) ───────────────────
+#
+# The original hybrid predicate required mono_gap > HEARTBEAT_STALL_S to
+# corroborate a stale bridge_heartbeat — but every poll iteration ticks the
+# Python heartbeat, so mono_gap is always ~POLL_INTERVAL_S for a live Python
+# process. A genuinely dead S1 (Python healthy, S1 gone) therefore NEVER
+# tripped the raise AND reset the per-call deadline on every tick, spinning
+# forever. The fix anchors on the stale `last_polled_at` VALUE: the deadline
+# resets at most once per distinct stale value (preserving issue #41
+# suspend/resume tolerance — each suspend produces a NEW stale value), and an
+# anchor that survives STALL_CONFIRM_S of continuous Python ticking raises
+# BridgeStallError (confirmed).
+
+
+def test_dead_s1_with_live_python_raises_stall(bridge_path):
+    """A dead S1 (stale, NEVER-changing last_polled_at) with a healthy,
+    continuously-ticking Python loop must raise BridgeStallError after the
+    confirmation window — not spin forever resetting the per-call deadline.
+
+    Pre-fix: the loop resets `deadline` on every tick (mono_gap is always
+    ~POLL_INTERVAL_S because the loop itself ticks), so the call never
+    returns — the worker thread is still alive at join(5).
+    """
+    run_id = 500
+    # The live loop must tick naturally — no pre-seeded monotonic state.
+    bridge_mod._last_python_tick_monotonic.pop(run_id, None)
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=run_id)
+    wrapper.HEARTBEAT_STALL_S = 0.5
+    wrapper.STALL_CONFIRM_S = 0.5
+    wrapper.POLL_INTERVAL_S = 0.02
+    # Dead S1: heartbeat stamped once, 5s in the past, never refreshed.
+    _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=5)
+    # NO servicing thread — the row stays pending forever.
+
+    caught: dict[str, BaseException] = {}
+
+    def call():
+        try:
+            wrapper.team_create(name="x", members=[])
+        except BaseException as exc:  # capture for assertion
+            caught["exc"] = exc
+
+    t = threading.Thread(target=call, daemon=True)
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive(), (
+        "dead-S1 poll loop never terminated — the stall predicate is dead "
+        "and the per-call deadline keeps being reset"
+    )
+    assert isinstance(caught.get("exc"), BridgeStallError), (
+        f"expected BridgeStallError, got {caught.get('exc')!r}"
+    )
+    assert "confirmed" in str(caught["exc"])
+
+
+def test_dead_s1_with_live_python_raises_stall_in_poll_many(bridge_path):
+    """_poll_many mirror of the dead-S1 confirmed-stall raise — the batch
+    loop has the identical (previously dead) predicate."""
+    run_id = 501
+    bridge_mod._last_python_tick_monotonic.pop(run_id, None)
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=run_id)
+    wrapper.HEARTBEAT_STALL_S = 0.5
+    wrapper.STALL_CONFIRM_S = 0.5
+    wrapper.POLL_INTERVAL_S = 0.02
+    _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=5)
+
+    caught: dict[str, BaseException] = {}
+
+    def call():
+        try:
+            wrapper.send_message_many(
+                [
+                    {"team_id": "t", "to": "a", "message": "m1"},
+                    {"team_id": "t", "to": "b", "message": "m2"},
+                ]
+            )
+        except BaseException as exc:  # capture for assertion
+            caught["exc"] = exc
+
+    t = threading.Thread(target=call, daemon=True)
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive(), "dead-S1 batch poll loop never terminated"
+    exc = caught.get("exc")
+    assert isinstance(exc, BridgeStallError), f"expected BridgeStallError, got {exc!r}"
+    assert "confirmed" in str(exc)
+    # kaizen#91: the confirmed-stall raise site also carries a snapshot.
+    assert exc.snapshot is not None
+    assert exc.snapshot.classification == "true_stall"
+
+
+def test_stall_anchor_tolerates_repeated_suspend_resume(bridge_path):
+    """Issue #41 preserved: each suspend produces a NEW stale last_polled_at
+    value, so the anchor re-arms (and the deadline resets) per distinct value
+    — a resumed S1 that refreshes its heartbeat within the confirm window
+    never trips the confirmed raise."""
+    run_id = 502
+    bridge_mod._last_python_tick_monotonic.pop(run_id, None)
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=run_id)
+    wrapper.HEARTBEAT_STALL_S = 0.5
+    # 2.0s confirm window vs 0.3s refresh cadence — wide margin against host
+    # scheduling hiccups (reviewer flagged 1.0s as flake-prone).
+    wrapper.STALL_CONFIRM_S = 2.0
+    wrapper.POLL_INTERVAL_S = 0.02
+    # First "post-suspend" stale value.
+    _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=5)
+
+    def fake_s1():
+        row_id = _wait_for_pending_row(bridge_path, run_id=run_id)
+        # Two successive distinct stale values (two suspend/resume events),
+        # each observed for a few ticks but each refreshed/changed before the
+        # 2.0s confirm window elapses.
+        time.sleep(0.3)
+        _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=7)
+        time.sleep(0.3)
+        # S1 fully resumes: fresh heartbeat, services the row.
+        _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=0)
+        _mark_row_ready(bridge_path, row_id, {"team_id": "resumed-team"})
+
+    t = threading.Thread(target=fake_s1, daemon=True)
+    t.start()
+    team_id = wrapper.team_create(name="x", members=[])
+    t.join(timeout=5)
+    assert team_id == "resumed-team"
+
+
+# ── Cleanup-path hard cap (never-reset bound for team_delete/apply_layout) ─
+
+
+def test_team_delete_bounded_when_s1_long_dead(bridge_path):
+    """Cleanup-path calls skip the cycle wall; with a dead S1 the old code
+    reset the per-call deadline every tick and spun forever. The never-reset
+    hard cap (2*timeout + STALL_CONFIRM_S) plus the confirmed-stall raise
+    bound the call; team_delete swallows the BridgeError and returns None
+    (best-effort — the L1-L4 filesystem/pkill backstop takes over)."""
+    run_id = 510
+    bridge_mod._last_python_tick_monotonic.pop(run_id, None)
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=run_id)
+    wrapper.HEARTBEAT_STALL_S = 0.3
+    wrapper.STALL_CONFIRM_S = 0.3
+    wrapper.CLEANUP_TIMEOUT_S = 0.3
+    wrapper.POLL_INTERVAL_S = 0.02
+    _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=10)
+    # No servicing thread — S1 is long dead.
+
+    result: dict[str, object] = {}
+
+    def call():
+        result["out"] = wrapper.team_delete("dead-s1-team")
+        result["done"] = True
+
+    t = threading.Thread(target=call, daemon=True)
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive(), "team_delete spun forever against a dead S1"
+    assert result.get("done") is True
+    assert result.get("out") is None
+
+
+def test_cleanup_hard_cap_bounds_anchor_churn(bridge_path):
+    """Per-mechanism isolation of the hard cap (charter: multi-mechanism fix
+    → per-mechanism assertion). A sick S1 that writes a NEW stale
+    last_polled_at every tick re-arms the stall anchor each time, so the
+    confirmed-stall raise NEVER fires — only the never-reassigned hard cap
+    (2*timeout + STALL_CONFIRM_S) terminates the cleanup call. With the cap
+    neutered (hard_cap = None) this test hangs and fails at join()."""
+    run_id = 512
+    bridge_mod._last_python_tick_monotonic.pop(run_id, None)
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=run_id)
+    wrapper.HEARTBEAT_STALL_S = 0.3
+    wrapper.STALL_CONFIRM_S = 0.3
+    wrapper.CLEANUP_TIMEOUT_S = 0.3
+    wrapper.POLL_INTERVAL_S = 0.02
+    _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=10)
+
+    stop = threading.Event()
+
+    def churn():
+        # Distinct stale value every 0.1s — always > HEARTBEAT_STALL_S old,
+        # never the same raw string twice, never servicing the row.
+        offset = 10
+        while not stop.is_set():
+            offset += 1
+            _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=offset)
+            time.sleep(0.1)
+
+    churner = threading.Thread(target=churn, daemon=True)
+    churner.start()
+
+    caught: dict[str, BaseException] = {}
+
+    def call():
+        try:
+            wrapper._request(
+                "team_delete",
+                {"team_id": "churning-s1"},
+                timeout_s=wrapper.CLEANUP_TIMEOUT_S,
+                cleanup=True,
+            )
+        except BaseException as exc:
+            caught["exc"] = exc
+
+    t = threading.Thread(target=call, daemon=True)
+    t.start()
+    t.join(timeout=10)
+    stop.set()
+    churner.join(timeout=2)
+    assert not t.is_alive(), "cleanup call spun forever under anchor churn"
+    exc = caught.get("exc")
+    assert isinstance(exc, BridgeTimeoutError), f"expected BridgeTimeoutError, got {exc!r}"
+    assert "hard cap exceeded" in str(exc)
+
+
+def test_apply_layout_bounded_when_s1_long_dead(bridge_path):
+    """apply_layout mirror of the dead-S1 cleanup bound — same cleanup=True
+    path, same swallow-and-return-None best-effort contract."""
+    run_id = 511
+    bridge_mod._last_python_tick_monotonic.pop(run_id, None)
+    wrapper = QueueBridgeWrapper(str(bridge_path), run_id=run_id)
+    wrapper.HEARTBEAT_STALL_S = 0.3
+    wrapper.STALL_CONFIRM_S = 0.3
+    wrapper.CLEANUP_TIMEOUT_S = 0.3
+    wrapper.POLL_INTERVAL_S = 0.02
+    _tick_bridge_heartbeat(bridge_path, run_id=run_id, at_offset_seconds=10)
+
+    result: dict[str, object] = {}
+
+    def call():
+        result["out"] = wrapper.apply_layout("dead-s1-team")
+        result["done"] = True
+
+    t = threading.Thread(target=call, daemon=True)
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive(), "apply_layout spun forever against a dead S1"
+    assert result.get("done") is True
+    assert result.get("out") is None
 
 
 # ── kaizen#91: read-first capture on bridge timeout/stall ──────────────────

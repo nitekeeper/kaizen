@@ -7,12 +7,15 @@ agent-authored prose (which may contain quotes, newlines, SQL syntax,
 or shell metacharacters) flows through `?` placeholders and CANNOT
 escape into SQL or shell.
 
-Invocation (the only form the SKILL prose tells Claude to use)::
+Invocation (the only form the SKILL prose tells Claude to use) — the
+body is first written to a temp file via the Write tool (NO shell
+interpolation of agent prose; a single-quoted apostrophe would break
+out of a shell string), then fed to this helper on stdin::
 
-    printf '%s' '<json-encoded body>' | \\
-        python3 scripts/bridge_write.py --row-id <row_id> --status ready
-    printf '%s' '<error_text>' | \\
-        python3 scripts/bridge_write.py --row-id <row_id> --status error
+    python3 scripts/bridge_write.py --row-id <row_id> --status ready \\
+        < .ai/bridge_response_<row_id>.json
+    python3 scripts/bridge_write.py --row-id <row_id> --status error \\
+        < .ai/bridge_response_<row_id>.txt
 
 Behaviour:
   * `--status` is gated by argparse `choices=("ready","error")`; the only

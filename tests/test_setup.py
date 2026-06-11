@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -11,6 +12,7 @@ from scripts.setup import (
     check_atelier,
     check_gh,
     check_git,
+    check_memex,
     check_python_version,
     run_setup,
     verify_all,
@@ -32,7 +34,7 @@ def _fake_proc(returncode: int = 0) -> subprocess.CompletedProcess:
     return subprocess.CompletedProcess(args=[], returncode=returncode)
 
 
-def _all_present(monkeypatch, tmp_path=None) -> None:
+def _all_present(monkeypatch, tmp_path) -> None:
     """Patch the world so every dep check passes."""
 
     def fake_which(name: str):
@@ -53,6 +55,22 @@ def _all_present(monkeypatch, tmp_path=None) -> None:
     # the real plugin cache.
     fake_atelier_root = Path("/fake/atelier/v1.0.0")
     monkeypatch.setattr(setup_mod, "find_atelier_root", lambda: fake_atelier_root)
+
+    # Point the memex check at a tmp registry — the suite must NEVER read the
+    # host's real ~/.memex.
+    _patch_memex_registry(monkeypatch, tmp_path)
+
+
+def _patch_memex_registry(monkeypatch, tmp_path) -> Path:
+    """Write a valid tmp registry.json and point _MEMEX_REGISTRY at it."""
+    registry = tmp_path / "memex" / "registry.json"
+    registry.parent.mkdir(parents=True, exist_ok=True)
+    registry.write_text(
+        json.dumps({"agents": {"path": str(tmp_path / "memex" / "agents")}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(setup_mod, "_MEMEX_REGISTRY", registry)
+    return registry
 
 
 # ── Individual check tests ─────────────────────────────────────────────────
@@ -149,7 +167,7 @@ class TestCheckPythonVersion:
 
 class TestRunSetup:
     def test_all_present_returns_zero_and_applies_migration(self, monkeypatch, tmp_path):
-        _all_present(monkeypatch)
+        _all_present(monkeypatch, tmp_path)
 
         db_path = tmp_path / ".ai" / "memex.db"
         db_path.parent.mkdir(parents=True)
@@ -171,7 +189,7 @@ class TestRunSetup:
             assert expected in names, f"missing table {expected!r}; got {names}"
 
     def test_idempotent_rerun(self, monkeypatch, tmp_path):
-        _all_present(monkeypatch)
+        _all_present(monkeypatch, tmp_path)
 
         db_path = tmp_path / ".ai" / "memex.db"
         db_path.parent.mkdir(parents=True)
@@ -202,6 +220,8 @@ class TestRunSetup:
         monkeypatch.setattr(setup_mod.shutil, "which", fake_which)
         monkeypatch.setattr(setup_mod.subprocess, "run", fake_run)
         monkeypatch.setattr(setup_mod, "find_atelier_root", lambda: Path("/fake/atelier"))
+        # Host isolation: never read the real ~/.memex even on the failure path.
+        _patch_memex_registry(monkeypatch, tmp_path)
 
         db_path = tmp_path / ".ai" / "memex.db"
         monkeypatch.setattr(setup_mod, "DB_PATH", db_path)
@@ -249,14 +269,62 @@ class TestCheckAtelier:
         assert "agora install atelier" in c.fix.lower()
 
 
+class TestCheckMemex:
+    def test_missing_registry(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(setup_mod, "_MEMEX_REGISTRY", tmp_path / "nope" / "registry.json")
+        c = check_memex()
+        assert c.ok is False
+        assert "registry" in c.detail.lower()
+        assert "memex" in c.fix.lower()
+
+    def test_malformed_json(self, monkeypatch, tmp_path):
+        registry = tmp_path / "registry.json"
+        registry.write_text("{not json", encoding="utf-8")
+        monkeypatch.setattr(setup_mod, "_MEMEX_REGISTRY", registry)
+        c = check_memex()
+        assert c.ok is False
+
+    def test_registry_missing_agents_path(self, monkeypatch, tmp_path):
+        registry = tmp_path / "registry.json"
+        registry.write_text(json.dumps({"agents": {}}), encoding="utf-8")
+        monkeypatch.setattr(setup_mod, "_MEMEX_REGISTRY", registry)
+        c = check_memex()
+        assert c.ok is False
+
+    def test_registry_agents_not_a_mapping(self, monkeypatch, tmp_path):
+        registry = tmp_path / "registry.json"
+        registry.write_text(json.dumps({"agents": "oops"}), encoding="utf-8")
+        monkeypatch.setattr(setup_mod, "_MEMEX_REGISTRY", registry)
+        c = check_memex()
+        assert c.ok is False
+
+    def test_registry_agents_path_not_a_string(self, monkeypatch, tmp_path):
+        registry = tmp_path / "registry.json"
+        registry.write_text(json.dumps({"agents": {"path": 42}}), encoding="utf-8")
+        monkeypatch.setattr(setup_mod, "_MEMEX_REGISTRY", registry)
+        c = check_memex()
+        assert c.ok is False
+
+    def test_valid_registry(self, monkeypatch, tmp_path):
+        registry = _patch_memex_registry(monkeypatch, tmp_path)
+        c = check_memex()
+        assert c.ok is True
+        assert json.loads(registry.read_text())["agents"]["path"] in c.detail
+
+
 class TestVerifyAll:
-    def test_returns_four_checks(self, monkeypatch):
-        _all_present(monkeypatch)
+    def test_returns_five_checks(self, monkeypatch, tmp_path):
+        _all_present(monkeypatch, tmp_path)
 
         checks = verify_all()
-        assert len(checks) == 4
-        assert {c.name for c in checks} == {"git", "gh", "python", "atelier"}
+        assert len(checks) == 5
+        assert {c.name for c in checks} == {"git", "gh", "python", "atelier", "memex"}
         assert all(c.ok for c in checks)
+
+    def test_verify_all_includes_memex(self, monkeypatch, tmp_path):
+        """Iron-Law test: memex is a CLAUDE.md hard dep — verify_all must check it."""
+        _all_present(monkeypatch, tmp_path)
+        assert "memex" in {c.name for c in verify_all()}
 
 
 # ── kaizen#98 Gap A — in-place-upgrade runtime glyph-gating warning ─────────

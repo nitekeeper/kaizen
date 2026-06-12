@@ -249,6 +249,27 @@ The boundary is narrow: this is *not* a general "skip atelier" license. If `atel
 
 ---
 
+## F16 — Mandatory loom-agent-chat inter-agent comms
+
+**Rule.** When the Loom desktop app's agent-chat server is available (auto-detected; `KAIZEN_LOOM_COMMS=0` is the ONLY opt-out), every kaizen team-mode and subagent-mode dispatch MUST carry the loom-comms instruction block, and agents MUST route teammate-to-teammate communication (status updates, clarifications, conflict negotiation, findings summaries) over loom-agent-chat. F7 `SendMessage(to="team-lead", ...)` completion replies are unchanged and remain the ONLY completion signal in team mode. Loom failures degrade gracefully and never abort a cycle.
+
+**Why it exists.** Direct user directive (2026-06-11): "when we use the kaizen skill in team/subagent mode, you must use the loom agent chat skill no matter what. this rule must be held as long as the loom is available." Before F16, kaizen had ZERO loom references — neither team mode (`scripts/team_executor.py` dispatches) nor subagent mode (`internal/cycle/SKILL.md`) mentioned loom, so spawned agents never used it even with Loom running. Loom gives the human a live, persistent observability surface over inter-agent chatter (the tmux panes only show each agent's own transcript), and gives agents a peer channel that does not consume the team-lead's context.
+
+**Mechanism.** A single stdlib-only module, `scripts/loom_comms.py`, owns the contract:
+
+1. `find_loom_client()` — locate the bundled `loom_chat.py` client: `KAIZEN_LOOM_CHAT` env pin → bounded-depth glob under `~/.claude/plugins/` → sibling-app fallback `~/apps/loom-agent-chat/`.
+2. `detect_loom()` — one timeout-bounded `detect` probe per process (cached); `KAIZEN_LOOM_COMMS=0` short-circuits to unavailable.
+3. `loom_comms_block(role, channel, client_path)` — the MANDATORY instruction block (register → join → send → inbox-at-phase-boundaries → ≤500-char bodies with `.loom/temp/` pointers for long content → deregister), ending with the load-bearing F7 caveat.
+4. `augment_dispatch(message, role=…, channel=…)` — splices the block immediately BEFORE the F7 trailer (mirroring `_inject_terse_before_trailer` so the trailer stays the prompt's last instruction). Bodies without the trailer — notably the GAP-7 `shutdown_request` STRUCTURED-JSON payload — pass through byte-exact. Never raises.
+
+**Wiring.** Team mode: the `_TrackedTools` proxy in `scripts/team_executor.py` augments every outgoing `send_message` / `send_message_many` body (single choke point — no per-dispatch-site edits, no F14 template/`_trailer.md` changes, byte-frozen trailer parity preserved); the executor also best-effort registers `team-lead` and creates the per-team channel (`channel_for_team(team_name)`) at cycle start, and deregisters the team-lead's assigned name at cycle teardown. Subagent mode: `internal/cycle/SKILL.md` § "Loom comms — MANDATORY when available (F16)" has the orchestrator run `python3 scripts/loom_comms.py detect` at cycle start, obtain the canonical channel name via `python3 scripts/loom_comms.py channel --run-id <id> --cycle <n>` (single naming authority — `channel_for_run` matches team mode's derivation exactly), and embed `python3 scripts/loom_comms.py block --role <role> --channel <chan>` output in every dispatched Agent prompt.
+
+**Degradation contract.** Detect failure, register failure, channel failure, or any subprocess error → log one line, dispatch unaugmented, keep the cycle running. Loom is an observability/coordination layer, never a gate.
+
+**Originating incident.** 2026-06-11 — user directive (this PR). Production-caller coverage in `tests/test_loom_comms.py` per `feedback-test-the-production-caller-not-just-units` (the run-61/run-67 lesson: units-only testing ships features that are dead end-to-end).
+
+---
+
 ## Deferred follow-ups
 
 The following items were considered during the kaizen#53 / run 33 rule consolidation and intentionally punted. They are recorded here so future contributors can see they were weighed.

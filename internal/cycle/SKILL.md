@@ -47,6 +47,40 @@ context. The end-to-end integration test
 through `orchestrate_run` with mocked callbacks — proving the Python side
 is complete.
 
+## Loom comms — MANDATORY when available (F16)
+
+When the Loom agent-chat server is available, inter-agent communication over loom-agent-chat is REQUIRED in BOTH modes (CLAUDE.md rule F16; `KAIZEN_LOOM_COMMS=0` is the only opt-out). Loom failures must never block or abort a cycle — on any loom error, note it and continue.
+
+**Mode scope.** In **team mode** this entire section is handled automatically by `scripts/team_executor.py`: it detects loom, registers the team-lead, creates the channel, injects the loom block into every dispatch at the `_TrackedTools` choke point, and deregisters the team-lead at cycle teardown. Do NOT also perform the numbered steps below by hand in team mode — a manual register would double-register the team-lead. The steps below are **subagent-mode orchestrator duties only**.
+
+**At cycle start** the subagent-mode orchestrator runs (from the kaizen root):
+
+```
+PYTHONPATH=. python3 scripts/loom_comms.py detect
+```
+
+- `{"available": false, ...}` (exit 3) → note "loom: unavailable" once and proceed exactly as before. Skip the rest of this section.
+- `{"available": true, "client": "<path>", ...}` (exit 0) → loom comms are mandatory for this cycle:
+
+1. **Obtain the canonical channel name** (single naming authority — the exact name team mode derives; never compose one by hand):
+
+   ```
+   PYTHONPATH=. python3 scripts/loom_comms.py channel --run-id <run_id> --cycle <cycle_n>
+   ```
+
+   Then register and open it using the `client` path from the detect JSON: `python3 <client> register "team-lead"` — capture the returned `assigned_name` (it may be collision-suffixed, e.g. `team-lead-2`) and use it verbatim as `--as "<assigned>"` everywhere below — then `python3 <client> create-channel <chan> --as "<assigned>"` (or `join` if it already exists).
+2. **Every dispatched Agent prompt MUST embed the loom block.** Obtain it via:
+
+   ```
+   PYTHONPATH=. python3 scripts/loom_comms.py block --role <role> --channel <chan>
+   ```
+
+   and append the printed block to the subagent's prompt. The block instructs the agent to register under its bare role id, join the channel, discover peers' ACTUAL assigned names from the channel member list before sending (registrations may be collision-suffixed), send peer communication via loom, check its inbox at phase boundaries, keep bodies ≤500 chars (file pointer under `.loom/temp/` in the working repo/clone root for longer content), and deregister on completion.
+3. **Orchestrator reads the channel between phases** (`python3 <client> read <chan> --as "<assigned>"`, then `mark-read` what it processed) so cross-agent chatter informs synthesis/review decisions.
+4. **Everyone deregisters at run end** — agents per their block; the orchestrator via `python3 <client> deregister --as "<assigned>"`.
+
+F7 is unchanged in team mode: the `SendMessage(to="team-lead", ...)` completion reply remains the ONLY completion signal — loom carries everything else.
+
 ## Inputs
 
 - `clone_dir` (Path) — the experiment clone, already on the run branch with atelier seeded.

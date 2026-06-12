@@ -103,6 +103,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from scripts import loom_comms
 from scripts._tmux_config import (
     check_glyph_readiness,
     install_team_window_hook,
@@ -1394,6 +1395,33 @@ def team_cycle_executor(
 
     team_name = f"kaizen-cycle-{run_row.get('id', 0)}-{cycle_n}"
 
+    # F16 — mandatory loom-agent-chat inter-agent comms when Loom is
+    # available (KAIZEN_LOOM_COMMS=0 is the only opt-out). Detect ONCE per
+    # executor run (detect_loom caches per process); every teammate-bound
+    # dispatch is then augmented at the single _TrackedTools choke point
+    # below. Best-effort by contract: loom errors never abort the cycle.
+    loom_info = loom_comms.detect_loom()
+    loom_channel = loom_comms.channel_for_team(team_name)
+    # The team-lead's ASSIGNED loom name (may be collision-suffixed, e.g.
+    # "team-lead-2"); None when setup failed/skipped. Consumed by the
+    # best-effort deregister in the cycle `finally` teardown below.
+    loom_lead_name: str | None = None
+    if loom_info.get("available"):
+        _log.info(
+            "kaizen F16: loom available (%s) — mandatory loom comms on channel %r",
+            loom_info.get("url", "?"),
+            loom_channel,
+        )
+        try:
+            loom_lead_name = loom_comms.team_lead_setup(loom_info["client"], loom_channel)
+        except Exception as exc:  # pragma: no cover — defensive (F16: never block)
+            _log.warning("kaizen F16: loom team-lead setup failed: %s", exc)
+    else:
+        _log.info(
+            "kaizen F16: loom unavailable (%s) — proceeding without loom comms",
+            loom_info.get("reason") or loom_info.get("source") or "unknown",
+        )
+
     outcome_acc = TeamCycleOutcome(participants=list(roster) if roster else [pm])
 
     commit_sha: str | None = None
@@ -1452,6 +1480,13 @@ def team_cycle_executor(
             # The retitle/fold keys off the INPUT ``to`` (not the response),
             # so it is valid to run in ``finally``; the bare ``finally``
             # re-raises the original exception automatically.
+            #
+            # F16 — augment EVERY outgoing teammate message with the loom-
+            # comms block (single choke point). `augment_dispatch` is a
+            # no-op when loom is unavailable, when the body carries no F7
+            # trailer (GAP-7 shutdown JSON passes through byte-exact), or
+            # on any loom error — it never raises.
+            message = loom_comms.augment_dispatch(message, role=to, channel=loom_channel)
             try:
                 resp = self._inner.send_message(team_id, to, message)
                 # active-member contract is INTENTIONALLY success-only
@@ -1502,6 +1537,21 @@ def team_cycle_executor(
             # retitle/re-fold in ``finally`` (keyed off the INPUT ``messages``,
             # not the responses) re-folds on BOTH the success and the raising
             # path; the bare ``finally`` re-raises the original exception.
+            #
+            # F16 — augment every batch message with the loom-comms block
+            # (same choke-point contract as ``send_message`` above). Built
+            # as NEW dicts so the caller's message dicts are not mutated;
+            # the ``finally`` block below reads only ``m["to"]``, which is
+            # preserved.
+            messages = [
+                {
+                    **m,
+                    "message": loom_comms.augment_dispatch(
+                        m["message"], role=m["to"], channel=loom_channel
+                    ),
+                }
+                for m in messages
+            ]
             try:
                 resps = self._inner.send_message_many(messages, quorum_floor=quorum_floor)
                 # Record every recipient on a SUCCESSFUL return. The batch is
@@ -2600,6 +2650,15 @@ def team_cycle_executor(
                 team_id,
                 exc,
             )
+        # F16 — best-effort team-lead loom deregister. Mirrors the
+        # registration in the cycle preamble; uses the ASSIGNED name
+        # (collision-suffix safe). Never blocks teardown: the helper is
+        # non-raising and the call is additionally guarded.
+        if loom_lead_name is not None:
+            try:
+                loom_comms.team_lead_teardown(loom_info["client"], loom_lead_name)
+            except Exception as exc:  # pragma: no cover — defensive (F16: never block)
+                _log.warning("kaizen F16: loom team-lead teardown failed: %s", exc)
 
     if outcome_acc.abandoned:
         assert outcome_acc.phase_reached in VALID_PHASES, (

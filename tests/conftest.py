@@ -7,7 +7,22 @@ from pathlib import Path
 
 import pytest
 
+from scripts import loom_comms
 from scripts.dispatch_templates import _reset_template_cache
+
+
+# F16 hermeticity: a live Loom server on the dev host must never leak
+# into the suite. Every test runs with the explicit kill-switch set and
+# a cold detect cache; tests that exercise loom behaviour override the
+# env (monkeypatch.setenv / delenv) and call `loom_comms.reset_cache()`
+# themselves. The guarded live-roundtrip test (KAIZEN_LOOM_LIVE=1)
+# deletes the kill-switch inside the test body.
+@pytest.fixture(autouse=True)
+def _isolate_loom_comms(monkeypatch):
+    monkeypatch.setenv("KAIZEN_LOOM_COMMS", "0")
+    loom_comms.reset_cache()
+    yield
+    loom_comms.reset_cache()
 
 
 # Any test that mutates files in `internal/cycle/templates/` (or that

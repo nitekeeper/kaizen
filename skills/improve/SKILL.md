@@ -33,6 +33,10 @@ Priority order when instructions conflict:
 
 > **Team mode** follows the launch sequence in Step 3b below.
 
+## Loom comms (F16)
+
+When the Loom agent-chat server is available, loom-agent-chat inter-agent comms are **MANDATORY** in both modes — `KAIZEN_LOOM_COMMS=0` is the only opt-out, and loom errors never abort a run. Detection and wiring are automatic: team mode injects the loom block at the dispatch choke point in `scripts/team_executor.py`; subagent mode follows the "Loom comms — MANDATORY when available (F16)" section in `internal/cycle/SKILL.md` (detect via `PYTHONPATH=. python3 scripts/loom_comms.py detect`; per-agent block via `PYTHONPATH=. python3 scripts/loom_comms.py block --role <role> --channel <chan>`). F7 `SendMessage` completion replies are unchanged.
+
 ## Procedure
 
 ### Step 1 — Verify hard dependencies

@@ -2,17 +2,28 @@
 
 from __future__ import annotations
 
+import os
+import subprocess as real_subprocess
+
 import pytest
 
+from scripts import _tmux_config
 from scripts._tmux_config import (
     CONFIG_BLOCK,
+    KAIZEN_FOLD_GUARD_OPTION,
+    KAIZEN_TEAM_HOOK_EVENT,
+    KAIZEN_TEAM_HOOK_NAME,
+    KAIZEN_TEAM_ID_OPTION,
     MARKER_END,
     MARKER_START,
     MARKER_VERSION,
     apply_config_block,
+    build_team_fold_hook_command,
     check_glyph_readiness,
     detect_existing_marker,
     extract_installed_block,
+    install_team_window_hook,
+    remove_team_window_hook,
     removed_glyph_gating_directives,
     show_diff,
 )
@@ -551,3 +562,422 @@ def test_check_glyph_readiness_malformed_marker_is_warning_not_raise(tmp_path):
     warnings = check_glyph_readiness(p)
     assert len(warnings) == 1
     assert "malformed" in warnings[0].lower()
+
+
+# ── run-76 AI-2 — pane-add reconcile hook (install / teardown / command) ───
+#
+# Test strategy mirrors the established tmux-boundary pattern from
+# tests/test_tmux_workspace.py: monkeypatch ``<module>.subprocess.run`` with a
+# fake that records argv and returns canned CompletedProcess results — no
+# live tmux server anywhere. On top of that, the hook SCRIPT itself (the
+# ``run-shell -b "<sh>"`` payload) is exercised functionally by simulating
+# tmux's format expansion (plain string substitution of the ``#{...}``
+# tokens, exactly what run-shell does before handing the script to /bin/sh)
+# and running the result with /bin/sh against recorder stubs standing in for
+# the python interpreter and the tmux binary. That gives REAL no-leak /
+# no-loop evidence (the Phase-3 "tests FIRST" pair) without inventing a tmux
+# mock contract.
+
+_HOOK_KW = {
+    "team_id": "tid-123",
+    "orchestrator_pane_id": "%1",
+    "kaizen_root": "/home/op/apps/kaizen",
+    "python_exe": "/usr/bin/python3",
+    "tmux_exe": "/usr/bin/tmux",
+    "tmux_env": "/tmp/tmux-1000/default,12345,3",
+}
+
+
+def _mk_proc(returncode: int = 0, stdout: str = "", stderr: str = ""):
+    return real_subprocess.CompletedProcess(
+        args=[], returncode=returncode, stdout=stdout, stderr=stderr
+    )
+
+
+def _extract_hook_script(hook_command: str) -> str:
+    """Peel the sh script out of the ``run-shell -b "<script>"`` tmux command."""
+    prefix = 'run-shell -b "'
+    assert hook_command.startswith(prefix), hook_command
+    assert hook_command.endswith('"'), hook_command
+    return hook_command[len(prefix) : -1]
+
+
+def _expand_formats(script: str, *, team_opt: str, guard_opt: str, team_id: str = "tid-123") -> str:
+    """Simulate run-shell's #{...} format expansion at hook-fire time.
+
+    The script's only format is the combined gate conditional
+    ``#{&&:#{==:#{@kaizen_team_id},<id>},#{!=:#{@kaizen_fold_hook_running},1}}``
+    — tmux evaluates the option comparisons in the FORMAT layer and expands
+    the whole token to a literal ``0``/``1`` (the option VALUES never reach
+    /bin/sh). ``team_opt`` / ``guard_opt`` are what the user-options hold in
+    the fired-on window: the team id (kaizen window), '' (foreign / untagged
+    window), or '1' (guard set mid-fold); the shim computes the verdict the
+    way tmux would.
+    """
+    gate_token = (
+        f"#{{&&:#{{==:#{{{KAIZEN_TEAM_ID_OPTION}}},{team_id}}},"
+        f"#{{!=:#{{{KAIZEN_FOLD_GUARD_OPTION}}},1}}}}"
+    )
+    assert gate_token in script, f"gate format token not found in script: {script}"
+    verdict = "1" if (team_opt == team_id and guard_opt != "1") else "0"
+    expanded = script.replace(gate_token, verdict)
+    # Drift guard: after expanding the gate the script must be fully concrete
+    # — a leftover #{...} would mean the shim no longer mirrors run-shell.
+    assert "#{" not in expanded, f"unexpanded format remains: {expanded}"
+    return expanded
+
+
+def _write_recorders(tmp_path):
+    """Create executable sh stubs for python/tmux that append to one log.
+
+    A shared log file preserves the relative ORDER of guard-set / fold /
+    guard-unset calls. The fake python dumps argv + the env vars the fold
+    entrypoint depends on (concern C evidence); the fake tmux dumps argv.
+    """
+    log = tmp_path / "calls.log"
+    fake_python = tmp_path / "fake_python"
+    fake_python.write_text(
+        "#!/bin/sh\n"
+        f'printf \'PY|%s|TMUX=%s|TMUX_PANE=%s|PYTHONPATH=%s|CWD=%s\\n\' "$*" "$TMUX" '
+        f'"$TMUX_PANE" "$PYTHONPATH" "$(pwd)" >> {log}\n'
+    )
+    fake_python.chmod(0o755)
+    fake_tmux = tmp_path / "fake_tmux"
+    fake_tmux.write_text(f"#!/bin/sh\nprintf 'TMUX|%s\\n' \"$*\" >> {log}\n")
+    fake_tmux.chmod(0o755)
+    return log, str(fake_python), str(fake_tmux)
+
+
+def _build_with_recorders(tmp_path):
+    log, fake_python, fake_tmux = _write_recorders(tmp_path)
+    cmd = build_team_fold_hook_command(
+        team_id="tid-123",
+        orchestrator_pane_id="%1",
+        kaizen_root=str(tmp_path),  # must exist — the script cd's into it
+        python_exe=fake_python,
+        tmux_exe=fake_tmux,
+        tmux_env="/tmp/tmux-1000/default,12345,3",
+    )
+    return log, _extract_hook_script(cmd)
+
+
+def _run_sh(script: str) -> real_subprocess.CompletedProcess:
+    return real_subprocess.run(
+        ["/bin/sh", "-c", script], capture_output=True, text=True, timeout=30
+    )
+
+
+# ── constants / structure ─────────────────────────────────────────────────
+
+
+def test_team_id_option_constant_matches_workspace_module():
+    """The window-tag option name is duplicated (no cross-imports between the
+    subprocess-wrapper modules) — pin the two literals equal so they can
+    never drift apart silently."""
+    from scripts._tmux_workspace import KAIZEN_TEAM_ID_OPTION as workspace_option
+
+    assert workspace_option == KAIZEN_TEAM_ID_OPTION
+
+
+def test_hook_binds_pane_add_event_only():
+    """Concern A (primary mechanism): the hook MUST bind after-split-window —
+    a pane-ADD command hook that our own fold (select-layout + join-pane)
+    never emits — and must be array-indexed so teardown removes only ours."""
+    assert KAIZEN_TEAM_HOOK_EVENT == "after-split-window"
+    assert KAIZEN_TEAM_HOOK_NAME == "after-split-window[88]"
+    cmd = build_team_fold_hook_command(**_HOOK_KW)
+    # The re-entrancy analysis only holds for the pane-add event; a rebinding
+    # to any layout-change event would loop (fold → event → fold → ...).
+    for looping_event in ("window-layout-changed", "after-select-layout", "after-join-pane"):
+        assert looping_event not in cmd
+        assert looping_event not in KAIZEN_TEAM_HOOK_NAME
+
+
+def test_hook_command_is_single_background_run_shell():
+    """The hook value is exactly one ``run-shell -b "<sh>"`` tmux command;
+    -b keeps the fold off the tmux server's main loop."""
+    cmd = build_team_fold_hook_command(**_HOOK_KW)
+    script = _extract_hook_script(cmd)
+    # No characters that would break tmux's double-quote parse of the script.
+    assert '"' not in script
+    assert "\\" not in script
+    assert "$" not in script
+    # "Exactly one command" means tmux must find no separator it would split
+    # on: no newlines anywhere, and no ';' OUTSIDE the double-quoted script
+    # (the script's own ';'s are sh statement separators, quoted away from
+    # tmux). Everything outside the two delimiting quotes must be exactly
+    # the run-shell invocation itself.
+    assert "\n" not in cmd
+    outside = cmd[: cmd.index('"')] + cmd[cmd.rindex('"') + 1 :]
+    assert outside == "run-shell -b "
+    assert ";" not in outside
+
+
+def test_hook_script_gates_on_team_id_before_any_side_effect():
+    """Concern B (BLOCKER, structural half): the team-id comparison happens in
+    tmux's FORMAT layer (option value never reaches sh) and must come before
+    the guard toggles and the fold invocation."""
+    script = _extract_hook_script(build_team_fold_hook_command(**_HOOK_KW))
+    gate_pos = script.index("#{&&:")
+    # The comparison is a format conditional embedding the expected id...
+    assert f"#{{==:#{{{KAIZEN_TEAM_ID_OPTION}}},tid-123}}" in script
+    # ...and the RAW option value is never spliced into sh quoting (a value
+    # containing a quote would otherwise be shell injection at hook-fire).
+    assert f"'#{{{KAIZEN_TEAM_ID_OPTION}}}'" not in script
+    assert f"'#{{{KAIZEN_FOLD_GUARD_OPTION}}}'" not in script
+    assert gate_pos < script.index(f"{KAIZEN_FOLD_GUARD_OPTION} 1")
+    assert gate_pos < script.index("scripts.fold_workspace")
+
+
+def test_hook_command_is_env_self_contained():
+    """Concern C: absolute interpreter + PYTHONPATH + cwd + TMUX socket +
+    orchestrator TMUX_PANE are all embedded — nothing inherited from the
+    tmux server's context."""
+    script = _extract_hook_script(build_team_fold_hook_command(**_HOOK_KW))
+    assert "cd '/home/op/apps/kaizen'" in script
+    assert "PYTHONPATH='/home/op/apps/kaizen'" in script
+    assert "'/usr/bin/python3' -m scripts.fold_workspace" in script
+    assert "TMUX='/tmp/tmux-1000/default,12345,3'" in script
+    # The ORCHESTRATOR pane id (not #{hook_pane}): it pins tmux's
+    # current-window resolution to the kaizen window AND keeps
+    # _orchestrator_pane_id()'s PM-pane exclusion correct inside the fold.
+    assert "TMUX_PANE='%1'" in script
+    # No bare interpreter that would resolve via the server's PATH.
+    assert " python3 -m" not in script
+
+
+def test_hook_script_has_reentrancy_guard_around_fold():
+    """Concern A (belt-and-suspenders half): guard checked (format layer),
+    set before the fold, unset after — so a sequential hook→fold→hook
+    re-fire no-ops. Set/unset are addressed via the ORCHESTRATOR pane
+    (stable lifetime, same window) — a #{hook_pane} target could die
+    mid-fold and strand the guard at 1, muting the hook for the run."""
+    script = _extract_hook_script(build_team_fold_hook_command(**_HOOK_KW))
+    check = script.index(f"#{{!=:#{{{KAIZEN_FOLD_GUARD_OPTION}}},1}}")
+    set_on = script.index(f"set-option -w -t '%1' {KAIZEN_FOLD_GUARD_OPTION} 1")
+    fold = script.index("scripts.fold_workspace")
+    unset = script.index(f"set-option -wu -t '%1' {KAIZEN_FOLD_GUARD_OPTION}")
+    assert check < set_on < fold < unset
+    assert "#{hook_pane}" not in script
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [
+        ("team_id", "tid;rm -rf /"),
+        ("team_id", "tid'quote"),
+        ("team_id", 'tid"quote'),
+        ("team_id", "tid with space"),
+        ("team_id", "tid#{format}"),
+        ("team_id", "tid$HOME"),
+        ("team_id", ""),
+        ("orchestrator_pane_id", "not-a-pane"),
+        ("kaizen_root", "relative/path"),
+        ("kaizen_root", "/path/with'quote"),
+        ("python_exe", "/usr/bin/py thon"),
+        ("tmux_exe", "/usr/bin/tmux;evil"),
+        ("tmux_env", "no-leading-slash,1,2"),
+    ],
+)
+def test_builder_rejects_values_outside_allowlist(field, bad_value):
+    """Everything interpolated into the hook crosses tmux-parse → format
+    expansion → /bin/sh; anything outside the conservative charset is
+    refused outright rather than escaped."""
+    kwargs = dict(_HOOK_KW)
+    kwargs[field] = bad_value
+    with pytest.raises(ValueError) as exc:
+        build_team_fold_hook_command(**kwargs)
+    assert field in str(exc.value)
+
+
+# ── functional sh-level tests — no-leak and no-loop FIRST (Phase 3 close) ──
+
+
+def test_hook_script_does_not_leak_to_foreign_windows(tmp_path):
+    """NO-LEAK (concern B, functional half): on a window without the
+    @kaizen_team_id tag the option expands empty → the script must perform
+    ZERO side effects — no fold spawn, not even a guard set-option."""
+    log, script = _build_with_recorders(tmp_path)
+    expanded = _expand_formats(script, team_opt="", guard_opt="")
+    proc = _run_sh(expanded)
+    assert proc.returncode == 0, proc.stderr
+    assert not log.exists(), f"foreign window triggered side effects: {log.read_text()}"
+
+
+def test_hook_script_does_not_leak_to_other_team_windows(tmp_path):
+    """A window tagged by a DIFFERENT kaizen team must not match either."""
+    log, script = _build_with_recorders(tmp_path)
+    expanded = _expand_formats(script, team_opt="other-team", guard_opt="")
+    proc = _run_sh(expanded)
+    assert proc.returncode == 0, proc.stderr
+    assert not log.exists()
+
+
+def test_hook_script_no_loop_when_guard_already_set(tmp_path):
+    """NO-LOOP (concern A, functional half): a re-entrant fire — guard option
+    already '1' because a hook-triggered fold is in flight — must no-op
+    instead of spawning another fold (which is how a loop would sustain)."""
+    log, script = _build_with_recorders(tmp_path)
+    expanded = _expand_formats(script, team_opt="tid-123", guard_opt="1")
+    proc = _run_sh(expanded)
+    assert proc.returncode == 0, proc.stderr
+    assert not log.exists(), f"re-entrant fire still ran the fold: {log.read_text()}"
+
+
+def test_hook_script_runs_fold_for_team_window(tmp_path):
+    """On the kaizen team window the script runs guard-on → fold → guard-off,
+    exactly once, with the self-contained env actually delivered."""
+    log, script = _build_with_recorders(tmp_path)
+    expanded = _expand_formats(script, team_opt="tid-123", guard_opt="")
+    proc = _run_sh(expanded)
+    assert proc.returncode == 0, proc.stderr
+    lines = log.read_text().splitlines()
+    assert len(lines) == 3, lines
+    guard_on, fold, guard_off = lines
+    # Ordering: guard set → fold → guard unset — addressed via the
+    # ORCHESTRATOR pane (%1, stable for the run; -w resolves it to the shared
+    # window), never the mortal freshly-split pane.
+    assert guard_on == f"TMUX|set-option -w -t %1 {KAIZEN_FOLD_GUARD_OPTION} 1"
+    assert guard_off == f"TMUX|set-option -wu -t %1 {KAIZEN_FOLD_GUARD_OPTION}"
+    # The fold invocation: right entrypoint, right team id, exactly one spawn.
+    assert fold.startswith("PY|-m scripts.fold_workspace --team-id tid-123|")
+    # Concern C delivered end-to-end: env vars + cwd as embedded.
+    assert "|TMUX=/tmp/tmux-1000/default,12345,3|" in fold
+    assert "|TMUX_PANE=%1|" in fold
+    assert f"|PYTHONPATH={tmp_path}|" in fold
+    cwd = fold.rsplit("|CWD=", 1)[1]
+    assert os.path.realpath(cwd) == os.path.realpath(str(tmp_path))
+
+
+# ── install_team_window_hook ──────────────────────────────────────────────
+
+
+@pytest.fixture()
+def _hook_env(monkeypatch):
+    """Place the test inside a synthetic orchestrator pane."""
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,12345,3")
+
+
+def test_install_tags_window_then_sets_hook(monkeypatch, _hook_env):
+    """Install order is load-bearing: window tag FIRST (so the hook can never
+    fire ungated), then the global indexed set-hook."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _mk_proc(0)
+
+    monkeypatch.setattr(_tmux_config.subprocess, "run", fake_run)
+    assert install_team_window_hook("tid-123", tmux_exe="/usr/bin/tmux") is True
+    assert len(calls) == 2
+    assert calls[0] == ["tmux", "set-option", "-w", "-t", "%1", KAIZEN_TEAM_ID_OPTION, "tid-123"]
+    assert calls[1][:3] == ["tmux", "set-hook", "-g"]
+    assert calls[1][3] == KAIZEN_TEAM_HOOK_NAME
+    assert calls[1][4].startswith('run-shell -b "')
+    assert "tid-123" in calls[1][4]
+
+
+def test_install_refuses_outside_tmux(monkeypatch):
+    """No $TMUX_PANE / $TMUX → warn-and-refuse with ZERO tmux calls."""
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    monkeypatch.delenv("TMUX", raising=False)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _mk_proc(0)
+
+    monkeypatch.setattr(_tmux_config.subprocess, "run", fake_run)
+    assert install_team_window_hook("tid-123") is False
+    assert calls == []
+
+
+def test_install_refuses_unsafe_team_id(monkeypatch, _hook_env, capsys):
+    """An allowlist-violating team id is refused BEFORE any tmux write."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _mk_proc(0)
+
+    monkeypatch.setattr(_tmux_config.subprocess, "run", fake_run)
+    assert install_team_window_hook("tid'; run-shell evil", tmux_exe="/usr/bin/tmux") is False
+    assert calls == []
+    assert "allowlist" in capsys.readouterr().err
+
+
+def test_install_skips_hook_when_window_tag_fails(monkeypatch, _hook_env):
+    """If the gate tag cannot be written, the hook must NOT be installed —
+    never ship an ungated (or gate-less) global hook."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "set-option" in argv:
+            return _mk_proc(1, stderr="bad option")
+        return _mk_proc(0)
+
+    monkeypatch.setattr(_tmux_config.subprocess, "run", fake_run)
+    assert install_team_window_hook("tid-123", tmux_exe="/usr/bin/tmux") is False
+    assert not any("set-hook" in c for c in calls)
+
+
+def test_install_tolerates_no_server(monkeypatch, _hook_env):
+    """House soft-failure contract: no tmux server → False, never raises."""
+
+    def fake_run(argv, **kwargs):
+        return _mk_proc(1, stderr="no server running on /tmp/tmux-1000/default")
+
+    monkeypatch.setattr(_tmux_config.subprocess, "run", fake_run)
+    assert install_team_window_hook("tid-123", tmux_exe="/usr/bin/tmux") is False
+
+
+# ── remove_team_window_hook ───────────────────────────────────────────────
+
+
+def test_remove_unsets_only_the_kaizen_indexed_hook(monkeypatch, _hook_env):
+    """Teardown removes OUR array entry (after-split-window[88]) and only it —
+    plus the window tag and any stale guard flag — leaving operator hooks at
+    other indices untouched."""
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _mk_proc(0)
+
+    monkeypatch.setattr(_tmux_config.subprocess, "run", fake_run)
+    assert remove_team_window_hook() is True
+    unhooks = [c for c in calls if "set-hook" in c]
+    assert unhooks == [["tmux", "set-hook", "-gu", KAIZEN_TEAM_HOOK_NAME]]
+    # The bare event name (which would nuke ALL after-split-window hooks)
+    # must never be passed — only the indexed entry.
+    assert not any(c[-1] == KAIZEN_TEAM_HOOK_EVENT for c in unhooks)
+    option_unsets = [c for c in calls if "set-option" in c]
+    assert ["tmux", "set-option", "-wu", "-t", "%1", KAIZEN_TEAM_ID_OPTION] in option_unsets
+    assert ["tmux", "set-option", "-wu", "-t", "%1", KAIZEN_FOLD_GUARD_OPTION] in option_unsets
+
+
+def test_remove_skips_option_unsets_without_pane(monkeypatch):
+    """Outside tmux (no pane id available) only the hook unset runs — the
+    success criterion — and the option unsets are skipped, not crashed."""
+    monkeypatch.delenv("TMUX_PANE", raising=False)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return _mk_proc(0)
+
+    monkeypatch.setattr(_tmux_config.subprocess, "run", fake_run)
+    assert remove_team_window_hook() is True
+    assert calls == [["tmux", "set-hook", "-gu", KAIZEN_TEAM_HOOK_NAME]]
+
+
+def test_remove_tolerates_no_server(monkeypatch, _hook_env):
+    """No server → nothing to tear down; report False, never raise."""
+
+    def fake_run(argv, **kwargs):
+        return _mk_proc(1, stderr="no server running on /tmp/tmux-1000/default")
+
+    monkeypatch.setattr(_tmux_config.subprocess, "run", fake_run)
+    assert remove_team_window_hook() is False

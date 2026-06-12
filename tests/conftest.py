@@ -31,6 +31,36 @@ def _isolate_template_cache():
     yield
 
 
+# run-76 AI-4 rider (reviewer-imposed) — suite-wide isolation from the REAL
+# tmux server's GLOBAL hook state (the kaizen#98 operator-config-drift class).
+# `scripts.team_executor` installs/removes the `after-split-window[88]`
+# reconcile hook at workspace boot / cycle teardown; LEGACY executor-driving
+# test files (tests/test_team_executor_cleanup.py, tests/test_caveman_codec.py,
+# tests/test_end_to_end_team_mode.py, tests/test_f3_fire_order.py, ...) drive
+# `team_cycle_executor` without patching those seams. When pytest runs inside
+# a MULTI-PANE tmux window, the real `apply_workspace_layout` returns a
+# non-empty pane map, the install gate passes, and every such test would write
+# a real `set-hook -g after-split-window[88]` + window tags on the developer's
+# live server — a killed run could leak an active global hook. Stub the three
+# seams to inert fakes for EVERY test. This does not blunt the dedicated
+# coverage: tests/test_team_executor.py re-patches the same attributes with
+# per-test recorders (a monkeypatch applied later in the fixture chain — its
+# module autouse fixture and test-body patches — wins over this one), and the
+# hook/fold tests in tests/test_tmux_config.py / tests/test_tmux_workspace.py /
+# tests/test_tmux_hook_reconcile.py exercise the helper MODULES directly, not
+# team_executor's rebindings.
+@pytest.fixture(autouse=True)
+def _isolate_team_window_hook_seams_suite_wide(monkeypatch):
+    import scripts.team_executor as _team_executor
+
+    monkeypatch.setattr(_team_executor, "install_team_window_hook", lambda team_id, **kw: True)
+    monkeypatch.setattr(_team_executor, "remove_team_window_hook", lambda **kw: True)
+    # None = "tmux soft-fail" → the pane-signature delta trigger stays
+    # disarmed (and adds zero subprocess reads) unless a test scripts it.
+    monkeypatch.setattr(_team_executor, "_pane_signature", lambda workspace_name: None)
+    yield
+
+
 def _git(args: list[str], cwd: Path) -> None:
     subprocess.run(
         ["git", *args],

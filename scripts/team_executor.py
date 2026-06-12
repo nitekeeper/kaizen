@@ -103,10 +103,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from scripts._tmux_config import check_glyph_readiness
+from scripts._tmux_config import (
+    check_glyph_readiness,
+    install_team_window_hook,
+    remove_team_window_hook,
+)
 from scripts._tmux_workspace import (
     KAIZEN_TEAM_ID_OPTION,
     PANE_LABEL_PREFIX_RE,
+    _pane_signature,
     apply_workspace_layout,
     set_pane_title,
     set_pane_titles,
@@ -1473,6 +1478,11 @@ def team_cycle_executor(
                 # add a per-message fold.
                 needs_refold[0] = False
                 _retitle_on_first_send(to)
+                # run-76 — pane-signature delta trigger: catches a mid-phase
+                # REMOVE/RESPAWN (no new recipient, so the first-contact
+                # heuristic is blind) at this servicing opportunity instead
+                # of waiting for the next phase boundary.
+                _flag_refold_on_pane_delta()
                 if needs_refold[0] and not suppress_batch_refold[0]:
                     _request_orchestrator_fold()
                 needs_refold[0] = False
@@ -1524,6 +1534,10 @@ def team_cycle_executor(
                     # kaizen#61 — retitle each batch recipient on first
                     # observation. Set-membership keeps repeats cheap.
                     _retitle_on_first_send(m["to"])
+                # run-76 — pane-signature delta trigger (one read per BATCH,
+                # not per message): catches mid-phase REMOVE/RESPAWN the
+                # first-contact pass above cannot see.
+                _flag_refold_on_pane_delta()
                 # Fold ONCE after the whole batch — unless a phase boundary
                 # owns the fold (``suppress_batch_refold``), per kaizen#88
                 # MAJOR-2.
@@ -1571,12 +1585,16 @@ def team_cycle_executor(
     # recipient" is a FIRST-CONTACT HEURISTIC, NOT a true pane-count delta: it
     # fires on teammate ADD but is blind to teammate REMOVE (TeamDelete of a
     # straggler) and to RESPAWN of an already-seen role. Those cases are
-    # backstopped by the UNCONDITIONAL per-phase-boundary fold
-    # (``_phase_boundary_fold``) issued at each Phase-4 wave boundary and each
-    # Phase-5b' reviewer iteration — that is the backbone that delivers
-    # "PM-left + 2-col grid at ALL times"; the heuristic is a within-batch
-    # complement so a mid-phase spawn re-folds promptly rather than waiting
-    # for the next boundary. (review MAJOR-1 / MINOR-5)
+    # covered mid-phase by the run-76 pane-signature delta trigger
+    # (``_flag_refold_on_pane_delta`` — any membership change vs the
+    # last-folded signature flags a re-fold at the next servicing
+    # opportunity) and, as the unconditional backbone, by the
+    # per-phase-boundary fold (``_phase_boundary_fold``) issued at each
+    # Phase-4 wave boundary and each Phase-5b' reviewer iteration — that is
+    # the floor that delivers "PM-left + 2-col grid at ALL times"; the
+    # heuristic is a within-batch complement so a mid-phase spawn re-folds
+    # promptly rather than waiting for the next boundary.
+    # (review MAJOR-1 / MINOR-5; run-76 item 3)
     seen_recipients: set[str] = set()
     # Per-batch "a new pane appeared — re-fold once after this batch" flag.
     # Mutated by ``_retitle_on_first_send``; checked + cleared by the
@@ -1593,6 +1611,27 @@ def team_cycle_executor(
     # the per-wave / per-iteration fold count is exactly 1. A list so the
     # closure can mutate it.
     suppress_batch_refold: list[bool] = [False]
+    # run-76 layout consistency — the pane-SET signature observed at the last
+    # fold REQUEST (the set the requested reconcile converges on). The
+    # ``_flag_refold_on_pane_delta`` trigger compares the live
+    # ``_pane_signature`` against this baseline at each servicing opportunity:
+    # ANY membership delta (ADD, REMOVE, or RESPAWN id-churn) flags a re-fold,
+    # closing the first-contact heuristic's REMOVE/RESPAWN blind spot
+    # mid-phase rather than waiting for the next boundary. ``None`` = trigger
+    # DISARMED (no fold requested yet, tmux soft-failed at capture time, or
+    # the window held no teammate panes — an EMPTY baseline is normalised to
+    # None so headless / single-pane environments never run per-message
+    # list-panes reads). A list so the closure can mutate it.
+    last_fold_sig: list[frozenset[str] | None] = [None]
+    # run-76 — was the after-split-window reconcile-hook install ATTEMPTED?
+    # Gates the finally-block teardown: when True, ``remove_team_window_hook``
+    # MUST run post-cycle (concern D — the hook lives in the operator's
+    # long-running tmux server and must not outlive the run), even when the
+    # install itself reported False (a partial install may have written the
+    # window tag before refusing). When False there is nothing to remove and
+    # the teardown is skipped (keeps headless/test runs free of global
+    # set-hook churn). A list so the closure can mutate it.
+    hook_install_attempted: list[bool] = [False]
 
     def _request_orchestrator_fold() -> None:
         """Emit an ``apply_layout`` bridge request so the ORCHESTRATOR folds
@@ -1607,11 +1646,60 @@ def team_cycle_executor(
         so firing it repeatedly is safe — never call ``fold_right_column``
         directly here. Best-effort + cosmetic: the wrapper swallows bridge
         errors so a layout request can never abort the cycle.
+
+        run-76 — also re-baselines ``last_fold_sig`` to the pane signature
+        observed at request time: the requested reconcile converges on (at
+        least) this set, so the delta trigger should compare future reads
+        against it. Captured BEFORE the request so a pane that materialises
+        while the fold is in flight still reads as a delta next opportunity
+        (worst case: one redundant idempotent re-fold, never a missed one).
+        An EMPTY signature disarms the trigger (normalised to None) — no
+        teammate panes means there is no grid to keep consistent.
         """
+        try:
+            sig = _pane_signature(team_name)
+            last_fold_sig[0] = sig or None
+        except Exception as exc:  # pragma: no cover - defensive
+            _log.warning("pane-signature baseline read failed: %s", exc)
+            last_fold_sig[0] = None
         try:
             tools.apply_layout(team_id)
         except Exception as exc:  # pragma: no cover - defensive
             _log.warning("apply_layout request failed: %s", exc)
+
+    def _flag_refold_on_pane_delta() -> None:
+        """Pane-signature delta trigger (run-76 layout consistency).
+
+        Runs at each ``_TrackedTools`` servicing opportunity, AFTER the
+        first-contact retitle pass. Compares the live teammate pane SET
+        (:func:`scripts._tmux_workspace._pane_signature`) against the
+        signature captured at the last fold request; ANY membership change —
+        ADD the first-contact heuristic missed, REMOVE (straggler reap), or
+        RESPAWN id-churn — sets ``needs_refold`` so the wrapper's existing
+        coalesced-fold logic re-folds once for the batch. This is the trigger
+        the cap-exhaust comment in ``_tmux_workspace.fold_current_window``
+        names as the recovery path; it complements (never replaces) the
+        unconditional per-phase-boundary fold and the after-split-window
+        tmux hook.
+
+        Cheap + bounded + degrade-never-raise: one ``list-panes`` read per
+        opportunity, and ONLY when armed — skipped when a re-fold is already
+        flagged, when a phase boundary owns the fold
+        (``suppress_batch_refold``), or when the baseline is disarmed
+        (``None``: no fold yet / tmux soft-failed / no teammate panes). A
+        soft-failed read (``None`` signature) is ignored, never a trigger.
+        """
+        if needs_refold[0] or suppress_batch_refold[0]:
+            return
+        if last_fold_sig[0] is None:
+            return
+        try:
+            sig = _pane_signature(team_name)
+        except Exception as exc:  # pragma: no cover - defensive
+            _log.warning("pane-signature delta read failed: %s", exc)
+            return
+        if sig is not None and sig != last_fold_sig[0]:
+            needs_refold[0] = True
 
     def _phase_boundary_fold() -> None:
         """Unconditional, idempotent re-fold issued at a phase boundary.
@@ -1667,6 +1755,42 @@ def team_cycle_executor(
             # label and decide whether a tmux call is needed.
             for role in pane_to_agent.values():
                 current_title[role] = role
+            # run-76 layout consistency — install the after-split-window
+            # reconcile hook at workspace boot, so tmux's OWN pane-add event
+            # (not Python's first-contact guess) re-folds the grid the moment
+            # a team pane materialises. Gated on a NON-EMPTY pane map: the
+            # map is the executor's positive evidence that its tmux context
+            # ($TMUX / $TMUX_PANE, inherited from the orchestrator session)
+            # actually reaches the team window — headless CI, a single-pane
+            # test window, or a detached process that cannot see the window
+            # all yield an empty map, and installing a server-GLOBAL hook
+            # from such a context would be wrong (concern B/C). The helper
+            # itself re-validates $TMUX/$TMUX_PANE and the hook-safety
+            # allowlists, and returns False (warn-not-raise) on refusal — a
+            # False must NOT abort the cycle; the per-phase-boundary fold and
+            # the pane-signature delta trigger remain the fallback layout
+            # mechanisms. ONE-SHOT by design (this whole function is gated by
+            # ``layout_applied``): a transient tmux hiccup at first send
+            # (empty map / refused install) skips the hook for the remainder
+            # of the cycle with no retry — an ACCEPTED degrade, since the
+            # boundary fold + delta trigger deliver the same invariant at a
+            # coarser cadence. Known accepted limitation: the hook array index
+            # (after-split-window[88]) is server-global, so two concurrent
+            # kaizen runs on one tmux server would collide — concurrent runs
+            # are already barred by the operational no-concurrent-runs rule.
+            # Teardown (concern D) is the gated ``remove_team_window_hook``
+            # in the cycle's finally block below.
+            hook_install_attempted[0] = True
+            try:
+                if not install_team_window_hook(team_id):
+                    _log.warning(
+                        "after-split-window reconcile hook not installed for "
+                        "team %s (helper refused — see stderr); proceeding "
+                        "with boundary-fold + delta-trigger fallback.",
+                        team_id,
+                    )
+            except Exception as exc:  # pragma: no cover - defensive
+                _log.warning("install_team_window_hook raised for team %s: %s", team_id, exc)
         # kaizen#86/#88 — emit the FIRST orchestrator-side fold (the
         # post-first-wave fold). Subsequent spawn waves re-fold via the
         # ``needs_refold`` path in the ``_TrackedTools`` wrappers.
@@ -1706,7 +1830,9 @@ def team_cycle_executor(
 
         This first-contact flag is only a COMPLEMENT to the unconditional
         per-phase-boundary fold (``_phase_boundary_fold``) — it cannot see a
-        teammate REMOVE or a RESPAWN, which the boundary fold handles.
+        teammate REMOVE or a RESPAWN, which the run-76 pane-signature delta
+        trigger (``_flag_refold_on_pane_delta``) catches mid-phase and the
+        boundary fold backstops.
 
         Phase 4 and Phase 5b' wrap a different desired label
         (``[w{n}] {role}`` / ``[R{iter_n}] {role}``) so the per-spawn
@@ -2341,6 +2467,34 @@ def team_cycle_executor(
                 _log.warning("kaizen#96 cycle-level re-fold backstop failed: %s", fold_exc)
         raise
     finally:
+        # run-76 layout consistency (concern D) — tear down the
+        # after-split-window reconcile hook FIRST, before any teardown churn,
+        # on EVERY exit path (success, abandonment, exception): the hook
+        # lives in the operator's long-running tmux SERVER and would
+        # otherwise keep firing forever after the run ends. Gated on
+        # ``hook_install_attempted`` (not on install SUCCESS — a partial
+        # install may have written the window tag before refusing, and the
+        # removal helper clears the tag + guard option too); when no install
+        # was attempted there is nothing to remove. Accepted tradeoff: an
+        # install that refused BEFORE any tmux write still triggers this
+        # removal, whose ``set-hook -gu 'after-split-window[88]'`` would
+        # clear a hypothetical operator hook parked at the same index —
+        # index 88 is kaizen-reserved (see the install-site comment), so an
+        # unconditional-when-attempted teardown errs on the concern-D side
+        # (hook gone) rather than risk a leak. Best-effort: a removal
+        # failure is logged and MUST NOT block the shutdown handshake /
+        # team_delete invariants below.
+        if hook_install_attempted[0]:
+            try:
+                remove_team_window_hook()
+            except Exception as exc:  # pragma: no cover - defensive
+                _log.warning(
+                    "remove_team_window_hook failed for team %s: %s — the "
+                    "after-split-window[88] hook may be leaked; remove it "
+                    "manually via: tmux set-hook -gu 'after-split-window[88]'",
+                    team_id,
+                    exc,
+                )
         # GAP-7 (docs/kaizen/2026-05-24-bridge-smoke-3.md) — graceful
         # teammate shutdown BEFORE team_delete. Per CC's TeamCreate docs:
         # "Gracefully terminate teammates first, then call TeamDelete after

@@ -18,6 +18,7 @@ of `team_cycle_executor`:
 from __future__ import annotations
 
 import os
+from typing import ClassVar
 from unittest.mock import patch
 
 import pytest
@@ -117,6 +118,28 @@ def _happy_scripted() -> dict[str, str]:
         "Phase 4 wave": "applied the change",
         "Phase 5b'": "NO ISSUES",
     }
+
+
+# run-76 (review MAJOR-1) — keep EVERY test in this module off the real tmux
+# server's GLOBAL hook state. The executor now installs/removes the
+# after-split-window[88] reconcile hook at workspace boot / cycle teardown;
+# legacy tests in this module drive `team_cycle_executor` without patching
+# the layout seams, and when pytest runs inside a MULTI-PANE tmux window the
+# real `apply_workspace_layout` returns a non-empty pane map — the install
+# gate would then pass and each test would write `set-hook -g
+# after-split-window[88]` + window tags on the operator's live server (a
+# killed test run could leak an active global hook — the kaizen#98 drift
+# class). This autouse fixture stubs the three run-76 seams to inert fakes
+# for every test; the run-76 wiring tests below re-patch them per-test with
+# recorders, which override this fixture (monkeypatch in the test body wins).
+@pytest.fixture(autouse=True)
+def _isolate_team_window_hook_seams(monkeypatch):
+    monkeypatch.setattr(team_executor_mod, "install_team_window_hook", lambda team_id, **kw: True)
+    monkeypatch.setattr(team_executor_mod, "remove_team_window_hook", lambda **kw: True)
+    # None = "tmux soft-fail" → the pane-signature delta trigger stays
+    # disarmed (and adds zero subprocess reads) unless a test scripts it.
+    monkeypatch.setattr(team_executor_mod, "_pane_signature", lambda ws: None)
+    yield
 
 
 def _patch_phase5c(monkeypatch):
@@ -2456,3 +2479,339 @@ class TestParseReviewerResponseMixedReply:
         assert _parse_reviewer_response("NO ISSUES", "reviewer-1", prefix="R1") == []
         assert _parse_reviewer_response("no issues found.", "reviewer-1", prefix="R1") == []
         assert _parse_reviewer_response("", "reviewer-1", prefix="R1") == []
+
+
+# ── run-76 — after-split-window reconcile hook wiring + pane-signature ──────
+# delta trigger. These tests drive the PRODUCTION caller (team_cycle_executor
+# through the _TrackedTools wrappers / _setup_tmux_layout_once / the cycle
+# finally block) via the module-attribute injection seams — never the
+# _tmux_config/_tmux_workspace helpers directly — per the no-inert-lever
+# acceptance criterion (this repo has shipped dead levers before; see
+# feedback-test-the-production-caller-not-just-units).
+
+
+_FAKE_PANE_MAP = {"%1": "pm-1", "%2": "backend-engineer-1"}
+
+
+def _patch_tmux_layout_seams(
+    monkeypatch,
+    *,
+    pane_map: dict[str, str] | None = None,
+    install_result: bool = True,
+) -> tuple[list, list]:
+    """Patch every tmux seam `_setup_tmux_layout_once` / the finally block
+    touches so no real tmux server is mutated, and return
+    ``(install_calls, remove_calls)`` recorders for the hook helpers.
+    """
+    install_calls: list = []
+    remove_calls: list = []
+    resolved_map = dict(_FAKE_PANE_MAP if pane_map is None else pane_map)
+    monkeypatch.setattr(
+        team_executor_mod, "apply_workspace_layout", lambda **kw: dict(resolved_map)
+    )
+    monkeypatch.setattr(team_executor_mod, "set_pane_titles", lambda *a, **k: None)
+    monkeypatch.setattr(team_executor_mod, "set_pane_title", lambda *a, **k: None)
+    monkeypatch.setattr(team_executor_mod, "check_glyph_readiness", lambda *a, **k: [])
+    monkeypatch.setattr(team_executor_mod, "_live_allow_set_title", lambda: None)
+    # Skip the real cleanup grace sleeps so these tests stay fast.
+    monkeypatch.setattr(team_executor_mod, "_sleep", lambda s: None)
+    # Default the signature seam to "tmux soft-fail" (delta trigger disarmed)
+    # so the hook tests are independent of the delta logic; the delta tests
+    # override this with scripted signatures.
+    monkeypatch.setattr(team_executor_mod, "_pane_signature", lambda ws: None)
+
+    def fake_install(team_id, **kwargs):
+        install_calls.append(team_id)
+        return install_result
+
+    def fake_remove(**kwargs):
+        remove_calls.append(kwargs)
+        return True
+
+    monkeypatch.setattr(team_executor_mod, "install_team_window_hook", fake_install)
+    monkeypatch.setattr(team_executor_mod, "remove_team_window_hook", fake_remove)
+    return install_calls, remove_calls
+
+
+def _patch_pane_signature_sequence(monkeypatch, values: list) -> list:
+    """Patch the `_pane_signature` seam to return ``values`` in order,
+    repeating the LAST value once exhausted. Returns the read log.
+    """
+    seq = list(values)
+    reads: list = []
+
+    def fake_sig(workspace_name):
+        value = seq.pop(0) if len(seq) > 1 else seq[0]
+        reads.append(value)
+        return value
+
+    monkeypatch.setattr(team_executor_mod, "_pane_signature", fake_sig)
+    return reads
+
+
+def _run_cycle(tools, tmp_path, roster=None):
+    with patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}):
+        return team_cycle_executor(
+            clone_dir=tmp_path,
+            project=_project(roster=roster),
+            run_row=_run_row(),
+            cycle_n=1,
+            tools=tools,
+        )
+
+
+class TestTeamWindowHookWiring:
+    """The after-split-window reconcile hook is installed at workspace boot
+    and torn down in the cycle finally block — on EVERY exit path (concern D:
+    the hook must never outlive the run in the operator's tmux server).
+    """
+
+    def test_hook_installed_at_workspace_boot_and_removed_before_team_delete(
+        self, tmp_path, monkeypatch
+    ):
+        """Workspace boot (first send → `_setup_tmux_layout_once`) installs
+        the hook with the real team_id; the finally block removes it BEFORE
+        team_delete (concern D ordering: hook gone before the team is gone).
+        """
+        events: list[str] = []
+        _patch_tmux_layout_seams(monkeypatch)
+        monkeypatch.setattr(
+            team_executor_mod,
+            "install_team_window_hook",
+            lambda team_id, **kw: (events.append(f"install({team_id})"), True)[1],
+        )
+        monkeypatch.setattr(
+            team_executor_mod,
+            "remove_team_window_hook",
+            lambda **kw: (events.append("remove"), True)[1],
+        )
+
+        class _RecordingTools(MockTeamTools):
+            def team_delete(self, team_id):
+                events.append(f"team_delete({team_id})")
+                super().team_delete(team_id)
+
+        tools = _RecordingTools(scripted={"Phase 1": "ABANDON: stop"})
+        outcome = _run_cycle(tools, tmp_path)
+
+        assert outcome["status"] == "abandoned"
+        installs = [e for e in events if e.startswith("install(")]
+        removes = [e for e in events if e == "remove"]
+        assert installs == ["install(team-kaizen-cycle-1-1)"], (
+            f"hook must be installed exactly once at workspace boot with the "
+            f"TeamCreate team_id; events: {events}"
+        )
+        assert len(removes) == 1, f"hook must be removed exactly once post-cycle; events: {events}"
+        assert events.index("remove") < events.index("team_delete(team-kaizen-cycle-1-1)"), (
+            f"concern D: the hook teardown must fire BEFORE team_delete in the "
+            f"cleanup flow; events: {events}"
+        )
+
+    def test_hook_install_refusal_does_not_abort_cycle(self, tmp_path, monkeypatch):
+        """install returns False (warn-not-raise refusal) → the cycle still
+        runs to SUCCESS, and teardown still fires (a partial install may have
+        written the window tag, which remove also clears).
+        """
+        install_calls, remove_calls = _patch_tmux_layout_seams(monkeypatch, install_result=False)
+        _patch_ci_green(monkeypatch)
+        _patch_phase5c(monkeypatch)
+        tools = MockTeamTools(scripted=_happy_scripted())
+        outcome = _run_cycle(tools, tmp_path)
+        assert outcome["status"] == "success", (
+            "a refused hook install must NOT abort the cycle — the "
+            f"boundary fold remains the fallback; got {outcome!r}"
+        )
+        assert len(install_calls) == 1
+        assert len(remove_calls) == 1, (
+            "teardown must still fire when install was ATTEMPTED but refused"
+        )
+
+    def test_hook_install_skipped_when_no_teammate_panes(self, tmp_path, monkeypatch):
+        """An empty pane map (headless CI / single-pane window / detached
+        process that cannot see the team window) means no tmux context —
+        installing a server-GLOBAL hook from there would be wrong, so both
+        install and teardown are skipped.
+        """
+        install_calls, remove_calls = _patch_tmux_layout_seams(monkeypatch, pane_map={})
+        tools = MockTeamTools(scripted={"Phase 1": "ABANDON: stop"})
+        outcome = _run_cycle(tools, tmp_path)
+        assert outcome["status"] == "abandoned"
+        assert install_calls == [], "no teammate panes visible → install must be skipped"
+        assert remove_calls == [], "no install attempted → nothing to tear down"
+
+    def test_hook_removed_on_midcycle_exception(self, tmp_path, monkeypatch):
+        """Abnormal exit (a dispatch raising mid-cycle) still tears the hook
+        down — concern D: the hook must not outlive the run on ANY path.
+        """
+        install_calls, remove_calls = _patch_tmux_layout_seams(monkeypatch)
+        # Call 1 = Phase-1 PM send (succeeds → workspace boot installs the
+        # hook); call 2 = Phase-2 fan-out (raises → cycle re-raises).
+        tools = MockTeamTools(raise_on_send_call_n=2)
+        with pytest.raises(RuntimeError, match="injected send_message failure"):
+            _run_cycle(tools, tmp_path)
+        assert len(install_calls) == 1, "hook was installed at workspace boot before the raise"
+        assert len(remove_calls) == 1, (
+            "the cycle finally block must remove the hook on the exception path"
+        )
+        assert [c[0] for c in tools.calls][-1] == "team_delete", (
+            "team_delete still fires last on the raising path"
+        )
+
+    def test_hook_remove_failure_does_not_block_team_delete(self, tmp_path, monkeypatch):
+        """A raising teardown is logged-and-swallowed: the shutdown handshake
+        + team_delete invariants must be unaffected.
+        """
+        install_calls, _ = _patch_tmux_layout_seams(monkeypatch)
+
+        def boom_remove(**kwargs):
+            raise RuntimeError("injected remove failure")
+
+        monkeypatch.setattr(team_executor_mod, "remove_team_window_hook", boom_remove)
+        tools = MockTeamTools(scripted={"Phase 1": "ABANDON: stop"})
+        outcome = _run_cycle(tools, tmp_path)
+        assert outcome["status"] == "abandoned"
+        assert len(install_calls) == 1
+        assert [c[0] for c in tools.calls][-1] == "team_delete", (
+            "team_delete must still fire when hook teardown raises"
+        )
+
+
+class TestPaneSignatureDeltaTrigger:
+    """The `_pane_signature` delta trigger: ANY teammate pane-set membership
+    change (REMOVE / RESPAWN id-churn — the cases the first-contact heuristic
+    is blind to) observed at a servicing opportunity flags ONE coalesced
+    re-fold. This is the recovery path the cap-exhaust comment in
+    `_tmux_workspace.fold_current_window` forward-references.
+
+    Send sequence for the 2-member roster abandoning at Phase 3 close:
+      1. P1 → pm           (workspace boot: setup fold #1, baseline captured)
+      2. P2 batch → [be]   (first-contact → fold #2, baseline re-captured)
+      3. P3 open  → [pm,be]   (no new recipients → DELTA CHECK runs here)
+      4. P3 debate → [pm,be]  (delta check)
+      5. P3 close → pm        (ABANDON; delta check still runs in finally)
+    """
+
+    _SCRIPTED: ClassVar[dict[str, str]] = {
+        "Phase 1": "do the work",
+        "Phase 2": "I propose a small change",
+        "Phase 3 open": "noted",
+        "Phase 3 debate": "agreed",
+        "Phase 3 close": "ABANDON: stop",
+    }
+
+    @staticmethod
+    def _fold_count(tools) -> int:
+        return len([c for c in tools.calls if c[0] == "apply_layout"])
+
+    def test_stable_signature_control_fires_no_delta_fold(self, tmp_path, monkeypatch):
+        """CONTROL (neuter-proof companion): with a STABLE pane signature the
+        delta trigger contributes ZERO folds — exactly the 2 pre-existing
+        folds fire (setup + Phase-2 first-contact).
+        """
+        _patch_tmux_layout_seams(monkeypatch)
+        _patch_pane_signature_sequence(monkeypatch, [frozenset({"%1", "%2"})])
+        tools = MockTeamTools(scripted=dict(self._SCRIPTED))
+        _run_cycle(tools, tmp_path)
+        assert self._fold_count(tools) == 2, (
+            "stable signature must add no delta folds: expected exactly 2 "
+            "(setup + Phase-2 first-contact), got "
+            f"{self._fold_count(tools)}: {[c for c in tools.calls if c[0] == 'apply_layout']}"
+        )
+
+    @pytest.mark.parametrize(
+        ("changed_sig", "case"),
+        [
+            (frozenset({"%1"}), "REMOVE (straggler reaped mid-phase)"),
+            (frozenset({"%1", "%9"}), "RESPAWN (same count, id churn)"),
+        ],
+    )
+    def test_membership_delta_triggers_exactly_one_refold(
+        self, tmp_path, monkeypatch, changed_sig, case
+    ):
+        """A membership delta vs the last-folded baseline flags ONE re-fold
+        (fold #3 at the Phase-3-open servicing opportunity), and the baseline
+        RE-ARMS on that fold so the now-stable set does not re-fold again at
+        the later opportunities (exact-count: 3, not 4+).
+        """
+        _patch_tmux_layout_seams(monkeypatch)
+        base = frozenset({"%1", "%2"})
+        # Reads: P1 baseline, P1 delta, P2 baseline, then the CHANGED set for
+        # every later read (P3-open delta → fold → new baseline → stable).
+        _patch_pane_signature_sequence(monkeypatch, [base, base, base, changed_sig])
+        tools = MockTeamTools(scripted=dict(self._SCRIPTED))
+        _run_cycle(tools, tmp_path)
+        assert self._fold_count(tools) == 3, (
+            f"{case}: a pane-set delta must add EXACTLY ONE re-fold on top of "
+            "the 2 baseline folds (and re-arm, not re-fold forever); got "
+            f"{self._fold_count(tools)}"
+        )
+
+    def test_soft_fail_none_signature_disarms_trigger(self, tmp_path, monkeypatch):
+        """tmux soft-fail (None signature) disarms the trigger: no delta
+        folds, no raise — degrade-never-raise.
+        """
+        _patch_tmux_layout_seams(monkeypatch)
+        _patch_pane_signature_sequence(monkeypatch, [None])
+        tools = MockTeamTools(scripted=dict(self._SCRIPTED))
+        outcome = _run_cycle(tools, tmp_path)
+        assert outcome["status"] == "abandoned"  # the scripted ABANDON, not a crash
+        assert self._fold_count(tools) == 2
+
+    def test_empty_signature_disarms_trigger(self, tmp_path, monkeypatch):
+        """An EMPTY pane set (reachable window, zero teammates — the
+        headless/single-pane shape) normalises the baseline to None so the
+        per-message delta read never runs against a meaningless grid.
+        """
+        _patch_tmux_layout_seams(monkeypatch)
+        _patch_pane_signature_sequence(monkeypatch, [frozenset()])
+        tools = MockTeamTools(scripted=dict(self._SCRIPTED))
+        _run_cycle(tools, tmp_path)
+        assert self._fold_count(tools) == 2
+
+    def test_delta_trigger_defers_to_phase_boundary_fold_during_wave(self, tmp_path, monkeypatch):
+        """While a phase boundary owns the fold (`suppress_batch_refold`),
+        the delta trigger must NOT fire per-message: a 2-owner wave with an
+        EVER-CHANGING signature still emits zero folds between the two owner
+        dispatches — the single unconditional boundary fold covers the wave.
+        """
+        _patch_tmux_layout_seams(monkeypatch)
+        _patch_ci_green(monkeypatch)
+        counter = [0]
+
+        def ever_changing_sig(workspace_name):
+            counter[0] += 1
+            return frozenset({f"%{counter[0]}"})
+
+        monkeypatch.setattr(team_executor_mod, "_pane_signature", ever_changing_sig)
+        two_item_dag = (
+            "ok\n```json\n"
+            '[{"id": "A", "touches": ["x.py"], "reads": [], "depends_on": [], '
+            '"wave": 1, "owner": "backend-engineer-1"},\n'
+            ' {"id": "B", "touches": ["y.py"], "reads": [], "depends_on": [], '
+            '"wave": 1, "owner": "pm-1"}]\n```'
+        )
+        scripted = _happy_scripted()
+        scripted["Phase 3 close"] = two_item_dag
+        tools = MockTeamTools(scripted=scripted)
+        outcome = _run_cycle(tools, tmp_path)
+        # Both roster members are implementers → no disjoint reviewer →
+        # Phase 5b' abandons; the wave itself completed, which is the part
+        # under test.
+        assert outcome["status"] == "abandoned"
+        assert "disjoint reviewer" in outcome["detail"]
+        wave_send_idxs = [
+            i
+            for i, c in enumerate(tools.calls)
+            if c[0] == "send_message" and "Phase 4 wave" in c[2].get("message", "")
+        ]
+        assert len(wave_send_idxs) == 2, f"expected 2 wave owner dispatches: {tools.calls}"
+        between = [c[0] for c in tools.calls[wave_send_idxs[0] + 1 : wave_send_idxs[1]]]
+        assert "apply_layout" not in between, (
+            "the delta trigger fired a per-message fold INSIDE a wave — the "
+            "boundary owns the fold while suppress_batch_refold is set; "
+            f"calls between owner dispatches: {between}"
+        )
+        after_wave = [c[0] for c in tools.calls[wave_send_idxs[1] + 1 :]]
+        assert "apply_layout" in after_wave, (
+            "the unconditional boundary fold must still fire after the wave"
+        )

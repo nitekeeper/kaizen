@@ -1536,3 +1536,462 @@ def test_run_tmux_timeout_returns_synthetic_completed_process(monkeypatch):
     proc = _tmux_workspace._run_tmux(["list-panes"])
     assert proc.returncode == 124
     assert "timed out" in proc.stderr
+
+
+# ── _pane_signature ───────────────────────────────────────────────────────
+
+
+def test_pane_signature_returns_frozenset_of_teammate_panes(monkeypatch):
+    """list-panes output → order-discarding frozenset (orchestrator excluded)."""
+
+    def fake_run(argv, **kwargs):
+        if "list-panes" in argv:
+            return _mk_proc(0, "%2\n%3\n%4\n")
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    sig = _tmux_workspace._pane_signature("w")
+    assert sig == frozenset({"%2", "%3", "%4"})
+    assert isinstance(sig, frozenset)
+
+
+def test_pane_signature_none_on_no_server(monkeypatch):
+    """Soft failure (no server) → None, inherited from _list_pane_ids."""
+
+    def fake_run(argv, **kwargs):
+        return _mk_proc(1, "", "no server running on /tmp/tmux-1000/default")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    assert _tmux_workspace._pane_signature("w") is None
+
+
+def test_pane_signature_empty_frozenset_when_no_teammate_panes(monkeypatch):
+    """Reachable window, zero teammate panes → empty frozenset (NOT None)."""
+
+    def fake_run(argv, **kwargs):
+        if "list-panes" in argv:
+            return _mk_proc(0, "")
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    assert _tmux_workspace._pane_signature("w") == frozenset()
+
+
+# ── _fold_stable_max_iters ────────────────────────────────────────────────
+
+
+def test_fold_stable_max_iters_default_when_unset(monkeypatch):
+    monkeypatch.delenv("KAIZEN_FOLD_STABLE_MAX_ITERS", raising=False)
+    assert (
+        _tmux_workspace._fold_stable_max_iters() == _tmux_workspace._FOLD_STABLE_MAX_ITERS_DEFAULT
+    )
+
+
+def test_fold_stable_max_iters_env_override(monkeypatch):
+    monkeypatch.setenv("KAIZEN_FOLD_STABLE_MAX_ITERS", "9")
+    assert _tmux_workspace._fold_stable_max_iters() == 9
+
+
+@pytest.mark.parametrize("bad", ["abc", "", "  "])
+def test_fold_stable_max_iters_falls_back_on_unparseable_value(monkeypatch, bad):
+    """Unparseable → default."""
+    monkeypatch.setenv("KAIZEN_FOLD_STABLE_MAX_ITERS", bad)
+    assert (
+        _tmux_workspace._fold_stable_max_iters() == _tmux_workspace._FOLD_STABLE_MAX_ITERS_DEFAULT
+    )
+
+
+@pytest.mark.parametrize("low", ["1", "0", "-3"])
+def test_fold_stable_max_iters_clamps_below_floor_to_two(monkeypatch, low):
+    """Below-floor values clamp to 2: one iteration folds, a SECOND confirms
+    stability. A cap of 1 could never confirm — a perfectly stable window
+    would exhaust the loop, warn falsely, and skip geometry verification."""
+    monkeypatch.setenv("KAIZEN_FOLD_STABLE_MAX_ITERS", low)
+    assert _tmux_workspace._fold_stable_max_iters() == _tmux_workspace._FOLD_STABLE_MIN_ITERS
+
+
+def test_fold_stable_max_iters_cap_of_one_does_not_false_warn(monkeypatch, capsys):
+    """Regression for the floor: env=1 on a STABLE 4-pane grid window must
+    fold once, confirm stability (no false "still changing" warn), and still
+    run the geometry verification."""
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    monkeypatch.setenv("KAIZEN_FOLD_STABLE_MAX_ITERS", "1")
+    monkeypatch.delenv("KAIZEN_TEAMMATE_LAYOUT", raising=False)  # n=4 → grid-2col
+    fake_run, calls = _fold_with_geometry_fake("%1\n%2\n%3\n%4\n%5\n", [_GEOM_GRID_4_OK])
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.fold_current_window(workspace_name="w")
+    assert len([c for c in calls if "select-layout" in c]) == 1
+    geometry_reads = [
+        c for c in calls if "list-panes" in c and _tmux_workspace._GRID_GEOMETRY_FMT in c
+    ]
+    assert len(geometry_reads) == 1, "geometry verification must still run under the clamped cap"
+    err = capsys.readouterr().err
+    assert "still changing" not in err, "stable window must not emit the churn warning"
+    assert "below the floor" in err and "clamping to 2" in err
+
+
+# ── fold_current_window — materialize-vs-fold race (fold-until-stable) ─────
+
+
+def _count_select_layouts(calls):
+    return [c for c in calls if "select-layout" in c]
+
+
+def test_fold_current_window_stable_set_folds_once(monkeypatch):
+    """Common path: pane set never changes → exactly ONE reset-then-fold.
+
+    The reconcile loop reads the set, folds, re-reads, sees the same set, and
+    exits — so a stable window pays for only a single select-layout.
+    """
+    monkeypatch.delenv("KAIZEN_FOLD_STABLE_MAX_ITERS", raising=False)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv:
+            return _mk_proc(0, "%2\n%3\n%4\n")
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.fold_current_window(workspace_name="w")
+    assert len(_count_select_layouts(calls)) == 1, (
+        "a stable pane set must fold exactly once, not re-fold"
+    )
+
+
+def test_fold_current_window_refolds_when_pane_set_grows(monkeypatch):
+    """Race fix LIVE: a pane that materialises AFTER the first fold triggers a
+    re-fold on the grown set. Proves the loop is not inert — neutering it
+    (single fold) drops the count to 1 and fails this assertion.
+    """
+    monkeypatch.delenv("KAIZEN_FOLD_STABLE_MAX_ITERS", raising=False)
+    calls: list[list[str]] = []
+    # list-panes snapshots: stale set, then grown set (new pane %5
+    # materialised), then stable. Loop must fold on the first two and stop.
+    snapshots = ["%2\n%3\n%4\n", "%2\n%3\n%4\n%5\n", "%2\n%3\n%4\n%5\n"]
+    idx = {"n": 0}
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv:
+            out = snapshots[min(idx["n"], len(snapshots) - 1)]
+            idx["n"] += 1
+            return _mk_proc(0, out)
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.fold_current_window(workspace_name="w")
+    assert len(_count_select_layouts(calls)) == 2, (
+        "a pane set that grows under an in-flight fold must trigger exactly one "
+        "re-fold (2 total) — the materialize-vs-fold race fix"
+    )
+
+
+def test_fold_current_window_caps_refold_loop(monkeypatch, capsys):
+    """A never-quiescing pane set is bounded by KAIZEN_FOLD_STABLE_MAX_ITERS
+    (no infinite spin) and the give-up is VISIBLE on stderr."""
+    monkeypatch.setenv("KAIZEN_FOLD_STABLE_MAX_ITERS", "3")
+    calls: list[list[str]] = []
+    counter = {"n": 0}
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv:
+            # Every read returns a DIFFERENT set → never quiesces.
+            counter["n"] += 1
+            panes = "".join(f"%{i}\n" for i in range(2, 2 + counter["n"] + 1))
+            return _mk_proc(0, panes)
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.fold_current_window(workspace_name="w")
+    assert len(_count_select_layouts(calls)) == 3, (
+        "loop must be bounded at the cap (3), never spin unbounded"
+    )
+    err = capsys.readouterr().err
+    assert "still changing after 3 fold attempts" in err
+
+
+def test_fold_current_window_noop_visible_when_no_panes(monkeypatch, capsys):
+    """No teammate panes → no select-layout, and the no-op is logged (kaizen#88)."""
+    monkeypatch.delenv("KAIZEN_FOLD_STABLE_MAX_ITERS", raising=False)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv:
+            return _mk_proc(0, "")
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.fold_current_window(workspace_name="w")
+    assert _count_select_layouts(calls) == []
+    assert "no-op" in capsys.readouterr().err
+
+
+def test_fold_current_window_stops_on_select_layout_soft_failure(monkeypatch, capsys):
+    """select-layout soft-failure → loop stops (no re-fold) and logs."""
+    monkeypatch.delenv("KAIZEN_FOLD_STABLE_MAX_ITERS", raising=False)
+    calls: list[list[str]] = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv:
+            return _mk_proc(0, "%2\n%3\n%4\n")
+        if "select-layout" in argv:
+            return _mk_proc(1, "", "no server running")
+        return _mk_proc(0, "")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.fold_current_window(workspace_name="w")
+    # exactly one select-layout attempt, then bail — no join-pane after failure.
+    assert len(_count_select_layouts(calls)) == 1
+    assert [c for c in calls if "join-pane" in c] == []
+    assert "did not apply" in capsys.readouterr().err
+
+
+# ── grid invariant — expected_grid_geometry (the pure spec) ────────────────
+
+
+@pytest.mark.parametrize(
+    ("n", "expected"),
+    [
+        (0, ()),
+        (1, (1,)),
+        (2, (2,)),
+        (3, (2, 1)),
+        (4, (2, 2)),
+        (5, (2, 2, 1)),
+        (6, (2, 2, 2)),
+        (7, (2, 2, 2, 1)),
+        (8, (2, 2, 2, 2)),
+    ],
+)
+def test_expected_grid_geometry_exact_matrix(n, expected):
+    """EXACT per-row counts for n in 0..8 (multi-mechanism → exact-count rule).
+
+    Odd n is the load-bearing half: the trailing unpaired pane is the NAMED
+    banner row — one full-width row of 1 at the bottom — so "2-col grid" is
+    a pinned, testable spec for odd teammate counts, not emergent behaviour.
+    """
+    assert _tmux_workspace.expected_grid_geometry(n) == expected
+
+
+# ── grid invariant — grid_invariant_check (observed vs expected) ───────────
+
+# Geometry fixtures: "#{pane_id} #{pane_top} #{pane_left}" lines. %1 is the
+# PM/main pane at the far left; teammates occupy the right area.
+_GEOM_GRID_4_OK = "%1 0 0\n%2 0 100\n%3 0 150\n%4 10 100\n%5 10 150\n"
+_GEOM_GRID_4_STACKED = "%1 0 0\n%2 0 100\n%3 5 100\n%4 10 100\n%5 15 100\n"
+_GEOM_GRID_5_ODD_BANNER = "%1 0 0\n%2 0 100\n%3 0 150\n%4 10 100\n%5 10 150\n%6 20 100\n"
+
+
+def _geometry_fake(geometry_stdout: str):
+    """fake subprocess.run answering ONLY the geometry-format list-panes."""
+
+    def fake_run(argv, **kwargs):
+        if "list-panes" in argv and _tmux_workspace._GRID_GEOMETRY_FMT in argv:
+            return _mk_proc(0, geometry_stdout)
+        return _mk_proc(0, "")
+
+    return fake_run
+
+
+def test_grid_invariant_check_true_on_folded_grid(monkeypatch):
+    """4 teammates in 2 rows of 2, PM strictly left → invariant holds."""
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", _geometry_fake(_GEOM_GRID_4_OK))
+    verdict, _detail = _tmux_workspace.grid_invariant_check("w", ["%2", "%3", "%4", "%5"])
+    assert verdict is True
+
+
+def test_grid_invariant_check_odd_count_banner_row(monkeypatch):
+    """5 teammates → (2, 2, 1): the odd pane is a sole-occupant bottom row."""
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", _geometry_fake(_GEOM_GRID_5_ODD_BANNER))
+    verdict, _detail = _tmux_workspace.grid_invariant_check("w", ["%2", "%3", "%4", "%5", "%6"])
+    assert verdict is True
+
+
+def test_grid_invariant_check_false_when_stacked(monkeypatch):
+    """Membership stable but panes STACKED (1 per row) → definite violation.
+
+    This is exactly the failure pane-COUNT checks cannot see — the predicate
+    must read geometry, and the detail must be greppable expected/got.
+    """
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", _geometry_fake(_GEOM_GRID_4_STACKED))
+    verdict, detail = _tmux_workspace.grid_invariant_check("w", ["%2", "%3", "%4", "%5"])
+    assert verdict is False
+    assert "expected rows (2, 2) got (1, 1, 1, 1)" in detail
+
+
+def test_grid_invariant_check_false_when_main_not_left(monkeypatch):
+    """A grid pane at (or left of) the main pane's column violates PM-left."""
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    geometry = "%1 0 0\n%2 0 0\n%3 0 150\n%4 10 100\n%5 10 150\n"
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", _geometry_fake(geometry))
+    verdict, detail = _tmux_workspace.grid_invariant_check("w", ["%2", "%3", "%4", "%5"])
+    assert verdict is False
+    assert "not strictly left" in detail
+
+
+def test_grid_invariant_check_headless_first_pane_is_main(monkeypatch):
+    """No TMUX_PANE → pane_ids[0] acted as main (mirrors _apply_fold_once)."""
+    # autouse fixture keeps TMUX_PANE unset. Main %2 at left 0; grid %3+%4
+    # share one row → expected (2,) for the 2 grid panes.
+    geometry = "%2 0 0\n%3 0 100\n%4 0 150\n"
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", _geometry_fake(geometry))
+    verdict, _detail = _tmux_workspace.grid_invariant_check("w", ["%2", "%3", "%4"])
+    assert verdict is True
+
+
+def test_grid_invariant_check_none_on_no_server(monkeypatch):
+    """tmux soft-failure → None (unverifiable), never False."""
+    monkeypatch.setenv("TMUX_PANE", "%1")
+
+    def fake_run(argv, **kwargs):
+        return _mk_proc(1, "", "no server running on /tmp/tmux-1000/default")
+
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    verdict, _detail = _tmux_workspace.grid_invariant_check("w", ["%2", "%3"])
+    assert verdict is None
+
+
+def test_grid_invariant_check_none_on_id_only_output(monkeypatch):
+    """Geometry read that parses to nothing (e.g. a test double modelling only
+    the ``#{pane_id}`` format) → None, NOT False. Pinned: a False here would
+    make the verify retry/warn fire under every legacy mock in this suite."""
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", _geometry_fake("%1\n%2\n%3\n"))
+    verdict, _detail = _tmux_workspace.grid_invariant_check("w", ["%2", "%3"])
+    assert verdict is None
+
+
+def test_grid_invariant_check_none_when_pane_vanished(monkeypatch):
+    """A folded pane missing from the geometry read = set churn → None
+    (the settle loop's domain — must not be misread as a fold failure)."""
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", _geometry_fake(_GEOM_GRID_4_OK))
+    verdict, _detail = _tmux_workspace.grid_invariant_check("w", ["%2", "%3", "%4", "%5", "%9"])
+    assert verdict is None
+
+
+def test_grid_invariant_check_ignores_panes_outside_pane_ids(monkeypatch):
+    """A pane in the geometry read but NOT in ``pane_ids`` (e.g. an operator
+    split that appeared AFTER the settle-confirmed read) is counted in
+    NEITHER side of the comparison → still True.
+
+    Pins the documented limitation precisely: there is no roster filter —
+    a cohabitant present at fold time is in ``pane_ids`` and counted on
+    BOTH sides (consistent, no spurious False); only a late-appearing pane
+    is invisible to the check, so a True verdict can transiently coexist
+    with a visually-off layout until the next reconcile."""
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    # %9 shares the first grid row but is absent from pane_ids.
+    geometry = _GEOM_GRID_4_OK + "%9 0 200\n"
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", _geometry_fake(geometry))
+    verdict, _detail = _tmux_workspace.grid_invariant_check("w", ["%2", "%3", "%4", "%5"])
+    assert verdict is True
+
+
+# ── fold_current_window — post-fold geometry verification ─────────────────
+
+
+def _fold_with_geometry_fake(pane_id_stdout: str, geometry_outputs: list[str]):
+    """fake subprocess.run for fold runs: id-format list-panes returns a stable
+    pane list; geometry-format list-panes returns successive entries of
+    ``geometry_outputs`` (last entry repeats). Returns (fake_run, calls)."""
+    calls: list[list[str]] = []
+    geom_idx = {"n": 0}
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        if "list-panes" in argv and _tmux_workspace._GRID_GEOMETRY_FMT in argv:
+            out = geometry_outputs[min(geom_idx["n"], len(geometry_outputs) - 1)]
+            geom_idx["n"] += 1
+            return _mk_proc(0, out)
+        if "list-panes" in argv:
+            return _mk_proc(0, pane_id_stdout)
+        return _mk_proc(0, "")
+
+    return fake_run, calls
+
+
+def test_fold_current_window_geometry_unmet_retries_once_then_warns(monkeypatch, capsys):
+    """Verification LIVE: a set-stable but STACKED window triggers exactly ONE
+    extra reset-then-fold, then a single greppable warn. Neutering the verify
+    (returning after set-stability alone) drops select-layout to 1 and emits
+    no warning — failing both assertions."""
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    monkeypatch.delenv("KAIZEN_TEAMMATE_LAYOUT", raising=False)  # n=4 → grid-2col
+    monkeypatch.delenv("KAIZEN_FOLD_STABLE_MAX_ITERS", raising=False)
+    fake_run, calls = _fold_with_geometry_fake("%1\n%2\n%3\n%4\n%5\n", [_GEOM_GRID_4_STACKED])
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.fold_current_window(workspace_name="w")
+    layouts = [c for c in calls if "select-layout" in c]
+    assert len(layouts) == 2, (
+        "geometry-unmet must trigger exactly one reset-then-fold retry "
+        f"(2 select-layouts total); got {len(layouts)}"
+    )
+    err = capsys.readouterr().err
+    assert "fold geometry unmet" in err and "after retry" in err
+    assert err.count("fold geometry unmet") == 1, "give-up warn must fire ONCE"
+
+
+def test_fold_current_window_geometry_ok_skips_retry(monkeypatch, capsys):
+    """A correctly-folded grid verifies clean: no extra fold, no warning."""
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    monkeypatch.delenv("KAIZEN_TEAMMATE_LAYOUT", raising=False)
+    monkeypatch.delenv("KAIZEN_FOLD_STABLE_MAX_ITERS", raising=False)
+    fake_run, calls = _fold_with_geometry_fake("%1\n%2\n%3\n%4\n%5\n", [_GEOM_GRID_4_OK])
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.fold_current_window(workspace_name="w")
+    assert len([c for c in calls if "select-layout" in c]) == 1
+    assert "fold geometry unmet" not in capsys.readouterr().err
+
+
+def test_fold_current_window_geometry_recovers_on_retry_without_warn(monkeypatch, capsys):
+    """Mismatch → retry → match: the retry folds (2 select-layouts) and the
+    give-up warning does NOT fire (it is reserved for unmet-after-retry)."""
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    monkeypatch.delenv("KAIZEN_TEAMMATE_LAYOUT", raising=False)
+    monkeypatch.delenv("KAIZEN_FOLD_STABLE_MAX_ITERS", raising=False)
+    fake_run, calls = _fold_with_geometry_fake(
+        "%1\n%2\n%3\n%4\n%5\n", [_GEOM_GRID_4_STACKED, _GEOM_GRID_4_OK]
+    )
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.fold_current_window(workspace_name="w")
+    assert len([c for c in calls if "select-layout" in c]) == 2
+    assert "fold geometry unmet" not in capsys.readouterr().err
+
+
+def test_fold_current_window_geometry_unverifiable_skips_silently(monkeypatch, capsys):
+    """None verdict (geometry read unparseable) → no retry, no geometry warn.
+
+    This pins the contract that keeps every legacy id-only-format test double
+    in this suite (and test_fold_workspace.py) green: unverifiable is SKIP,
+    never a retry trigger."""
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    monkeypatch.delenv("KAIZEN_TEAMMATE_LAYOUT", raising=False)
+    monkeypatch.delenv("KAIZEN_FOLD_STABLE_MAX_ITERS", raising=False)
+    fake_run, calls = _fold_with_geometry_fake("%1\n%2\n%3\n%4\n%5\n", ["%1\n%2\n"])
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.fold_current_window(workspace_name="w")
+    assert len([c for c in calls if "select-layout" in c]) == 1
+    assert "fold geometry unmet" not in capsys.readouterr().err
+
+
+def test_fold_current_window_stripes_mode_skips_geometry_verify(monkeypatch):
+    """stripes has no grid invariant: no geometry read at all (3 panes → auto
+    → stripes)."""
+    monkeypatch.setenv("TMUX_PANE", "%1")
+    monkeypatch.delenv("KAIZEN_TEAMMATE_LAYOUT", raising=False)  # n=3 → stripes
+    monkeypatch.delenv("KAIZEN_FOLD_STABLE_MAX_ITERS", raising=False)
+    fake_run, calls = _fold_with_geometry_fake("%1\n%2\n%3\n%4\n", [_GEOM_GRID_4_OK])
+    monkeypatch.setattr(_tmux_workspace.subprocess, "run", fake_run)
+    _tmux_workspace.fold_current_window(workspace_name="w")
+    geometry_reads = [
+        c for c in calls if "list-panes" in c and _tmux_workspace._GRID_GEOMETRY_FMT in c
+    ]
+    assert geometry_reads == []

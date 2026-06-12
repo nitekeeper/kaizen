@@ -72,6 +72,25 @@ _NO_SERVER_HINTS = (
 # this module by design (no cross-imports between subprocess wrappers).
 _TMUX_TIMEOUT_S = 10.0
 
+# kaizen team-mode layout consistency — bound on the fold-until-stable
+# reconcile loop in ``fold_current_window``. CC materialises team-mode panes
+# asynchronously, so a fold enqueued at first-contact can run BEFORE tmux has
+# created the new pane (the materialize-vs-fold RACE): the stale fold tiles the
+# old set, the fresh pane then auto-retiles, and the grid stays collapsed until
+# the next phase boundary. The loop re-reads the live pane set after each
+# reset-then-fold and re-folds until two consecutive reads agree (the set
+# quiesced) — bounded by this many attempts so a never-quiescing window logs
+# and exits rather than spinning. Operator-overridable via the env var of the
+# same name; an unparseable value falls back to the default, a value below
+# the floor is clamped to the floor.
+_FOLD_STABLE_MAX_ITERS_DEFAULT = 5
+# Floor for the cap. Stability is confirmed by TWO consecutive identical
+# reads (one iteration folds, the next confirms), so a cap of 1 can never
+# confirm: a perfectly STABLE window would exhaust the loop, emit the false
+# "pane set still changing" warning on every call, and skip the post-fold
+# geometry verification entirely. Values below 2 are clamped, not rejected.
+_FOLD_STABLE_MIN_ITERS = 2
+
 # kaizen#66 — orchestrator pane identity.
 #
 # When kaizen runs in a tmux pane (the typical interactive case), tmux sets
@@ -313,6 +332,64 @@ def _list_pane_ids(workspace_name: str) -> list[str] | None:
     if lead_pane_id and lead_pane_id in pane_ids:
         pane_ids = [pid for pid in pane_ids if pid != lead_pane_id]
     return pane_ids
+
+
+def _pane_signature(workspace_name: str) -> frozenset[str] | None:
+    """Return the current teammate pane-id SET, or None on soft failure.
+
+    Thin, order-discarding wrapper over :func:`_list_pane_ids`. Membership
+    delta detection only cares *whether the pane set changed* — not the
+    positional order — so a hashable ``frozenset`` is the right comparison
+    key. This is the exported seam for the ``team_executor`` re-fold trigger
+    (any pane-set delta vs the last-folded signature requests a re-fold,
+    covering ADD, REMOVE, and RESPAWN uniformly); the reconcile loop in
+    :func:`fold_current_window` builds the same signature shape inline from
+    the pane LIST it already read (it needs the list itself to fold, so a
+    second list-panes round-trip per iteration would be waste).
+
+    Soft-failure contract is inherited verbatim from ``_list_pane_ids``:
+    ``None`` means "tmux unavailable / list-panes hard error" (the caller
+    abandons the reconcile and keeps the best-effort exit-0 path); an EMPTY
+    ``frozenset`` means "reachable window, but no teammate panes."
+    """
+    pane_ids = _list_pane_ids(workspace_name)
+    if pane_ids is None:
+        return None
+    return frozenset(pane_ids)
+
+
+def _fold_stable_max_iters() -> int:
+    """Resolve the fold-until-stable attempt cap (env-overridable).
+
+    Reads ``KAIZEN_FOLD_STABLE_MAX_ITERS``; an unparseable value falls back
+    to ``_FOLD_STABLE_MAX_ITERS_DEFAULT``, a value below
+    ``_FOLD_STABLE_MIN_ITERS`` (2) is clamped to that floor. Always returns
+    ``>= 2``: the loop needs one iteration to fold and a second to CONFIRM
+    stability, so a cap of 1 would make every stable window exhaust the loop
+    — emitting the false "pane set still changing" warning and skipping the
+    post-fold geometry verification.
+    """
+    raw = os.environ.get("KAIZEN_FOLD_STABLE_MAX_ITERS", "").strip()
+    if not raw:
+        return _FOLD_STABLE_MAX_ITERS_DEFAULT
+    try:
+        parsed = int(raw)
+    except ValueError:
+        print(
+            f"[_tmux_workspace] KAIZEN_FOLD_STABLE_MAX_ITERS={raw!r} is not an "
+            f"integer; falling back to {_FOLD_STABLE_MAX_ITERS_DEFAULT}.",
+            file=sys.stderr,
+        )
+        return _FOLD_STABLE_MAX_ITERS_DEFAULT
+    if parsed < _FOLD_STABLE_MIN_ITERS:
+        print(
+            f"[_tmux_workspace] KAIZEN_FOLD_STABLE_MAX_ITERS={parsed} is below "
+            f"the floor of {_FOLD_STABLE_MIN_ITERS} (one iteration folds, a "
+            f"second confirms stability); clamping to {_FOLD_STABLE_MIN_ITERS}.",
+            file=sys.stderr,
+        )
+        return _FOLD_STABLE_MIN_ITERS
+    return parsed
 
 
 # kaizen#78 — operator-configurable right-area layout via KAIZEN_TEAMMATE_LAYOUT.
@@ -615,6 +692,127 @@ def fold_right_column(pane_ids: list[str]) -> None:
             )
 
 
+# kaizen team-mode layout consistency — the GRID INVARIANT, encoded as a
+# testable predicate (the "2-col grid" contract was previously emergent, not
+# pinned — odd teammate counts had no defined geometry, so post-fold
+# verification had nothing to assert against).
+#
+# Invariant: after a grid-2col fold settles, the window holds the PM/main
+# pane strictly LEFT of every grid pane, and the grid panes form a 2-column
+# grid read top-to-bottom. ODD-count geometry — NAMED: the trailing unpaired
+# pane is the **banner row** — a single full-width row at the BOTTOM of the
+# right area (the natural main-vertical residue ``fold_right_column`` leaves
+# by pairing ``range(0, n-1, 2)``; deterministic, and it reads as an
+# intentional region rather than a missing-neighbour error).
+#
+# ``expected_grid_geometry`` is the pure spec half (per-row pane counts);
+# ``grid_invariant_check`` is the observed half (reads tmux pane geometry and
+# compares). The geometry read uses pane_top/pane_left rather than the pane
+# COUNT because membership can be stable while the panes are STACKED wrong —
+# count alone cannot distinguish a folded grid from a single column.
+_GRID_GEOMETRY_FMT = "#{pane_id} #{pane_top} #{pane_left}"
+
+
+def expected_grid_geometry(n_grid_panes: int) -> tuple[int, ...]:
+    """Return the grid invariant's target shape as per-row pane counts.
+
+    Pure function — THE spec artifact for the 2-col grid contract. For
+    ``n_grid_panes`` live panes in the right area, top-to-bottom:
+
+      * ``n // 2`` paired rows of 2 panes each, then
+      * if ``n`` is ODD, one trailing **banner row** of 1 full-width pane.
+
+    e.g. ``4 → (2, 2)``; ``5 → (2, 2, 1)``; ``1 → (1,)``; ``0 → ()``.
+    The PM/main pane is NOT part of the grid count — callers pass the
+    teammate (right-area) pane count only.
+    """
+    if n_grid_panes <= 0:
+        return ()
+    return (2,) * (n_grid_panes // 2) + ((1,) if n_grid_panes % 2 else ())
+
+
+def grid_invariant_check(workspace_name: str, pane_ids: list[str]) -> tuple[bool | None, str]:
+    """Check the live window against the grid invariant; never raises.
+
+    Returns ``(verdict, detail)``:
+
+      * ``(True, ...)``  — observed geometry matches the invariant.
+      * ``(False, ...)`` — invariant violated (rows mis-shaped, or the main
+        pane is not strictly left of the grid); ``detail`` is the greppable
+        ``expected ... got ...`` explanation for the caller's warning.
+      * ``(None, ...)``  — UNVERIFIABLE: tmux soft-failed, the geometry
+        output did not parse, or a pane vanished between the fold and this
+        read (set churn is the settle loop's domain, not a fold failure).
+        Callers must treat None as "skip" — best-effort, never a retry
+        trigger. This also keeps the predicate inert under test doubles
+        that only model the ``#{pane_id}`` list-panes format.
+
+    ``pane_ids`` is the live pane list from :func:`_list_pane_ids` (every
+    pane in the current window except the orchestrator's own ``TMUX_PANE`` —
+    there is no teammate-roster filter anywhere in the fold path). The
+    main-vs-grid split mirrors :func:`_apply_fold_once`: with ``TMUX_PANE``
+    set the orchestrator pane is the main and ALL of ``pane_ids`` are grid
+    panes; headless (no ``TMUX_PANE``) the first listed pane acted as main.
+
+    Known limitations (both deliberate):
+
+      * Operator panes cohabiting the team window are CONSCRIPTED, not
+        ignored and not warned about. Because ``_list_pane_ids`` has no
+        roster, a cohabitant pane present when ``fold_current_window`` reads
+        the window is treated as a teammate end-to-end: the fold joins it
+        into the 2-col grid, and it is counted SYMMETRICALLY in both
+        ``expected_grid_geometry(len(grid_ids))`` and the observed rows —
+        so verification stays consistent (no spurious ``False``, no warn).
+        The symptom is the re-tile of the operator's pane itself; guidance:
+        do not open ad-hoc panes in the team window while a run is live.
+        Only a pane appearing AFTER the settle-confirmed read is invisible
+        to the check (rows are computed over ``grid_ids`` only; extra
+        geometry lines are never consulted), so a ``True`` verdict can
+        transiently coexist with a visually-off layout until the next
+        reconcile (signature-delta trigger / phase-boundary fold) re-reads
+        the window.
+      * With ``TMUX_PANE`` set, the orchestrator pane is ASSUMED to be the
+        ``main-vertical`` main (the strictly-leftmost pane) — the same
+        kaizen#81 assumption :func:`_apply_fold_once` folds under. If the
+        orchestrator pane is not the main (it was created after a teammate
+        pane, say), the PM-left check fails and verification returns
+        ``False`` on every fold → one bounded warn each, cosmetic; the fold
+        itself behaves no worse than before this predicate existed.
+    """
+    lead_pane_id = _orchestrator_pane_id()
+    if lead_pane_id is not None:
+        main_id, grid_ids = lead_pane_id, list(pane_ids)
+    elif pane_ids:
+        main_id, grid_ids = pane_ids[0], list(pane_ids[1:])
+    else:
+        return None, "no panes to verify"
+    proc = _run_tmux(["list-panes", "-F", _GRID_GEOMETRY_FMT])
+    if _tmux_unavailable(proc) or proc.returncode != 0:
+        return None, "list-panes geometry read failed"
+    geometry: dict[str, tuple[int, int]] = {}
+    for line in (proc.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        try:
+            geometry[parts[0]] = (int(parts[1]), int(parts[2]))
+        except ValueError:
+            continue
+    missing = [pid for pid in (main_id, *grid_ids) if pid not in geometry]
+    if missing:
+        return None, f"pane(s) {missing} absent from geometry read (set churn or unparseable)"
+    main_left = geometry[main_id][1]
+    if any(geometry[pid][1] <= main_left for pid in grid_ids):
+        return False, f"main pane {main_id} is not strictly left of every grid pane"
+    rows: dict[int, int] = {}
+    for pid in grid_ids:
+        top = geometry[pid][0]
+        rows[top] = rows.get(top, 0) + 1
+    observed = tuple(rows[top] for top in sorted(rows))
+    expected = expected_grid_geometry(len(grid_ids))
+    return observed == expected, f"expected rows {expected} got {observed}"
+
+
 def fold_current_window(*, workspace_name: str = "") -> None:
     """Fold the CURRENT tmux window into "PM-left + right-area layout".
 
@@ -636,28 +834,155 @@ def fold_current_window(*, workspace_name: str = "") -> None:
 
     Best-effort: tolerant of "no tmux server" / a missing window — never raises
     (a kaizen cycle must not abort on a tmux quirk).
+
+    kaizen team-mode layout consistency — the single read-then-fold below is
+    wrapped in a **fold-until-stable reconcile loop** that closes the
+    materialize-vs-fold RACE: CC creates team-mode panes asynchronously, so a
+    fold enqueued at first-contact (the per-spawn retitle hook in
+    ``team_executor``) can run BEFORE tmux has materialised the new pane. The
+    stale fold then tiles the OLD pane set, the fresh pane auto-retiles after,
+    and the grid stays collapsed until the next phase boundary. The loop
+    re-reads the live pane SET (:func:`_pane_signature`) after each
+    reset-then-fold and re-folds whenever the membership changed since the set
+    it last folded; it returns once two consecutive reads agree (the set
+    quiesced and the final fold landed on the live set). On a stable window the
+    common path is exactly ONE fold — the second read matches and the loop
+    exits. The loop is bounded by :func:`_fold_stable_max_iters`
+    (``KAIZEN_FOLD_STABLE_MAX_ITERS``) so a never-quiescing window logs and
+    exits rather than spinning. Each iteration's fold is the kaizen#88
+    reset-then-fold, which is idempotent, so re-folding never corrupts the grid.
+
+    Once the set quiesces, the resulting GEOMETRY is verified against the grid
+    invariant (:func:`grid_invariant_check` — membership can be stable while
+    the panes are stacked wrong, e.g. a per-pair ``join-pane`` failure left a
+    half-folded window) with at most ONE extra reset-then-fold retry and a
+    loud, greppable give-up — see :func:`_verify_grid_after_fold`.
     """
-    pane_ids = _list_pane_ids(workspace_name)  # excludes the orchestrator pane at source
-    if not pane_ids:
-        # kaizen#88 (D5) — make the no-op VISIBLE. The #86 trap was a fold
-        # that silently did nothing because it could not reach a window with
-        # teammate panes; the operator then saw an un-folded layout with no
-        # diagnostic. ``_list_pane_ids`` returns ``None`` on a tmux soft
-        # failure (no server / list-panes error) and ``[]`` when the window
-        # genuinely holds no teammate panes — both reduce to "nothing to
-        # fold." Log which case fired, then keep the best-effort exit-0
-        # contract (return without raising).
-        reason = (
-            "tmux unavailable or list-panes failed (no reachable window)"
-            if pane_ids is None
-            else "no teammate panes in the current window"
-        )
+    max_iters = _fold_stable_max_iters()
+    folded_sig: frozenset[str] | None = None
+    folded_mode: str | None = None
+    for _attempt in range(max_iters):
+        pane_ids = _list_pane_ids(workspace_name)  # excludes the orchestrator pane at source
+        if not pane_ids:
+            # kaizen#88 (D5) — make the no-op VISIBLE. The #86 trap was a fold
+            # that silently did nothing because it could not reach a window
+            # with teammate panes; the operator then saw an un-folded layout
+            # with no diagnostic. ``_list_pane_ids`` returns ``None`` on a tmux
+            # soft failure (no server / list-panes error) and ``[]`` when the
+            # window genuinely holds no teammate panes — both reduce to
+            # "nothing to fold." Log which case fired, then keep the
+            # best-effort exit-0 contract (return without raising).
+            reason = (
+                "tmux unavailable or list-panes failed (no reachable window)"
+                if pane_ids is None
+                else "no teammate panes in the current window"
+            )
+            print(
+                f"[_tmux_workspace] fold_current_window no-op for {workspace_name!r}: "
+                f"{reason}; layout left unchanged.",
+                file=sys.stderr,
+            )
+            return
+        sig = frozenset(pane_ids)
+        if sig == folded_sig:
+            # The pane SET we last folded still holds → the fold landed on the
+            # live set; the materialize-vs-fold race has quiesced. Verify the
+            # resulting GEOMETRY before declaring victory (grid-2col only —
+            # stripes has no grid invariant to check).
+            if folded_mode == "grid-2col":
+                _verify_grid_after_fold(pane_ids, workspace_name=workspace_name)
+            return
+        mode = _apply_fold_once(pane_ids, workspace_name=workspace_name)
+        if mode is None:
+            # select-layout failed (already logged by the helper) → stop.
+            return
+        folded_sig = sig
+        folded_mode = mode
+    else:
+        # Loop ran the full cap without two consecutive reads agreeing → the
+        # pane set is still churning. Surface it (VISIBLE, per kaizen#88) so a
+        # transiently-collapsed grid is diagnosable rather than a silent hang.
+        #
+        # DELIBERATE: geometry is NOT verified on this path, even when the
+        # last fold was grid-2col — a churn-then-settle window can therefore
+        # end half-folded with only this warning. Verifying here would re-open
+        # the bounded loop we just exhausted (verify's retry is itself a
+        # fold), trading the hard cap for unbounded chasing. Bounded
+        # best-effort wins; recovery is the pane-signature delta trigger in
+        # ``team_executor`` (see :func:`_pane_signature`) and the per-phase
+        # boundary fold, either of which re-runs this whole reconcile —
+        # including the verification — once the set actually settles.
         print(
-            f"[_tmux_workspace] fold_current_window no-op for {workspace_name!r}: "
-            f"{reason}; layout left unchanged.",
+            f"[_tmux_workspace] fold_current_window for {workspace_name!r}: pane set "
+            f"still changing after {max_iters} fold attempts "
+            f"(KAIZEN_FOLD_STABLE_MAX_ITERS); grid may be transiently collapsed.",
             file=sys.stderr,
         )
+
+
+def _verify_grid_after_fold(pane_ids: list[str], *, workspace_name: str = "") -> None:
+    """Post-fold geometry verification: observed == expected, ≤1 retry, loud give-up.
+
+    Called by :func:`fold_current_window` once the pane SET has quiesced. The
+    settle loop proves the fold ran on the live membership, but NOT that the
+    resulting shape is the grid invariant — ``fold_right_column`` logs per-pair
+    ``join-pane`` failures and proceeds, so a half-folded/stacked window can
+    pass membership-stable. This is the no-silent-failure half:
+
+      1. check :func:`grid_invariant_check` (observed geometry vs
+         :func:`expected_grid_geometry`);
+      2. on a definite mismatch, ONE more reset-then-fold (the cap is
+         deliberately 1 and separate from the settle-loop cap so the two
+         bounds compose rather than multiply), then re-check;
+      3. still mismatched → a single greppable stderr warning and return.
+
+    Degrade-never-raise: geometry is cosmetic — an unmet grid must stay a
+    VISIBLE warning, never abort the cycle. An UNVERIFIABLE read (``None``
+    verdict: tmux soft-fail / set churn / unparseable output) is skipped
+    silently — best-effort, not a retry trigger.
+    """
+    verdict, detail = grid_invariant_check(workspace_name, pane_ids)
+    if verdict is not False:
         return
+    # DELIBERATE: the retry re-folds the QUIESCED ``pane_ids`` the settle loop
+    # just confirmed, without re-listing. Re-listing here would re-open the
+    # settle loop's job inside the verify step and blur the two bounds (settle
+    # cap times verify cap). If the set churns again under this retry, the
+    # follow-up check usually returns None (a folded pane vanished from the
+    # geometry read → unverifiable → silent skip); the worst case is ONE
+    # mis-aimed warning against post-churn geometry — bounded and cosmetic —
+    # and the next reconcile (signature-delta trigger / phase-boundary fold)
+    # re-runs the whole loop on the fresh set anyway.
+    if _apply_fold_once(pane_ids, workspace_name=workspace_name) is None:
+        # The retry's select-layout itself soft-failed (already logged).
+        return
+    verdict, detail = grid_invariant_check(workspace_name, pane_ids)
+    if verdict is False:
+        print(
+            f"[_tmux_workspace] fold geometry unmet for {workspace_name!r} after retry: "
+            f"{detail}; layout left as-is (best-effort).",
+            file=sys.stderr,
+        )
+
+
+def _apply_fold_once(
+    pane_ids: list[str], *, workspace_name: str = ""
+) -> Literal["grid-2col", "stripes"] | None:
+    """Apply ONE reset-then-fold on the given ``pane_ids``; return the mode.
+
+    Factored out of :func:`fold_current_window` so the fold-until-stable
+    reconcile loop there can re-invoke a single idempotent fold. Returns the
+    CONCRETE layout mode that was applied (``"grid-2col"`` / ``"stripes"``)
+    when ``select-layout`` applied — the caller uses it to decide whether the
+    post-fold geometry verification is meaningful (the grid invariant only
+    exists in ``grid-2col`` mode) — or ``None`` when ``select-layout``
+    soft-failed (tmux unavailable / rejected the primitive), in which case the
+    loop must stop. Never raises.
+
+    ``pane_ids`` must be the live teammate panes from :func:`_list_pane_ids`
+    (orchestrator pane already excluded); this helper does NOT re-list, so the
+    signature the caller computed and the set folded here stay consistent.
+    """
     layout_mode = _resolve_layout(len(pane_ids), os.environ.get("KAIZEN_TEAMMATE_LAYOUT"))
     primitive = "main-vertical" if layout_mode == "grid-2col" else "even-vertical"
     proc = _run_tmux(["select-layout", primitive])
@@ -671,7 +996,7 @@ def fold_current_window(*, workspace_name: str = "") -> None:
             f"({(proc.stderr or '').strip() or 'tmux unavailable'}); layout left unchanged.",
             file=sys.stderr,
         )
-        return
+        return None
     if layout_mode == "grid-2col":
         # kaizen#81: prepend the PM pane (the untouched main at index 0) so
         # fold_right_column pairs ALL teammates rather than dropping the first.
@@ -682,6 +1007,7 @@ def fold_current_window(*, workspace_name: str = "") -> None:
             fold_right_column([lead_pane_id, *pane_ids])
         else:
             fold_right_column(pane_ids)
+    return layout_mode
 
 
 def pin_orchestrator_title(pane_id: str, glyph: str | None = None) -> None:

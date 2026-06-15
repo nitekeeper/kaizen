@@ -286,8 +286,10 @@ def test_require_wired_default_bridge_ok():
 
 
 def test_require_wired_host_not_implemented():
-    """host is recognized but not wired in M8a-1 — must NOT fall back to bridge."""
-    with pytest.raises(NotImplementedError, match="not wired until M8a-2"):
+    """The TOP-LEVEL orchestrator guard still raises for host: the Phase-4 host
+    executor is wired (M8a-2a) but the meeting->executor integration is a
+    follow-up — must NOT fall back to bridge, must NOT silently run half-wired."""
+    with pytest.raises(NotImplementedError, match="top-level kaizen:improve"):
         transport.require_wired_transport({"KAIZEN_TRANSPORT": "host"})
 
 

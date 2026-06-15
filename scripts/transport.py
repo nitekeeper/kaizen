@@ -6,10 +6,16 @@ transport is resolved, so the wiring lands behind one flag:
 
   * ``bridge`` (DEFAULT, unset/empty/whitespace) — the existing SQLite
     queue-bridge dispatch. Byte-for-byte unchanged.
-  * ``host`` — the in-process atelier host engine. RECOGNIZED but NOT YET WIRED
-    in this PR (M8a-1, foundation only): selecting it resolves cleanly and then
-    raises :class:`NotImplementedError` at dispatch time. It deliberately does
-    NOT silently fall back to ``bridge`` — that would mask the flag.
+  * ``host`` — the in-process atelier host engine. As of M8a-2a the Phase-4
+    implementation-wave executor (:func:`scripts.host_executor.host_cycle_executor`)
+    IS wired and e2e-tested as a unit, BUT the top-level ``kaizen:improve``
+    meeting→executor integration (Phases 1-3 glue in ``run.py`` / the SKILL) is a
+    LATER PR (M8a-2 follow-up). So selecting ``host`` resolves cleanly and the
+    Phase-4 executor is fully reachable directly, but
+    :func:`require_wired_transport` — the TOP-LEVEL orchestrator guard — still
+    raises :class:`NotImplementedError` so a half-wired top-level command cannot be
+    silently invoked in a broken state. It deliberately does NOT silently fall back
+    to ``bridge`` — that would mask the flag.
 
 Any other value raises :class:`UnknownTransportError` (fail-loud, mirroring
 atelier's ``scripts.dispatch.resolve_transport``): a typo or a stale value in
@@ -69,21 +75,28 @@ def resolve_transport(env: Mapping[str, str] | None = None) -> str:
 
 
 def require_wired_transport(env: Mapping[str, str] | None = None) -> str:
-    """Resolve the transport AND enforce that the selected one is wired.
+    """Resolve the transport AND enforce that the TOP-LEVEL path is wired.
 
-    For M8a-1 (foundation) ``host`` is recognized but not yet wired: this raises
-    a clear :class:`NotImplementedError` rather than silently falling back to
-    ``bridge``. ``bridge`` returns normally. Unknown values still raise
-    :class:`UnknownTransportError` (via :func:`resolve_transport`).
+    M8a-2a wired the Phase-4 executor (:func:`scripts.host_executor.host_cycle_executor`),
+    but NOT the top-level ``kaizen:improve`` meeting→executor integration (Phases
+    1-3 glue is a follow-up PR). This is the TOP-LEVEL orchestrator guard: it still
+    raises a clear :class:`NotImplementedError` for ``host`` rather than letting
+    ``kaizen:improve`` invoke a half-wired command in a broken state. ``bridge``
+    returns normally. Unknown values still raise :class:`UnknownTransportError`
+    (via :func:`resolve_transport`).
 
-    Call this from the dispatch seam once M8a-2 wires the host path; until then
-    it is the guard that keeps ``host`` from masquerading as ``bridge``.
+    The Phase-4 executor is independently reachable + e2e-tested as a unit; this
+    guard only protects the orchestrator entrypoint until the meeting glue lands.
+    Drop the ``host`` branch here when that follow-up PR wires the integration.
     """
     transport = resolve_transport(env)
     if transport == TRANSPORT_HOST:
         raise NotImplementedError(
-            f"{TRANSPORT_ENV_VAR}={TRANSPORT_HOST} not wired until M8a-2; "
-            f"the deterministic host engine is recognized but its dispatch path "
-            f"is not yet connected. Use the default {TRANSPORT_BRIDGE!r} transport."
+            f"{TRANSPORT_ENV_VAR}={TRANSPORT_HOST}: the Phase-4 host executor "
+            f"(scripts.host_executor.host_cycle_executor) is wired + e2e-tested, "
+            f"but the top-level kaizen:improve meeting->executor integration is a "
+            f"M8a-2 follow-up and is NOT yet connected. The orchestrator must not "
+            f"invoke a half-wired command. Use the default {TRANSPORT_BRIDGE!r} "
+            f"transport, or call host_cycle_executor directly."
         )
     return transport

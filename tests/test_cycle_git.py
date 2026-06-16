@@ -3,8 +3,16 @@
 import re
 import subprocess
 
+import pytest
+
 from scripts.clone import clone_repo
-from scripts.cycle_git import _slugify, commit_cycle, create_branch, push_branch
+from scripts.cycle_git import (
+    _slugify,
+    commit_cycle,
+    commit_cycle_and_sha,
+    create_branch,
+    push_branch,
+)
 
 # ── Slugification ──────────────────────────────────────────────────────────
 
@@ -238,6 +246,117 @@ class TestCommitCycle:
         assert not any("__pycache__" in f for f in committed), (
             f"nested __pycache__ contents must not be committed: {committed}"
         )
+
+
+# ── commit_cycle_and_sha ─────────────────────────────────────────────────────
+
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+class TestCommitCycleAndSha:
+    def test_returns_real_sha_and_creates_commit(self, tmp_path, bare_remote, source_repo):
+        """#1 — the helper commits AND returns a real 40-hex SHA that git log
+        confirms is HEAD. Mut (return None/empty, or skip the commit): a None/
+        empty return fails the regex; a no-op (no commit) leaves HEAD on the
+        clone's `init` commit whose subject is NOT a kaizen(cycle-N) line."""
+        dest = tmp_path / "clone"
+        clone_repo(str(bare_remote), dest, "main")
+        create_branch(dest, "sha-helper")
+        (dest / "CHANGES.txt").write_text("a real change")
+        sha = commit_cycle_and_sha(
+            clone_dir=dest,
+            cycle_n=3,
+            decisions=["host-mode cycle"],
+            participants=["backend-engineer-1"],
+            n_tests=5,
+            subject="sha helper",
+            minutes_rel_path="kaizen:cycle:host-3",
+        )
+        # Real, non-empty 40-hex SHA.
+        assert _SHA_RE.match(sha), f"not a 40-hex sha: {sha!r}"
+        # git log confirms the helper's commit IS HEAD (subject + sha match).
+        head = subprocess.run(
+            ["git", "-C", str(dest), "log", "-1", "--pretty=%H%n%s"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        head_sha, head_subject = head.stdout.strip().splitlines()
+        assert head_sha == sha
+        assert head_subject == "kaizen(cycle-3): host-mode cycle"
+        # The change really landed in the commit.
+        names = subprocess.run(
+            ["git", "-C", str(dest), "show", "--name-only", "--pretty=format:"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert "CHANGES.txt" in names.stdout
+
+    def test_raises_on_empty_head(self, tmp_path):
+        """#2 — a repo with no commits (rev-parse HEAD exits non-zero) raises
+        RuntimeError. Mut (drop the returncode guard): the helper would return
+        the empty/garbage stdout instead of raising.
+
+        We bypass `commit_cycle` (which would itself fail to commit a clean
+        tree) and call the rev-parse guard path directly by monkeypatching the
+        commit step to a no-op, so the guard is what's under test."""
+        import scripts.cycle_git as cg
+
+        repo = tmp_path / "empty"
+        repo.mkdir()
+        env = {
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+            "PATH": __import__("os").environ.get("PATH", ""),
+        }
+        subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, env=env, check=True)
+        orig = cg.commit_cycle
+        cg.commit_cycle = lambda **_kw: None  # no commit → HEAD is unborn
+        try:
+            with pytest.raises(RuntimeError, match="rev-parse HEAD"):
+                cg.commit_cycle_and_sha(
+                    clone_dir=repo,
+                    cycle_n=1,
+                    decisions=["x"],
+                    participants=["p"],
+                    n_tests=0,
+                    subject="empty",
+                    minutes_rel_path="kaizen:cycle:host-1",
+                )
+        finally:
+            cg.commit_cycle = orig
+
+    def test_raises_on_empty_sha_zero_exit(self, tmp_path, monkeypatch):
+        """#2b (LOW-2) — rev-parse HEAD exits 0 but returns an EMPTY sha →
+        RuntimeError. A near-impossible git state, but the defensive
+        ``if not commit_sha:`` branch must still fire — the helper must NEVER
+        return an empty sha (a NULL-ish value would reach the cycles row that
+        ``run.py`` hard-subscripts). Mut (drop the empty-sha guard): the helper
+        would return ``""``. We stub ``commit_cycle`` to a no-op and the rev-parse
+        ``subprocess.run`` to a zero-exit empty-stdout result."""
+        import scripts.cycle_git as cg
+
+        repo = tmp_path / "r"
+        repo.mkdir()
+        monkeypatch.setattr(cg, "commit_cycle", lambda **_kw: None)
+        monkeypatch.setattr(
+            cg.subprocess,
+            "run",
+            lambda argv, *a, **kw: subprocess.CompletedProcess(argv, 0, stdout="", stderr=""),
+        )
+        with pytest.raises(RuntimeError, match="empty SHA"):
+            cg.commit_cycle_and_sha(
+                clone_dir=repo,
+                cycle_n=1,
+                decisions=["x"],
+                participants=["p"],
+                n_tests=0,
+                subject="empty-sha",
+                minutes_rel_path="kaizen:cycle:host-1",
+            )
 
 
 # ── push_branch ────────────────────────────────────────────────────────────

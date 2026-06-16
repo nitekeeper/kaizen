@@ -13,6 +13,9 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
+# NOTE: this block is IGNORED — kaizen's active pytest config is pytest.ini
+# (pytest prefers pytest.ini when both exist). The `live` marker + `-m "not
+# live"` deselect live in pytest.ini. Kept only for tooling that reads pyproject.
 testpaths = ["tests"]
 
 # ----------------------------------------------------------------------------

@@ -143,22 +143,17 @@ def _isolate_team_window_hook_seams(monkeypatch):
 
 
 def _patch_phase5c(monkeypatch):
-    """Stub commit_cycle + subprocess.run rev-parse so Phase 5c does not need a real repo."""
+    """Stub commit_cycle_and_sha so Phase 5c does not need a real repo.
 
-    def fake_commit_cycle(**kwargs):
-        return None
+    The inline commit + rev-parse dance was folded into the shared
+    ``cycle_git.commit_cycle_and_sha`` helper (M8a-2c); team_executor imports
+    it as ``commit_cycle_and_sha`` and that is the seam Phase 5c now drives, so
+    we stub the single helper rather than commit_cycle + subprocess.run."""
 
-    monkeypatch.setattr(team_executor_mod, "commit_cycle", fake_commit_cycle)
+    def fake_commit_cycle_and_sha(**kwargs):
+        return "deadbeefcafebabe1234567890abcdef12345678"
 
-    class _FakeProc:
-        def __init__(self, stdout):
-            self.stdout = stdout
-            self.returncode = 0
-
-    def fake_run(cmd, **kwargs):
-        return _FakeProc("deadbeefcafebabe1234567890abcdef12345678\n")
-
-    monkeypatch.setattr(team_executor_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(team_executor_mod, "commit_cycle_and_sha", fake_commit_cycle_and_sha)
 
 
 def _patch_ci_green(monkeypatch):
@@ -1013,19 +1008,11 @@ class TestPhase5CCommit:
 
         commit_calls: list = []
 
-        def fake_commit_cycle(**kwargs):
+        def fake_commit_cycle_and_sha(**kwargs):
             commit_calls.append(kwargs)
+            return "1234567890abcdef"
 
-        monkeypatch.setattr(team_executor_mod, "commit_cycle", fake_commit_cycle)
-
-        class _FakeProc:
-            stdout = "1234567890abcdef\n"
-            returncode = 0
-
-        def fake_run(cmd, **kwargs):
-            return _FakeProc()
-
-        monkeypatch.setattr(team_executor_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(team_executor_mod, "commit_cycle_and_sha", fake_commit_cycle_and_sha)
 
         roster = ["pm-1", "be-1", "security-engineer-1", "software-architect-1"]
         ai_json = (
@@ -1054,7 +1041,7 @@ class TestPhase5CCommit:
         assert outcome["status"] == "success"
         assert outcome["commit_sha"] == "1234567890abcdef"
         assert outcome["commit_sha"] != "(skeleton)"
-        assert len(commit_calls) == 1, "commit_cycle must be invoked exactly once"
+        assert len(commit_calls) == 1, "commit_cycle_and_sha must be invoked exactly once"
 
     def test_phase5c_commit_carries_real_test_count_and_memex_minutes_ref(
         self, tmp_path, monkeypatch
@@ -1078,19 +1065,11 @@ class TestPhase5CCommit:
 
         commit_calls: list = []
 
-        def fake_commit_cycle(**kwargs):
+        def fake_commit_cycle_and_sha(**kwargs):
             commit_calls.append(kwargs)
+            return "1234567890abcdef"
 
-        monkeypatch.setattr(team_executor_mod, "commit_cycle", fake_commit_cycle)
-
-        class _FakeProc:
-            stdout = "1234567890abcdef\n"
-            returncode = 0
-
-        def fake_run(cmd, **kwargs):
-            return _FakeProc()
-
-        monkeypatch.setattr(team_executor_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(team_executor_mod, "commit_cycle_and_sha", fake_commit_cycle_and_sha)
 
         roster = ["pm-1", "be-1", "security-engineer-1", "software-architect-1"]
         ai_json = (
@@ -1117,7 +1096,7 @@ class TestPhase5CCommit:
                 tools=tools,
             )
         assert outcome["status"] == "success"
-        assert len(commit_calls) == 1, "commit_cycle must be invoked exactly once"
+        assert len(commit_calls) == 1, "commit_cycle_and_sha must be invoked exactly once"
         kwargs = commit_calls[0]
         # Mechanism 1: real pytest pass count parsed from the CI gate output.
         assert kwargs["n_tests"] == 7, (
@@ -1276,23 +1255,19 @@ class TestRevParseErrorPath:
     ):
         """F13 (audit cleanup): rev-parse failure must surface a message that
         names the exit code AND captures stderr — not an opaque
-        CalledProcessError that swallowed both."""
+        CalledProcessError that swallowed both. The rev-parse guard moved into
+        ``cycle_git.commit_cycle_and_sha`` (M8a-2c); team_executor calls it as
+        ``commit_cycle_and_sha`` and must propagate its RuntimeError unswallowed
+        through Phase 5c."""
         _patch_ci_green(monkeypatch)
 
-        def fake_commit_cycle(**kwargs):
-            return None
+        def fake_commit_cycle_and_sha(**kwargs):
+            raise RuntimeError(
+                f"git rev-parse HEAD in {kwargs['clone_dir']} exited "
+                "128: fatal: ambiguous argument 'HEAD'"
+            )
 
-        monkeypatch.setattr(team_executor_mod, "commit_cycle", fake_commit_cycle)
-
-        class _FakeProc:
-            stdout = ""
-            stderr = "fatal: ambiguous argument 'HEAD'"
-            returncode = 128
-
-        def fake_run(cmd, **kwargs):
-            return _FakeProc()
-
-        monkeypatch.setattr(team_executor_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(team_executor_mod, "commit_cycle_and_sha", fake_commit_cycle_and_sha)
         tools = MockTeamTools(scripted=_happy_scripted())
         with (
             patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}),
@@ -1313,23 +1288,18 @@ class TestRevParseErrorPath:
     def test_rev_parse_empty_sha_raises_clearer_error(self, tmp_path, monkeypatch):
         """F13 (audit cleanup): if rev-parse exits 0 but returns an empty
         SHA (corrupt clone, detached HEAD edge case), raise a named error
-        instead of letting an empty commit_sha land in the outcome dict."""
+        instead of letting an empty commit_sha land in the outcome dict. The
+        empty-SHA guard lives in ``cycle_git.commit_cycle_and_sha`` (M8a-2c);
+        team_executor must propagate its RuntimeError through Phase 5c."""
         _patch_ci_green(monkeypatch)
 
-        def fake_commit_cycle(**kwargs):
-            return None
+        def fake_commit_cycle_and_sha(**kwargs):
+            raise RuntimeError(
+                f"git rev-parse HEAD in {kwargs['clone_dir']} returned an empty SHA; "
+                "the clone may be corrupt or HEAD may be unset."
+            )
 
-        monkeypatch.setattr(team_executor_mod, "commit_cycle", fake_commit_cycle)
-
-        class _FakeProc:
-            stdout = "\n"
-            stderr = ""
-            returncode = 0
-
-        def fake_run(cmd, **kwargs):
-            return _FakeProc()
-
-        monkeypatch.setattr(team_executor_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(team_executor_mod, "commit_cycle_and_sha", fake_commit_cycle_and_sha)
         tools = MockTeamTools(scripted=_happy_scripted())
         with (
             patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}),

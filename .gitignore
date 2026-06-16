@@ -53,3 +53,6 @@ Thumbs.db
 desktop.ini
 ehthumbs.db
 .claude/worktrees/
+
+# Local Loom desktop-app session state (never tracked)
+.loom/

@@ -20,12 +20,15 @@ fresh box never hard-fails the suite.
 
 from __future__ import annotations
 
+import importlib
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from scripts.ci_runner import run_ci_checks
 from scripts.dispatch_templates import (
     TEAMMATE_REPLY_RULE,
     phase_4_implementer,
@@ -36,6 +39,7 @@ from scripts.dispatch_templates import (
 )
 from scripts.fix_loop import Finding
 from scripts.host_executor import (
+    _REVIEW_TERMINAL_RULE,
     _collect_review_findings,
     _consolidate_mesh,
     _interpret_engine_results,
@@ -48,6 +52,7 @@ from scripts.host_executor import (
     _make_review_briefing_for,
     _parse_mesh_response,
     _ReviewHardAbandon,
+    _run_ci_gate,
     build_engine_tasks,
     build_fix_tasks,
     build_mesh_tasks,
@@ -55,6 +60,7 @@ from scripts.host_executor import (
     build_review_tasks,
     host_cycle_executor,
 )
+from scripts.team_executor import _CHECK_TO_REASON
 
 # ── engine availability gate (skip cleanly on a fresh box) ──────────────────
 
@@ -73,6 +79,40 @@ _HAS_ENGINE = _engine_available()
 _SKIP_ENGINE = pytest.mark.skipif(
     not _HAS_ENGINE,
     reason="atelier host engine (>=1.10.0) not available; engine-touching test skipped",
+)
+
+
+# ── live e2e gate (real `claude` CLI + native sandbox) ──────────────────────
+# `sandbox_runtime_available` lives in atelier's IN-WINDOW `scripts.cli_dispatch`;
+# kaizen cannot import it at module level (its `scripts` resolves to kaizen).
+# Probe it once through a transient engine window, defaulting False on any error
+# so a fresh box (no atelier / no sandbox) skips cleanly at collection.
+_HAS_CLAUDE = shutil.which("claude") is not None
+_HAS_SANDBOX = False
+if _HAS_ENGINE:
+    try:
+        from scripts.atelier_engine import assert_engine_available, atelier_engine
+
+        with atelier_engine(assert_engine_available()):
+            _HAS_SANDBOX = importlib.import_module(
+                "scripts.cli_dispatch"
+            ).sandbox_runtime_available()
+    except Exception:
+        _HAS_SANDBOX = False
+
+_LIVE = pytest.mark.skipif(
+    not (_HAS_ENGINE and _HAS_CLAUDE and _HAS_SANDBOX),
+    reason="live e2e needs the atelier engine + `claude` on PATH + a native sandbox (bwrap/socat)",
+)
+
+# The host CI-mirror gate tests drive the REAL `run_ci_checks`, which shells out
+# to `ruff` on a temp clone that opts into ruff. Where ruff isn't on PATH the
+# check resolves to `status="skip"` and the pass/fail assertions can't hold —
+# skip cleanly rather than fail. CI installs ruff in the Tests job (ci.yml) so
+# these RUN there; a dev box without ruff skips them.
+_SKIP_NO_RUFF = pytest.mark.skipif(
+    shutil.which("ruff") is None,
+    reason="`ruff` not on PATH; host CI-gate tests invoke the real run_ci_checks which needs it",
 )
 
 
@@ -512,12 +552,19 @@ def test_host_cycle_executor_e2e_two_wave_dag(tmp_path):
         runner=runner,
         journal_path=tmp_path / "journal.json",
         review=False,  # Phase-4-only test; M8a-2b review covered by dedicated tests below
+        # M8a-2c: the seed clone has no tests, so a real `pytest` gate is noise
+        # for this Phase-4 dispatch/merge test. `true` is a no-op exit-0 gate
+        # (the gate's own coverage is in the dedicated CI-gate tests below).
+        test_command="true",
     )
 
     # ── outcome dict shape matches team mode's success variant ──────────────
     assert out["status"] == "success"
     assert out["subject"] == "test subject"
-    assert "commit_sha" in out  # present (None — commit is the orchestrator's job)
+    # M8a-2c: the executor is now self-contained — a clean success COMMITS and
+    # stamps a real 40-hex sha + Memex slug (was None pre-M8a-2c).
+    assert re.match(r"^[0-9a-f]{40}$", out["commit_sha"]), f"not a real sha: {out['commit_sha']!r}"
+    assert out["minutes_memex_slug"] == "kaizen:cycle:host-1"
     assert "participants" in out
     assert out["participants"] == ["backend-engineer-1", "sdet-1"]
 
@@ -564,6 +611,7 @@ def test_host_cycle_executor_e2e_tasks_carry_correct_fields(tmp_path):
         runner=runner,
         journal_path=tmp_path / "journal.json",
         review=False,  # Phase-4-only test; M8a-2b review covered by dedicated tests below
+        test_command="true",  # M8a-2c: no-op CI gate — this is a dispatch/merge test
     )
     assert out["status"] == "success"
     # AI-3 (wave 2) must dispatch AFTER AI-1 (wave 1) — the barrier. The runner
@@ -1396,10 +1444,13 @@ def test_host_cycle_executor_e2e_review_clean_exit(tmp_path):
         runner=runner,
         journal_path=tmp_path / "journal.json",
         review=True,
+        test_command="true",  # M8a-2c: no-op CI gate — this is a review-loop test
     )
 
     assert out["status"] == "success", f"expected clean SHIP, got {out!r}"
     assert out["subject"] == "clean ship"
+    # M8a-2c: a clean SHIP through the review loop now also COMMITS (self-contained).
+    assert re.match(r"^[0-9a-f]{40}$", out["commit_sha"]), f"not a real sha: {out['commit_sha']!r}"
     # C1: at first reviewer dispatch the merged impl files were in the BASE clone,
     # and the reviewer ran in the clone (NOT an isolated worktree).
     assert seen_at_review.get("foo") is True
@@ -1480,3 +1531,455 @@ def test_host_cycle_executor_e2e_review_unrecoverable(tmp_path):
     assert isinstance(out["unresolved_findings"][0], dict)
     assert out["convergence_summary"]  # non-empty human summary
     assert out["reviewer_attribution"]  # finding_id -> reviewer map, non-empty
+
+
+@_SKIP_ENGINE
+def test_consolidate_mesh_map_is_consumed_not_discarded(tmp_path):
+    """#10 (LOW-1) — drive the REAL engine to fix-loop exhaustion where reviewer-0
+    files a blocker that reviewer-1 NEVER cross-confirms in the mesh (reviewer-1's
+    mesh reply is an unrelated net-new nit, so it carries signal but no CONFIRM of
+    the blocker). The blocker survives (blocker/major always retained), the PM
+    REJECTs every round → exhaustion → the abandonment's convergence_summary names
+    the peer-unconfirmed blocker id via the neutral clause. Mut (re-introduce the
+    `_consolidate_mesh` side-map discard): the clause / id would be absent.
+
+    This proves the side-map flows ALL the way from `_consolidate_mesh` →
+    `_run_review_fix_loop` → `build_abandonment_outcome` → convergence_summary —
+    the wiring the loop previously discarded at the binders."""
+    clone = _git_init_clone(tmp_path)
+    items = [
+        {
+            "id": "AI-1",
+            "touches": ["scripts/foo.py"],
+            "reads": [],
+            "depends_on": [],
+            "wave": 1,
+            "owner": "backend-engineer-1",
+        },
+    ]
+    # Each round-1: reviewer-0 (R{i}-0) files the blocker; reviewer-1 (R{i}-1)
+    # finds nothing. The per-reviewer round-1 replies MUST be keyed per EXACT
+    # task_id (`notes_by_task`) — `notes_by_prefix` keys on the round prefix
+    # (`R{i}`), which both reviewers share, so it cannot differentiate them. In the
+    # mesh ONLY reviewer-1 has a peer to review (reviewer-0's blocker) — it replies
+    # with an UNRELATED net-new nit (recognized signal, but NO CONFIRM of the
+    # blocker id) → the blocker stays peer-unconfirmed. The fix "succeeds" each
+    # round but the next round re-files the blocker → persistent → exhaustion.
+    notes_by_task = {}
+    notes_by_prefix = {}
+    for i in range(1, 6):
+        notes_by_task[f"R{i}-0"] = f"[blocker] scripts/foo.py:1 — round {i} blocker"
+        notes_by_task[f"R{i}-1"] = "NO ISSUES"
+        # Mesh: reviewer-1 (the only dispatched mesh reviewer) emits a net-new NIT,
+        # never a CONFIRM of the blocker id → confirms==0 → peer_unconfirmed.
+        notes_by_prefix[f"M{i}"] = "[nit] scripts/foo.py:9 — minor style nit"
+    runner = _PhaseAwareHostFakeRunner(
+        impl_writes={"AI-1": ["scripts/foo.py"]},
+        notes_by_task=notes_by_task,
+        notes_by_prefix=notes_by_prefix,
+        fix_writes={f"FIX{i}-0": ["scripts/foo.py"] for i in range(1, 6)},
+        pm_default="REJECT — keep iterating",
+    )
+
+    out = host_cycle_executor(
+        action_items=items,
+        existing_files=frozenset({"seed.txt"}),
+        clone_dir=clone,
+        roster=["backend-engineer-1", "security-engineer-1", "software-architect-1"],
+        subject="peer-unconfirmed blocker",
+        runner=runner,
+        journal_path=tmp_path / "journal.json",
+        review=True,
+        test_command="true",
+    )
+
+    assert out["status"] == "abandoned", f"expected review_unrecoverable, got {out!r}"
+    assert out["reason"] == "review_unrecoverable"
+    summary = out["convergence_summary"]
+    # The neutral peer-unconfirmed clause is present and names the LATEST round's
+    # blocker id (iteration 5 → R5-0-0). This is the discarded side-map, now wired.
+    assert "Not peer-confirmed (single-reviewer):" in summary, (
+        f"peer-unconfirmed clause missing from convergence_summary: {summary!r}"
+    )
+    # Round-1 finding ids are stamped R{iter}-{reviewer_idx}-{k} with k starting at
+    # 1, so the latest round's (iteration 5) reviewer-0 blocker is R5-0-1.
+    assert "R5-0-1" in summary, f"peer-unconfirmed blocker id not named: {summary!r}"
+
+
+def test_review_terminal_rule_placeholder_wording():
+    """#11 (LOW-2) — the read-only review terminal rule names
+    `review-noop.placeholder` (matching the FakeCliRunner's `{tid}.noop` no-write
+    artifact convention), NOT `review-notes.md`, and explains the path is an inert
+    schema placeholder that no consumer reads. Mut (revert prose): the old
+    `review-notes.md` wording / missing placeholder clause fails these asserts."""
+    assert "review-noop.placeholder" in _REVIEW_TERMINAL_RULE
+    assert "review-notes.md" not in _REVIEW_TERMINAL_RULE
+    assert "schema placeholder" in _REVIEW_TERMINAL_RULE
+    assert "no consumer reads it" in _REVIEW_TERMINAL_RULE
+    assert "verdict lives entirely in `notes_md`" in _REVIEW_TERMINAL_RULE
+
+
+# ── M8a-2c #3/#4 — self-contained commit + journal-survives-commit (e2e) ─────
+
+
+@_SKIP_ENGINE
+def test_host_cycle_executor_e2e_commits_and_returns_sha(tmp_path):
+    """#3 — drive the REAL engine with a FakeCliRunner; on a clean Phase-4
+    success the executor COMMITS the merged work and returns a real 40-hex
+    commit_sha (+ Memex slug). git log confirms the kaizen(cycle-N) commit holds
+    the impl files. Mut: a wrapper that does NOT commit leaves commit_sha=None and
+    HEAD on the `init` commit (no kaizen subject, no impl files staged)."""
+    clone = _git_init_clone(tmp_path)
+    items = [
+        {
+            "id": "AI-1",
+            "touches": ["scripts/foo.py"],
+            "reads": [],
+            "depends_on": [],
+            "wave": 1,
+            "owner": "backend-engineer-1",
+        },
+        {
+            "id": "AI-2",
+            "touches": ["scripts/bar.py"],
+            "reads": [],
+            "depends_on": [],
+            "wave": 1,
+            "owner": "backend-engineer-1",
+        },
+    ]
+    runner = _HonestHostFakeRunner({"AI-1": ["scripts/foo.py"], "AI-2": ["scripts/bar.py"]})
+    out = host_cycle_executor(
+        action_items=items,
+        existing_files=frozenset({"seed.txt"}),
+        clone_dir=clone,
+        roster=["backend-engineer-1", "sdet-1"],
+        subject="commit me",
+        runner=runner,
+        journal_path=tmp_path / "journal.json",
+        review=False,
+        cycle_n=2,
+        run_id=7,
+        test_command="true",  # no-op gate — this test exercises the COMMIT path
+    )
+    assert out["status"] == "success", f"expected success, got {out!r}"
+    # Real 40-hex SHA + Memex slug stamped by the self-contained finalizer.
+    assert re.match(r"^[0-9a-f]{40}$", out["commit_sha"]), f"not a real sha: {out['commit_sha']!r}"
+    assert out["minutes_memex_slug"] == "kaizen:cycle:7-2"
+    # git log: HEAD is the kaizen cycle commit (its sha matches out["commit_sha"]).
+    head = subprocess.run(
+        ["git", "-C", str(clone), "log", "-1", "--pretty=%H%n%s"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    head_sha, head_subject = head.stdout.strip().splitlines()
+    assert head_sha == out["commit_sha"]
+    assert head_subject == "kaizen(cycle-2): host-mode cycle"
+    # The engine eager-merges each impl writer into HEAD as its own commit, so
+    # the kaizen cycle commit itself is empty (a metadata stamp). The merged
+    # impl files are TRACKED in HEAD's tree and present on disk regardless.
+    tracked = subprocess.run(
+        ["git", "-C", str(clone), "ls-tree", "-r", "--name-only", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert "scripts/foo.py" in tracked.stdout
+    assert "scripts/bar.py" in tracked.stdout
+    assert (clone / "scripts" / "foo.py").exists()
+    assert (clone / "scripts" / "bar.py").exists()
+
+
+@_SKIP_ENGINE
+def test_host_cycle_executor_journal_survives_commit(tmp_path):
+    """#4 — with the DEFAULT journal path (no journal_path arg), a clean success
+    commits AND the journal still exists afterward. Mut (§1A journal-wipe): if the
+    default journal lived at clone/.ai/host-journal.json, commit_cycle →
+    _strip_transient_dirs would rmtree clone/.ai/ and DELETE the journal; the
+    assertion `clone/.ai/host-journal.json does NOT exist` proves the default
+    journal is OUTSIDE the clone, and the success outcome proves the commit ran."""
+    clone = _git_init_clone(tmp_path)
+    items = [
+        {
+            "id": "AI-1",
+            "touches": ["scripts/foo.py"],
+            "reads": [],
+            "depends_on": [],
+            "wave": 1,
+            "owner": "backend-engineer-1",
+        },
+    ]
+    runner = _HonestHostFakeRunner({"AI-1": ["scripts/foo.py"]})
+    out = host_cycle_executor(
+        action_items=items,
+        existing_files=frozenset({"seed.txt"}),
+        clone_dir=clone,
+        roster=["backend-engineer-1", "sdet-1"],
+        subject="journal survives",
+        runner=runner,
+        # NO journal_path → exercises the DEFAULT (must resolve OUTSIDE the clone).
+        review=False,
+        cycle_n=1,
+        test_command="true",
+    )
+    assert out["status"] == "success", f"expected success, got {out!r}"
+    assert re.match(r"^[0-9a-f]{40}$", out["commit_sha"])
+    # NON-VACUOUS journal-survival check: the DEFAULT journal must EXIST at its
+    # deterministic out-of-clone location AFTER the commit. Mut (§1A): if the
+    # default regressed back to clone/.ai/host-journal.json, commit_cycle's
+    # _strip_transient_dirs would rmtree clone/.ai/ → this path would NOT exist →
+    # RED. (Asserting only that the journal is ABSENT from the clone is vacuous —
+    # a DELETED journal satisfies that too.)
+    expected_journal = clone.parent / f"{clone.name}.host-journal.json"
+    assert expected_journal.exists(), (
+        f"default journal must SURVIVE the commit at {expected_journal} "
+        "(outside the clone, untouched by the transient-dir strip)"
+    )
+    # And it must NOT have been placed inside the clone's stripped .ai/.
+    assert not (clone / ".ai" / "host-journal.json").exists(), (
+        "default journal must live OUTSIDE the clone — clone/.ai is stripped on commit"
+    )
+    # And the commit did not stage any stray .ai/ journal artifact.
+    names = subprocess.run(
+        ["git", "-C", str(clone), "show", "--name-only", "--pretty=format:"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert not any(line.startswith(".ai/") for line in names.stdout.splitlines())
+
+
+# ── M8a-2c #5/#6/#7 — CI-mirror gate (pure, no engine) ──────────────────────
+
+
+def _ruff_clone(tmp_path: Path, py_body: str) -> Path:
+    """A committed clone that opts into ruff (pyproject `[tool.ruff]`) with one
+    .py file. ``py_body`` controls whether ruff passes (clean) or fails (e.g. an
+    unused import → F401)."""
+    clone = tmp_path / "rclone"
+    clone.mkdir()
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+        "PATH": __import__("os").environ.get("PATH", ""),
+    }
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=clone, env=env, check=True)
+    (clone / "pyproject.toml").write_text("[tool.ruff]\nline-length = 100\n")
+    (clone / "mod.py").write_text(py_body)
+    subprocess.run(["git", "add", "-A"], cwd=clone, env=env, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=clone, env=env, check=True)
+    return clone
+
+
+@_SKIP_NO_RUFF
+def test_host_ci_gate_pre_existing_failure_does_not_abandon(tmp_path):
+    """#5 — a pre-existing ruff break (present in BOTH baseline and gate) must NOT
+    abandon: it predates the cycle's edits. Mut (drop the baseline diff): without
+    the baseline the pre-existing fail reads as cycle-introduced → abandon.
+
+    We build the baseline by running the SAME real ruff gate over the broken
+    clone, so baseline.ruff_check == fail; the gate then sees the identical fail
+    and `_diff_ci_results` classifies it pre-existing → returns None (proceed)."""
+    clone = _ruff_clone(tmp_path, "import os\n")  # F401 — pre-existing break
+    # Baseline captured with test_command="true" (real ruff still runs).
+    _, ci_baseline = run_ci_checks(clone, "true")
+    assert ci_baseline["ruff_check"]["status"] == "fail"  # the break IS in baseline
+    last_ci_results, abandon = _run_ci_gate(
+        clone,
+        "true",
+        ci_baseline,
+        subject="pre-existing debt",
+        participants=["backend-engineer-1"],
+    )
+    assert abandon is None, f"pre-existing failure must NOT abandon, got {abandon!r}"
+    assert last_ci_results["ruff_check"]["status"] == "fail"  # still observed, just ignored
+
+
+@_SKIP_NO_RUFF
+def test_host_ci_gate_cycle_introduced_failure_abandons(tmp_path):
+    """#6 — a ruff break that is ABSENT from the baseline but present at the gate
+    (the cycle introduced it) abandons with phase_reached='test',
+    reason='lint_failed'. Mut: gate not running (no abandon) or wrong reason
+    (anything but lint_failed) fails the assertions."""
+    clone = _ruff_clone(tmp_path, "x = 1\n")  # clean at baseline
+    _, ci_baseline = run_ci_checks(clone, "true")
+    assert ci_baseline["ruff_check"]["status"] == "pass"  # baseline is clean
+    # Now the "cycle" introduces an F401 break before the gate runs.
+    (clone / "mod.py").write_text("import os\n")
+    _last_ci_results, abandon = _run_ci_gate(
+        clone,
+        "true",
+        ci_baseline,
+        subject="introduced break",
+        participants=["backend-engineer-1"],
+    )
+    assert abandon is not None, "cycle-introduced ruff break must abandon"
+    assert abandon["status"] == "abandoned"
+    assert abandon["phase_reached"] == "test"
+    assert abandon["reason"] == "lint_failed"
+    assert "ruff_check" in abandon["detail"]
+    # Shape parity: the four review-outcome keys are present and None.
+    for k in (
+        "review_iteration_count",
+        "unresolved_findings",
+        "convergence_summary",
+        "reviewer_attribution",
+    ):
+        assert abandon[k] is None
+
+
+def test_host_ci_abandon_reason_parity_exact(tmp_path):
+    """#7 — every CI check maps to the SAME abandonment reason host and team modes
+    use (via the shared `_pick_highest_reason`/`_CHECK_TO_REASON`). Parametrized
+    by faking a single-check fail and asserting the gate's reason equals the
+    canonical map. Mut: a mis-map (e.g. bandit→lint_failed) fails the exact-equality
+    assertion against `_CHECK_TO_REASON`.
+
+    Driven through `_run_ci_gate` with a monkeypatched `run_ci_checks` so we
+    control exactly one failing check at a time (no need to manufacture a real
+    bandit/pip-audit break)."""
+    import scripts.host_executor as he
+
+    cases = {
+        "ruff_check": "lint_failed",
+        "ruff_format": "lint_failed",
+        "bandit": "security_failed",
+        "pip_audit": "sca_failed",
+        "tests": "tests_unrecoverable",
+    }
+    # Anchor the expectation against team mode's canonical map (not a hand-copy):
+    # any divergence between this test's table and _CHECK_TO_REASON is a bug in one
+    # of them, so assert they agree first.
+    assert cases == _CHECK_TO_REASON, (
+        f"parity table drifted from team_executor._CHECK_TO_REASON: {cases} != {_CHECK_TO_REASON}"
+    )
+    clone = tmp_path / "c"
+    clone.mkdir()
+    for check, expected_reason in cases.items():
+
+        def fake_run_ci_checks(_clone, _cmd, _check=check):
+            results = {
+                "tests": {"status": "pass", "output": "=== 1 passed in 0.01s ==="},
+                "ruff_check": {"status": "pass", "output": ""},
+                "ruff_format": {"status": "pass", "output": ""},
+                "bandit": {"status": "pass", "output": ""},
+                "pip_audit": {"status": "pass", "output": ""},
+            }
+            results[_check] = {"status": "fail", "output": f"{_check} broke"}
+            return False, results
+
+        orig = he.run_ci_checks
+        he.run_ci_checks = fake_run_ci_checks
+        try:
+            # Baseline = all green (the break is cycle-introduced).
+            baseline = {name: {"status": "pass", "output": ""} for name in cases}
+            _, abandon = _run_ci_gate(
+                clone,
+                "pytest",
+                baseline,
+                subject="parity",
+                participants=["backend-engineer-1"],
+            )
+        finally:
+            he.run_ci_checks = orig
+        assert abandon is not None, f"{check} fail must abandon"
+        assert abandon["reason"] == expected_reason, (
+            f"check {check!r} mapped to {abandon['reason']!r}, expected {expected_reason!r}"
+        )
+        assert abandon["phase_reached"] == "test"
+
+
+# ── LIVE e2e — real `claude` CLI through the sandbox (deselected by default) ──
+#
+# Drives `host_cycle_executor(review=True)` end-to-end with the PRODUCTION caller
+# (`runner=None` → atelier's real `real_cli_runner` resolved in-window) on a tiny
+# real git repo. NEVER sets ATELIER_CLI_ALLOW_UNSANDBOXED — the cycle runs fully
+# sandboxed (native_sandbox_wrap, wired in host_cycle_executor). Marked `live`
+# (CI deselects via `addopts = "-m 'not live'"`) AND skipped unless the engine +
+# `claude` + a native sandbox are all present. Run explicitly:
+#   PYTHONPATH=. python3 -m pytest -m live tests/test_host_executor.py -v
+#
+# Per `feedback-test-the-production-caller-not-just-units`: the FakeCliRunner can
+# never exercise the real CONFIRM/RETRACT/ESCALATE grammar, the real review
+# prompts, or the journal-replay path — only a live run does. Assertions are
+# robust to LLM nondeterminism (a real opus reviewer may legitimately file a
+# persistent blocker → `review_unrecoverable` is a VALID outcome).
+@pytest.mark.live
+@_LIVE
+def test_host_cycle_executor_live_review_cycle(tmp_path):
+    clone = _git_init_clone(tmp_path)
+    items = [
+        {
+            "id": "AI-1",
+            "touches": ["greeting.py"],
+            "reads": [],
+            "depends_on": [],
+            "wave": 1,
+            "owner": "backend-engineer-1",
+            # The task body the Phase-4 briefing renders for the real implementer.
+            "title": "Create greeting.py",
+            "description": (
+                "Create a new file `greeting.py` at the repo root containing a "
+                "single function `greet(name: str) -> str` that returns the "
+                "string `Hello, {name}!` (f-string). Keep it minimal — no extra "
+                "imports, no __main__ block. The file must be valid Python."
+            ),
+        },
+    ]
+    roster = ["backend-engineer-1", "security-engineer-1", "software-architect-1"]
+
+    out = host_cycle_executor(
+        action_items=items,
+        existing_files=frozenset({"seed.txt"}),
+        clone_dir=clone,
+        roster=roster,
+        pm="pm-1",
+        subject="live host review cycle",
+        runner=None,  # → REAL real_cli_runner resolved in-window (production caller)
+        journal_path=tmp_path / "journal.json",  # OUTSIDE the clone (avoids the strip hazard)
+        review=True,
+        cycle_n=1,
+        test_command="true",  # no-op CI gate (always-pass) — this validates the REVIEW loop, not CI
+    )
+
+    # ── anchor: the call returned a well-formed outcome (no exception escaped) ─
+    assert isinstance(out, dict)
+    assert out["status"] in {"success", "abandoned"}, f"unexpected status: {out!r}"
+    assert out["subject"] == "live host review cycle"
+
+    if out["status"] == "success":
+        # The M8a-2c flip: commit_sha is now a REAL 40-char hex sha (was None).
+        sha = out["commit_sha"]
+        assert isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha), f"bad sha: {sha!r}"
+        assert (out.get("minutes_memex_slug") or "").startswith("kaizen:cycle:")
+        assert out["participants"] == roster
+        # The engine eager-merges impl work into HEAD's TREE; the kaizen cycle
+        # commit is an empty metadata stamp ON TOP. So assert the impl file lives
+        # in HEAD's tree (git ls-tree) + on disk — NOT in `git show HEAD` (the
+        # stamp is empty).
+        tree = subprocess.run(
+            ["git", "-C", str(clone), "ls-tree", "-r", "--name-only", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        assert "greeting.py" in tree, f"greeting.py not in HEAD tree:\n{tree}"
+        assert (clone / "greeting.py").exists()
+    else:
+        # A real reviewer may legitimately block; CI ran no-op so test reasons are
+        # excluded. Accept the review/impl-phase abandonment reasons.
+        assert out["reason"] in {"no_consensus", "review_unrecoverable", "other"}, (
+            f"unexpected abandon reason: {out!r}"
+        )
+        if out["reason"] == "review_unrecoverable":
+            # The four review-outcome fields must be present on this path.
+            for k in (
+                "review_iteration_count",
+                "unresolved_findings",
+                "convergence_summary",
+                "reviewer_attribution",
+            ):
+                assert k in out, f"missing {k} on review_unrecoverable outcome"

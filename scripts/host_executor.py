@@ -8,15 +8,21 @@ v1.10.0's deterministic-host engine task dicts and drives
 ``host_scheduler.run_host_pipeline_for_project`` in-process (no subprocess hop)
 via :func:`scripts.atelier_engine.atelier_engine`.
 
-SCOPE (M8a-2a — PR 1 of 3):
+SCOPE (M8a-2a + M8a-2b + M8a-2c):
   * ONLY Phase 4 (implement tasks) goes through the engine here. Phases 1-3
     (agenda / pre-analysis / synthesis meeting) stay orchestrator-side and are
     OUT OF SCOPE — :func:`host_cycle_executor` RECEIVES the already-validated
     Action-Items list as input.
-  * NO review tasks (Phase 5b' review-pairing is M8a-2b).
-  * NO CI mirror, NO ``commit_cycle`` here (M8a-2c / orchestrator). This module
-    returns the interpreted outcome dict and leaves the merged files in the
-    clone; the caller commits + mirrors CI.
+  * Phase 5b' review-pairing + fix loop runs in the SAME engine window on a clean
+    Phase-4 success (M8a-2b).
+  * M8a-2c made the host path SELF-CONTAINED: after the window closes,
+    :func:`host_cycle_executor` runs the CI-mirror gate (baseline-diff parity
+    with team mode), then COMMITS the merged work via
+    :func:`scripts.cycle_git.commit_cycle_and_sha` and stamps the real
+    ``commit_sha`` + Memex minutes slug. The commit lives INSIDE this executor
+    (before run.py inspects the outcome) so F3 holds with ZERO run.py change.
+    The default journal path lives OUTSIDE the clone so the commit's
+    transient-dir strip cannot delete it mid-flight (§1A).
 
 CLOSURE / RE-IMPORT HAZARD (see :mod:`scripts.atelier_engine`): inside the
 ``with atelier_engine(...)`` window the name ``scripts`` resolves to ATELIER's
@@ -54,6 +60,8 @@ from typing import Any
 # symbol below is kaizen's, captured before the swap so the briefing closures +
 # consolidation + parse run correctly while `scripts` resolves to atelier.
 from scripts.atelier_engine import assert_engine_available, atelier_engine
+from scripts.ci_runner import parse_pytest_pass_count, run_ci_checks
+from scripts.cycle_git import commit_cycle_and_sha
 from scripts.fix_loop import (
     _BLOCKING_SEVERITIES,
     Finding,
@@ -71,7 +79,23 @@ from scripts.reviewers import InsufficientRosterError, select_reviewers
 # keeps host and team modes parsing the IDENTICAL `[severity] file:line — text`
 # grammar and routing fixes to the SAME owner index. team_executor does not
 # import host_executor, so there is no import cycle.
-from scripts.team_executor import _find_owner_for_finding, _parse_reviewer_response
+#
+# M8a-2c: the CI-mirror gate + abandonment-reason mapping reuse team mode's
+# byte-identical baseline-diff + reason helpers. `run_ci_checks` /
+# `parse_pytest_pass_count` (ci_runner) and `_diff_ci_results` /
+# `_pick_highest_reason` (team_executor) are imported HERE, at module top,
+# OUTSIDE any `atelier_engine()` window — the CI gate + commit run at the
+# OUTSIDE-window return seam by construction, so these are never reached while
+# `scripts` resolves to atelier. (`_pick_highest_reason` encapsulates
+# team_executor's `_CHECK_TO_REASON` map, so host and team modes emit the
+# IDENTICAL per-check → abandonment-reason taxonomy — the §7 #7 parity test
+# anchors that against `_CHECK_TO_REASON` directly.)
+from scripts.team_executor import (
+    _diff_ci_results,
+    _find_owner_for_finding,
+    _parse_reviewer_response,
+    _pick_highest_reason,
+)
 
 _log = logging.getLogger("kaizen.host_executor")
 
@@ -360,8 +384,11 @@ _REVIEW_TERMINAL_RULE = (
     "review — do NOT change directories and write NO files. Emit ONLY the "
     "terminal task_result envelope matching the provided json-schema: status "
     "'done' with a SINGLE summary artifact (you write no files, so give it a "
-    "synthetic path such as `review-notes.md` — the envelope schema rejects a "
-    "`done` with empty artifacts) and your verdict/finding lines in `notes_md`. "
+    "synthetic path such as `review-noop.placeholder` — this path is a schema "
+    "placeholder for the read-only review envelope: you write NO file and no "
+    "consumer reads it; your verdict lives entirely in `notes_md`, and the "
+    "envelope schema merely rejects a `done` with empty artifacts) and your "
+    "verdict/finding lines in `notes_md`. "
     "The envelope is your sole output channel — do not narrate."
 )
 
@@ -631,6 +658,7 @@ def _make_pm_briefing_for(
     blockers_by_task_id: Mapping[str, Sequence[Finding]],
     phase_5b_prime_pm_acceptance: Callable[..., str],
     teammate_reply_rule: str,
+    peer_unconfirmed_ids: set[str] | None = None,
 ) -> Callable[[Mapping[str, Any], int], str]:
     """Build a PM-acceptance ``briefing_for(task, attempt) -> str`` closure.
 
@@ -638,15 +666,25 @@ def _make_pm_briefing_for(
     surviving blocker/major findings. The closure renders the UNCHANGED PM template
     over them, strips F7, and appends the host read-only terminal rule. All refs
     pre-bound; no ``scripts.*`` at call time.
+
+    ``peer_unconfirmed_ids`` (M8a-2c LOW-1) is the set of blocker/major
+    finding_ids that survived without any peer cross-confirm (from
+    :func:`_consolidate_mesh`'s side-map). It is SNAPSHOT-BY-VALUE here (copied
+    into a frozen local set) so the closure references the immutable snapshot,
+    not a later-mutated caller object — the same pre-binding discipline as
+    ``blockers_map``. Passed straight into the template as a plain kwarg.
     """
     trailer = teammate_reply_rule.strip()
     blockers_map = {tid: list(fs) for tid, fs in blockers_by_task_id.items()}
+    unconfirmed_snapshot = set(peer_unconfirmed_ids or set())
 
     def briefing_for(task: Mapping[str, Any], attempt: int) -> str:
         tid = str(task["task_id"])
         iter_n = int(tid[2:])  # "PM{iter}"
         blockers = blockers_map.get(tid, [])
-        rendered = phase_5b_prime_pm_acceptance(findings=blockers, iter_n=iter_n)
+        rendered = phase_5b_prime_pm_acceptance(
+            findings=blockers, iter_n=iter_n, peer_unconfirmed_ids=unconfirmed_snapshot
+        )
         body = _strip_f7_trailer(rendered, trailer)
         return f"{body}\n\n{_REVIEW_TERMINAL_RULE}"
 
@@ -823,9 +861,9 @@ def _consolidate_mesh(
           unconfirmed it is flagged ``peer_unconfirmed=True`` in the RETURNED
           side-map. NEVER silently dropped — it stays in ``survivors`` so it
           counts as a blocker, drives a fix, and hits the PM gate regardless of
-          the flag. (Surfacing the flag in the PM briefing / convergence summary
-          is deferred to M8a-2c; the current loop consumes ``survivors`` and does
-          not yet read the side-map.)
+          the flag. (M8a-2c LOW-1: the loop now BINDS this side-map and surfaces
+          the flag NEUTRALLY in the PM briefing + the convergence summary on
+          exhaustion; it does NOT soften the PM toward acceptance.)
         - ``minor`` / ``nit``: DROPPED unless confirmed by >=1 peer.
 
     ``n_reviewers == 1`` is the VACUOUS-QUORUM case (spec §2.3 step 4): there are
@@ -964,9 +1002,7 @@ def _run_review_fix_loop(
     mesh_briefing_factory: Callable[
         [Mapping[str, Sequence[Finding]]], Callable[[Mapping[str, Any], int], str]
     ],
-    pm_briefing_factory: Callable[
-        [Mapping[str, Sequence[Finding]]], Callable[[Mapping[str, Any], int], str]
-    ],
+    pm_briefing_factory: Callable[..., Callable[[Mapping[str, Any], int], str]],
     fix_briefing_factory: Callable[
         [Mapping[str, Finding]], Callable[[Mapping[str, Any], int], str]
     ],
@@ -1006,13 +1042,19 @@ def _run_review_fix_loop(
             )
 
             # ── Skip-mesh fast paths ─────────────────────────────────────────
+            # `peer_unconfirmed` is the LATEST round's blocker/major-without-peer-
+            # confirm side-map from `_consolidate_mesh` (LOW-1). It flows to the PM
+            # briefing + convergence summary; previously discarded here.
+            peer_unconfirmed: dict[str, bool] = {}
             if not r1_findings:
                 # Zero round-1 findings → no mesh dispatch, clean exit.
                 survivors: list[Finding] = []
+                peer_unconfirmed = {}
                 record_findings(state, survivors)
             elif n_reviewers == 1:
-                # Single reviewer → mesh is vacuous; consolidate with no peers.
-                survivors, _peer_unconfirmed = _consolidate_mesh(r1_findings, {}, [], n_reviewers=1)
+                # Single reviewer → mesh is vacuous; consolidate with no peers (the
+                # map is `{}` by construction — a sole reviewer has no peers).
+                survivors, peer_unconfirmed = _consolidate_mesh(r1_findings, {}, [], n_reviewers=1)
                 record_findings(state, survivors)
             else:
                 # ── ROUND 2 (Mesh) ───────────────────────────────────────────
@@ -1087,7 +1129,7 @@ def _run_review_fix_loop(
                     mesh_verdicts_by_reviewer[reviewer] = verdicts
                     mesh_net_new.extend(net_new)
 
-                survivors, _peer_unconfirmed = _consolidate_mesh(
+                survivors, peer_unconfirmed = _consolidate_mesh(
                     r1_findings,
                     mesh_verdicts_by_reviewer,
                     mesh_net_new,
@@ -1100,9 +1142,18 @@ def _run_review_fix_loop(
             if not latest_blockers:
                 return None  # clean exit (zero blocking findings).
 
+            # Blocker/major finding_ids that survived without any peer cross-
+            # confirm (LOW-1) — restricted to this round's surviving blockers so
+            # the PM briefing only marks lines it actually renders.
+            unconfirmed_ids = {
+                f.finding_id for f in latest_blockers if peer_unconfirmed.get(f.finding_id)
+            }
+
             # ── PM-acceptance (read-only dispatched task) ────────────────────
             pm_task = build_pm_task(latest_blockers, pm, iter_n=iter_n)
-            pm_briefing = pm_briefing_factory({pm_task["task_id"]: latest_blockers})
+            pm_briefing = pm_briefing_factory(
+                {pm_task["task_id"]: latest_blockers}, unconfirmed_ids
+            )
             pm_results = dispatch_round([pm_task], pm_briefing)
             pm_result = pm_results[0]
             pm_resp = pm_result.get("notes_md") if isinstance(pm_result, Mapping) else None
@@ -1114,9 +1165,14 @@ def _run_review_fix_loop(
             if not should_continue(state, pm_accepts_remaining=pm_accepts):
                 if pm_accepts:
                     return None  # clean exit — PM ruled remaining issues acceptable.
-                # MAX_ITERATIONS reached with blockers still present.
+                # MAX_ITERATIONS reached with blockers still present. Pass the
+                # LATEST round's peer-unconfirmed map ONLY here (the exhaustion
+                # site) — fix-failed + HARD-abandon below pass None.
                 return build_abandonment_outcome(
-                    state, subject=subject, participants=list(participants)
+                    state,
+                    subject=subject,
+                    participants=list(participants),
+                    peer_unconfirmed=unconfirmed_ids,
                 )
 
             # ── FIX round (writers, one per coalesced file) ──────────────────
@@ -1205,6 +1261,72 @@ def _interpret_engine_results(
     }
 
 
+def _run_ci_gate(
+    clone_path: Path,
+    test_command: str,
+    ci_baseline: dict[str, dict] | None,
+    *,
+    subject: str | None,
+    participants: Sequence[str],
+) -> tuple[dict[str, dict] | None, dict[str, Any] | None]:
+    """Run the post-Phase-4 CI-mirror gate (M8a-2c §2). REUSE — kaizen has it.
+
+    Single post-Phase-4 gate (the engine runs the whole DAG in ONE call — there
+    is no per-wave Python boundary here; per-wave CI is out of scope/future).
+    Mirrors team mode's wave-boundary gate logic byte-for-byte via the shared
+    `_diff_ci_results` / `_pick_highest_reason` helpers:
+
+      * run ``run_ci_checks(clone, test_command)`` (honors KAIZEN_SKIP_CHECKS /
+        KAIZEN_SKIP_PIP_AUDIT and skips missing binaries gracefully);
+      * diff against the pre-window ``ci_baseline`` — pre-existing failures are
+        LOGGED ONLY, never abandon (without this a target with debt abandons
+        every cycle);
+      * cycle-introduced failures → an abandonment dict (``phase_reached="test"``,
+        the highest-severity per-check reason, detail naming BOTH lists, the four
+        review-outcome keys = None for shape parity).
+
+    Returns ``(last_ci_results, abandonment_or_None)``. ``last_ci_results`` is the
+    gate's per-check dict (the caller parses its pytest pass-count for the commit
+    message). The second element is None when the gate passes (or only pre-existing
+    failures remain) → proceed to commit. Runs OUTSIDE the engine window.
+    """
+    all_passed, last_ci_results = run_ci_checks(clone_path, test_command)
+    if all_passed:
+        return last_ci_results, None
+    cycle_introduced, pre_existing = _diff_ci_results(ci_baseline, last_ci_results)
+    if pre_existing:
+        # Pre-existing failures: log (structured logging is out of scope) but do
+        # NOT abandon — they predate the cycle's edits.
+        _log.warning(
+            "host CI gate: ignoring pre-existing failures from baseline: %s",
+            pre_existing,
+        )
+    if not cycle_introduced:
+        # Every failure was pre-existing → the cycle is clean; proceed to commit.
+        return last_ci_results, None
+    # Cycle-introduced failures → abandon at the test phase, mapping the
+    # highest-severity failed category to its per-CI-kind reason (parity with
+    # team_executor — same `_pick_highest_reason`/`_CHECK_TO_REASON` taxonomy).
+    reason = _pick_highest_reason(cycle_introduced)
+    detail = (
+        "host CI gate failed after Phase 4: "
+        f"cycle-introduced={cycle_introduced}, pre-existing={pre_existing}"
+    )
+    return last_ci_results, {
+        "status": "abandoned",
+        "subject": subject,
+        "participants": list(participants),
+        "phase_reached": "test",
+        "reason": reason,
+        "detail": detail,
+        "artifacts": [],
+        "review_iteration_count": None,
+        "unresolved_findings": None,
+        "convergence_summary": None,
+        "reviewer_attribution": None,
+    }
+
+
 def _review_roster_abandon(
     subject: str | None,
     participants: Sequence[str],
@@ -1244,6 +1366,9 @@ def host_cycle_executor(
     runner: Any = None,
     journal_path: str | Path | None = None,
     review: bool = True,
+    cycle_n: int = 1,
+    run_id: int | None = None,
+    test_command: str = "pytest",
 ) -> dict[str, Any]:
     """Run a cycle's Phase-4 implementation waves through atelier's host engine.
 
@@ -1257,15 +1382,29 @@ def host_cycle_executor(
       2. :func:`build_engine_tasks` — translate to engine Phase-4 task dicts.
       3. Build closures with PRE-BOUND refs BEFORE the engine window.
       4. :func:`assert_engine_available` — OUTSIDE the window (version+capability
-         gate).
+         gate). Capture the CI baseline (``run_ci_checks(clone, "true")``) here,
+         BEFORE the window, so the post-Phase-4 gate can diff cycle-introduced
+         failures from pre-existing debt (§2; mandatory).
       5. ``with atelier_engine(root) as host:`` — construct BudgetPool /
          ResultJournal / sandbox / worktree-factory / neutral run_mode IN-window
          (these are atelier's), then ``asyncio.run(run_host_pipeline_for_project(...))``
-         ENTIRELY inside the window.
-      6. OUTSIDE the window: interpret results → outcome dict.
+         ENTIRELY inside the window. On a clean Phase-4 success, the Phase 5b'
+         review→fix loop runs in the SAME window (M8a-2b).
+      6. OUTSIDE the window: interpret results → outcome dict, then SELF-CONTAINED
+         finalization (M8a-2c) — CI-mirror gate, then commit the merged work via
+         :func:`scripts.cycle_git.commit_cycle_and_sha` and stamp the real
+         ``commit_sha`` + ``minutes_memex_slug`` (slug
+         ``kaizen:cycle:{run_id}-{cycle_n}`` or ``kaizen:cycle:host-{cycle_n}``).
+
+    The commit happens INSIDE this executor (before run.py inspects the outcome)
+    so F3 holds with NO run.py change. The default ``journal_path`` lives OUTSIDE
+    the clone (a tempdir this executor owns) so the commit's transient-dir strip
+    cannot delete the journal mid-flight (§1A).
 
     ``runner`` defaults to ``None`` → atelier's ``real_cli_runner`` resolved
     in-window. Tests inject a ``FakeCliRunner`` (no real ``claude``).
+    ``test_command`` is the target's CI test command (mirrored by the gate);
+    ``cycle_n`` / ``run_id`` feed the commit message + Memex slug.
     """
     clone_path = Path(clone_dir)
     roster = list(roster or [])
@@ -1323,10 +1462,38 @@ def host_cycle_executor(
     # Version + capability gate (OUTSIDE the window).
     atelier_root = assert_engine_available()
 
-    journal_file = (
-        Path(journal_path) if journal_path is not None else clone_path / ".ai" / "host-journal.json"
-    )
+    # CRITICAL journal hazard (M8a-2c §1A): the post-Phase-4 commit calls
+    # `commit_cycle → _strip_transient_dirs`, which rmtrees the clone's UNTRACKED
+    # `clone/.ai/`. The old default journal path `clone/.ai/host-journal.json`
+    # would therefore be DELETED out from under the still-open ResultJournal mid
+    # commit. The default journal now lives OUTSIDE the clone — a DETERMINISTIC
+    # sibling of the clone dir in its (ephemeral, gitignored experiment) parent —
+    # so the commit's transient-dir strip can never touch it, it leaks no per-cycle
+    # /tmp dir, and a test can assert it SURVIVES at its real location. An explicit
+    # `journal_path` (tests / live e2e) is honored verbatim — callers are expected
+    # to point it outside the clone too.
+    if journal_path is not None:
+        journal_file = Path(journal_path)
+    else:
+        journal_file = clone_path.parent / f"{clone_path.name}.host-journal.json"
     journal_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # ── CI baseline (M8a-2c §2 — MANDATORY) ─────────────────────────────────
+    # Capture the target's CI state BEFORE the engine runs ANY Phase-4 work, so
+    # the post-Phase-4 gate can tell "the cycle introduced this break" apart from
+    # "the host arrived with this break." WITHOUT this baseline, a target with a
+    # pre-existing ruff/bandit/pip-audit debt would abandon EVERY cycle (the
+    # pre-F10 incident). `"true"` is the baseline test command (a no-op exit-0) so
+    # the baseline captures lint/security/sca state, not a pre-cycle pytest run.
+    # A baseline crash is non-fatal — log and proceed with baseline=None (every
+    # fail then reads as cycle-introduced, the pre-F10 behavior). This runs
+    # OUTSIDE the engine window (run_ci_checks is the kaizen helper, pre-bound).
+    ci_baseline: dict[str, dict] | None = None
+    try:
+        _baseline_passed, ci_baseline = run_ci_checks(clone_path, "true")
+    except Exception as baseline_exc:
+        _log.warning("host CI baseline run failed: %s — proceeding without diff", baseline_exc)
+        ci_baseline = None
 
     # ── The engine window. EVERYTHING atelier — BudgetPool, ResultJournal,
     #    sandbox, worktree factory, neutral run_mode, the runner default, AND
@@ -1465,9 +1632,12 @@ def host_cycle_executor(
                             TEAMMATE_REPLY_RULE,
                         )
 
-                    def _pm_fac(bmap):
+                    def _pm_fac(bmap, peer_unconfirmed_ids=None):
                         return _make_pm_briefing_for(
-                            bmap, phase_5b_prime_pm_acceptance, TEAMMATE_REPLY_RULE
+                            bmap,
+                            phase_5b_prime_pm_acceptance,
+                            TEAMMATE_REPLY_RULE,
+                            peer_unconfirmed_ids=peer_unconfirmed_ids,
                         )
 
                     def _fix_fac(fmap):
@@ -1502,9 +1672,62 @@ def host_cycle_executor(
                         is_failed_attempt=is_failed_attempt,
                     )
 
-    # ── OUTSIDE the window. A review abandonment (roster-too-small or fix-loop
-    #    exhaustion) SUPERSEDES the Phase-4 success; else return the Phase-4
-    #    outcome (success, or a Phase-4 abandonment that skipped review). ────────
+    # ── OUTSIDE the window — self-contained finalization (M8a-2c §1/§2). ────────
+    # The engine window is closed; `scripts` is kaizen again, so the CI helpers,
+    # `commit_cycle_and_sha`, and `parse_pytest_pass_count` (all pre-bound at
+    # module top) run here. F3 is satisfied with NO run.py change: the commit
+    # happens INSIDE host_cycle_executor, before run.py inspects the outcome — do
+    # NOT move it to run.py.
+    #
+    # Resolution order (only ONE path commits):
+    #   1. a review abandonment (roster-too-small or fix-loop exhaustion)
+    #      SUPERSEDES Phase-4 success → return it, NO commit;
+    #   2. Phase-4 itself abandoned (skipped review) → return it, NO commit;
+    #   3. clean Phase-4 success → run the CI-mirror gate; a cycle-introduced
+    #      break abandons → return that, NO commit;
+    #   4. else commit the merged work, stamp the real commit_sha + Memex slug.
     if review_outcome is not None:
         return review_outcome
+    if phase4_outcome.get("status") != "success":
+        return phase4_outcome
+
+    # Clean success → CI-mirror gate (§2). Reviewer-driven fixes are NOT re-CI'd
+    # — this single post-Phase-4 gate matches team mode's documented parity.
+    last_ci_results, ci_abandon = _run_ci_gate(
+        clone_path,
+        test_command,
+        ci_baseline,
+        subject=subject,
+        participants=participants,
+    )
+    if ci_abandon is not None:
+        return ci_abandon
+
+    # Commit the merged work + read back the real SHA (§1). The minutes slug is
+    # `kaizen:cycle:{run_id}-{cycle_n}` (or `kaizen:cycle:host-{cycle_n}` when no
+    # run_id), mirroring team mode's Memex-slug convention. n_tests is the real
+    # pytest pass count parsed from the gate's `tests` output.
+    #
+    # `allow_empty=True`: atelier's engine EAGER-MERGES each Phase-4 writer's
+    # worktree into the clone HEAD as `--no-ff` merge commits, so the impl work
+    # is ALREADY committed by the time we get here and the working tree is clean.
+    # The kaizen cycle commit stamps the standard cycle message (the PR
+    # title/body render from it) on top of those merges; without --allow-empty,
+    # `git commit` over a clean tree would exit 1.
+    minutes_ref = (
+        f"kaizen:cycle:{run_id}-{cycle_n}" if run_id is not None else f"kaizen:cycle:host-{cycle_n}"
+    )
+    n_tests = parse_pytest_pass_count((last_ci_results or {}).get("tests", {}).get("output", ""))
+    commit_sha = commit_cycle_and_sha(
+        clone_dir=clone_path,
+        cycle_n=cycle_n,
+        decisions=["host-mode cycle"],
+        participants=list(participants),
+        n_tests=n_tests,
+        subject=subject or "host-mode",
+        minutes_rel_path=minutes_ref,
+        allow_empty=True,
+    )
+    phase4_outcome["commit_sha"] = commit_sha
+    phase4_outcome["minutes_memex_slug"] = minutes_ref
     return phase4_outcome

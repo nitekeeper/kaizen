@@ -105,8 +105,15 @@ def should_continue(state: FixLoopState, pm_accepts_remaining: bool = False) -> 
     return bool(blocking)
 
 
-def _summarise_convergence(state: FixLoopState) -> str:
-    """Build a human-readable convergence summary from the history."""
+def _summarise_convergence(state: FixLoopState, peer_unconfirmed: set[str] | None = None) -> str:
+    """Build a human-readable convergence summary from the history.
+
+    ``peer_unconfirmed`` (M8a-2c LOW-1) is the set of blocker/major finding_ids
+    that survived without any peer cross-confirm. When NON-EMPTY a neutral
+    disclosure clause is appended; when None or empty NOTHING is appended (so the
+    summary shape is unchanged for the common path). Disclosure is neutral — it
+    does not editorialize on whether the findings are real.
+    """
     iterations = state.iteration
     latest = state.history[-1] if state.history else []
     n_remaining = len(latest)
@@ -125,17 +132,22 @@ def _summarise_convergence(state: FixLoopState) -> str:
     persistent_ids = sorted(fid for fid, count in id_counts.items() if count > 1)
     persistent_str = ", ".join(persistent_ids) if persistent_ids else "none"
 
-    return (
+    summary = (
         f"After {iterations} iterations: {n_remaining} unresolved finding(s) "
         f"({n_blocker} blocker, {n_major} major). "
         f"Persistent across rounds: {persistent_str}."
     )
+    if peer_unconfirmed:
+        ids = ", ".join(sorted(peer_unconfirmed))
+        summary += f" Not peer-confirmed (single-reviewer): {ids}."
+    return summary
 
 
 def build_abandonment_outcome(
     state: FixLoopState,
     subject: str | None,
     participants: list[str],
+    peer_unconfirmed: set[str] | None = None,
 ) -> dict:
     """Construct the cycle's abandonment-outcome dict for the orchestrator.
 
@@ -190,7 +202,7 @@ def build_abandonment_outcome(
     latest = state.history[-1] if state.history else []
     unresolved_findings = [asdict(f) for f in latest]
     reviewer_attribution = {f.finding_id: f.reviewer for f in latest}
-    convergence_summary = _summarise_convergence(state)
+    convergence_summary = _summarise_convergence(state, peer_unconfirmed)
     detail = (
         f"Phase 5b' fix loop exhausted after {state.iteration} iteration(s) "
         f"with {len(latest)} unresolved finding(s). {convergence_summary}"

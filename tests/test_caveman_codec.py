@@ -639,8 +639,13 @@ def _n1_run_executor_capturing_phase3_open(monkeypatch, tmp_path, gate_value):
     else:
         monkeypatch.setenv("KAIZEN_CAVEMAN_COMPRESS", gate_value)
 
-    # Stub Phase 5c commit + rev-parse (no real repo) and CI (always green).
-    monkeypatch.setattr(te, "commit_cycle", lambda **kwargs: None)
+    # Stub Phase 5c commit (no real repo) and CI (always green). The inline
+    # commit + rev-parse was folded into cycle_git.commit_cycle_and_sha (M8a-2c);
+    # team_executor drives that single seam now, so stub it to return a canned
+    # SHA. The fake subprocess proc still covers the best-effort tmux calls.
+    monkeypatch.setattr(
+        te, "commit_cycle_and_sha", lambda **kwargs: "deadbeefcafebabe1234567890abcdef12345678"
+    )
 
     class _FakeProc:
         stdout = "deadbeefcafebabe1234567890abcdef12345678\n"

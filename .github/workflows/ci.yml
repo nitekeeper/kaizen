@@ -72,7 +72,13 @@ jobs:
           cache: pip
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        # `ruff` is needed at TEST TIME (not just in the Ruff job): the host
+        # CI-mirror gate tests drive the real `run_ci_checks`, which shells out to
+        # `ruff` on a temp clone that opts into ruff. Without it those checks
+        # resolve to `status="skip"` and the gate tests fail (they assert
+        # pass/fail). bandit/pip-audit are mocked in the parity test, so only ruff
+        # is required here.
+        run: pip install -r requirements.txt ruff
 
       - name: Run test suite
         run: pytest tests/ -q

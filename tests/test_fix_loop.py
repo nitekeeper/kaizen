@@ -183,3 +183,30 @@ def test_build_abandonment_outcome_convergence_summary_mentions_persistent_findi
     summary = outcome["convergence_summary"]
     # The summary should surface that F-1 recurred across rounds.
     assert "F-1" in summary or "persistent" in summary.lower()
+
+
+def test_summarise_convergence_lists_peer_unconfirmed():
+    """#9 (LOW-1) — the neutral peer-unconfirmed clause is PRESENT when the map is
+    non-empty and ABSENT when it is None/empty. Mut (always-on): the clause would
+    appear even with None; mut (never-on): it would never appear with a non-empty
+    map."""
+    persistent = _f("R1-0-1", "blocker", reviewer="sec-1")
+    state = FixLoopState(iteration=5, history=[[persistent]] * 5)
+
+    # With a non-empty peer_unconfirmed set → clause present, names the id.
+    out_with = build_abandonment_outcome(
+        state, subject="s", participants=["a"], peer_unconfirmed={"R1-0-1"}
+    )
+    summary_with = out_with["convergence_summary"]
+    assert "Not peer-confirmed (single-reviewer):" in summary_with
+    assert "R1-0-1" in summary_with
+
+    # With None (the default / common path) → clause ABSENT.
+    out_none = build_abandonment_outcome(state, subject="s", participants=["a"])
+    assert "Not peer-confirmed" not in out_none["convergence_summary"]
+
+    # With an empty set → also ABSENT (empty is falsy; no editorializing).
+    out_empty = build_abandonment_outcome(
+        state, subject="s", participants=["a"], peer_unconfirmed=set()
+    )
+    assert "Not peer-confirmed" not in out_empty["convergence_summary"]

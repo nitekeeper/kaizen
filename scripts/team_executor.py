@@ -122,7 +122,7 @@ from scripts.caveman_codec import compress as _caveman_compress
 from scripts.caveman_codec import should_compress as _caveman_should_compress
 from scripts.cc_tool_bridge import quorum_for
 from scripts.ci_runner import parse_pytest_pass_count, run_ci_checks
-from scripts.cycle_git import commit_cycle
+from scripts.cycle_git import commit_cycle_and_sha
 from scripts.dag import validate_dag
 from scripts.dispatch_templates import (
     phase_1_agenda,
@@ -1345,7 +1345,7 @@ def team_cycle_executor(
                runs CI at the wave boundary
              - Phase 5b' (reviewers): disjoint reviewer selection + fix loop
                (max 5 iterations, blocker+major findings drive re-review)
-             - Phase 5c (commit): real git commit via commit_cycle()
+             - Phase 5c (commit): real git commit via commit_cycle_and_sha()
          finally:
              ``tools.team_delete(team_id)``  # ALWAYS — even on abandon or exception
       6. Return the outcome dict matching the contract in the module docstring
@@ -2461,7 +2461,10 @@ def team_cycle_executor(
             # Minutes live in Memex (docs/kaizen/* is banned from git per
             # CLAUDE.md); reference the Memex slug, mirroring the success dict.
             minutes_ref = f"kaizen:cycle:{run_row['id']}-{cycle_n}"
-            commit_cycle(
+            # F13: commit + read back the real SHA through the shared helper
+            # (check=False rev-parse + fail-loud guards live there now, so host
+            # and team modes commit through one code path).
+            commit_sha = commit_cycle_and_sha(
                 clone_dir=clone_dir,
                 cycle_n=cycle_n,
                 decisions=outcome_acc.decisions or ["team-mode cycle"],
@@ -2470,28 +2473,6 @@ def team_cycle_executor(
                 subject=subject or "team-mode",
                 minutes_rel_path=minutes_ref,
             )
-            # F13 (audit cleanup): check=True would raise CalledProcessError
-            # with no captured stdout/stderr in the message, masking the
-            # real problem (clone is corrupt, HEAD missing, etc). Use
-            # check=False and assert explicitly so the error names the
-            # actual exit code and stderr.
-            rev = subprocess.run(
-                ["git", "-C", str(clone_dir), "rev-parse", "HEAD"],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if rev.returncode != 0:
-                raise RuntimeError(
-                    f"git rev-parse HEAD in {clone_dir} exited "
-                    f"{rev.returncode}: {(rev.stderr or rev.stdout or '').strip()}"
-                )
-            commit_sha = rev.stdout.strip()
-            if not commit_sha:
-                raise RuntimeError(
-                    f"git rev-parse HEAD in {clone_dir} returned an empty SHA; "
-                    "the clone may be corrupt or HEAD may be unset."
-                )
     except Exception:
         # kaizen#96 Layer B — cycle-level error backstop (the repo owner's
         # explicit ask: "once a layout is established it must remain

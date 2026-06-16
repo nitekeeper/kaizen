@@ -253,6 +253,51 @@ def test_phase_5b_prime_pm_acceptance_explains_accept_reject_protocol():
     assert "iteration 3" in msg
 
 
+def test_pm_briefing_marks_peer_unconfirmed():
+    """#8 (LOW-1) — the NOT peer-confirmed marker is appended to the unconfirmed
+    finding's line and NOT to a confirmed one, and it sits OUTSIDE the untrusted
+    finding span (after the prose). Mut (not threaded): no marker on any line;
+    mut (wrong finding): marker on the confirmed line instead."""
+    confirmed = _finding(fid="R1-0-1", finding="confirmed blocker prose")
+    unconfirmed = _finding(fid="R1-1-2", finding="lone-reviewer blocker prose")
+    msg = phase_5b_prime_pm_acceptance(
+        findings=[confirmed, unconfirmed],
+        iter_n=4,
+        peer_unconfirmed_ids={"R1-1-2"},
+    )
+    marker = "[NOT peer-confirmed: flagged by one reviewer; no peer cross-confirmed]"
+    # Exactly the unconfirmed line carries the marker.
+    lines = [ln for ln in msg.splitlines() if ln.strip().startswith("-")]
+    unconfirmed_line = next(ln for ln in lines if "R1-1-2" in ln)
+    confirmed_line = next(ln for ln in lines if "R1-0-1" in ln)
+    assert marker in unconfirmed_line
+    assert marker not in confirmed_line
+    # The marker is appended AFTER the finding prose (outside the untrusted span).
+    assert unconfirmed_line.index("lone-reviewer blocker prose") < unconfirmed_line.index(marker)
+    # The neutral PM-ask sentence is present (context, not a recommendation).
+    assert "not cross-confirmed by a peer" in msg
+    assert "context, not a recommendation" in msg
+
+
+def test_pm_briefing_no_marker_when_none_unconfirmed():
+    """#8 companion (non-vacuous BOTH ways) — with no peer_unconfirmed_ids
+    (default — every team-mode + existing host call), NO finding line carries the
+    bracketed marker AND the neutral peer-unconfirmed disclosure sentence is
+    ABSENT, so the render is byte-identical to the pre-LOW-1 template. Mut
+    (always-on marker): the bracketed marker would appear; mut (always-on
+    sentence): the disclosure sentence would appear and churn every PM golden."""
+    marker = "[NOT peer-confirmed: flagged by one reviewer; no peer cross-confirmed]"
+    msg = phase_5b_prime_pm_acceptance(findings=[_finding()], iter_n=1)
+    finding_lines = [ln for ln in msg.splitlines() if ln.strip().startswith("-")]
+    assert finding_lines, "expected at least one rendered finding line"
+    for ln in finding_lines:
+        assert marker not in ln
+    # The neutral disclosure sentence is gated on having at least one unconfirmed
+    # finding — absent here so the default render is byte-identical to before.
+    assert "not cross-confirmed by a peer" not in msg
+    assert "context, not a recommendation" not in msg
+
+
 # ── MAJOR #2 (kaizen#62 cycle 1 reviewer): Layer-B sanitization in pm_acceptance ──
 
 

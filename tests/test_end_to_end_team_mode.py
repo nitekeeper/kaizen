@@ -87,17 +87,24 @@ def _install_orchestrator_stubs(monkeypatch, tmp_path):
 
 
 def _stub_team_executor_helpers(monkeypatch):
-    """Stub the executor's CI runner, commit_cycle, and git rev-parse."""
+    """Stub the executor's CI runner + the Phase-5c commit helper.
+
+    The inline commit + rev-parse dance was folded into the shared
+    ``cycle_git.commit_cycle_and_sha`` helper (M8a-2c); team_executor imports it
+    as ``commit_cycle_and_sha`` and that is the single seam Phase 5c drives, so
+    we stub it to return a canned SHA (it encapsulates both the commit and the
+    rev-parse read-back). The best-effort tmux subprocess calls are still
+    redirected to a fake exit-0 proc so a server-less box never trips them."""
 
     def fake_run_ci_checks(clone_dir, test_command):
         return True, {"tests": {"status": "pass", "output": "ok"}}
 
     monkeypatch.setattr(team_executor_mod, "run_ci_checks", fake_run_ci_checks)
 
-    def fake_commit_cycle(**kwargs):
-        return None
+    def fake_commit_cycle_and_sha(**kwargs):
+        return "deadbeefcafebabe1234567890abcdef12345678"
 
-    monkeypatch.setattr(team_executor_mod, "commit_cycle", fake_commit_cycle)
+    monkeypatch.setattr(team_executor_mod, "commit_cycle_and_sha", fake_commit_cycle_and_sha)
 
     class _FakeProc:
         def __init__(self, stdout="deadbeefcafebabe1234567890abcdef12345678\n"):

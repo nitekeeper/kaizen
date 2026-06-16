@@ -37,6 +37,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import logging
+import re
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -45,9 +46,38 @@ from typing import Any
 # so any closure that uses them inside the engine window references the kaizen
 # object, never an in-window atelier re-import. See the module docstring's
 # closure/re-import hazard note.
+#
+# C3 (M8a-2b): ALL kaizen helpers the review-fix loop reuses are imported HERE,
+# at module top, OUTSIDE any `atelier_engine()` window. NEVER import
+# `scripts.host_scheduler` / `scripts.planner` / `scripts.cli_dispatch` (atelier-
+# only) here — those are reached ONLY inside the window via `importlib`. Every
+# symbol below is kaizen's, captured before the swap so the briefing closures +
+# consolidation + parse run correctly while `scripts` resolves to atelier.
 from scripts.atelier_engine import assert_engine_available, atelier_engine
+from scripts.fix_loop import (
+    _BLOCKING_SEVERITIES,
+    Finding,
+    FixLoopState,
+    build_abandonment_outcome,
+    record_findings,
+    should_continue,
+    start_iteration,
+)
+from scripts.reviewers import InsufficientRosterError, select_reviewers
+
+# REUSE VERBATIM (no edits — per the M8a-2b spec): the byte-sensitive reviewer
+# finding-line parser and the finding->implementer owner router. Both are pure
+# kaizen helpers in team_executor; importing them (rather than re-implementing)
+# keeps host and team modes parsing the IDENTICAL `[severity] file:line — text`
+# grammar and routing fixes to the SAME owner index. team_executor does not
+# import host_executor, so there is no import cycle.
+from scripts.team_executor import _find_owner_for_finding, _parse_reviewer_response
 
 _log = logging.getLogger("kaizen.host_executor")
+
+# Reviewer-selection lens preferences — VERBATIM from team_executor.py:2258 so
+# host and team modes pick the same disjoint reviewers given the same roster.
+_REVIEWER_LENSES = ("security", "architect", "prompt", "safety")
 
 # The constant `phase` value every Phase-4 implement task carries (matches the
 # engine's free-form `phase` field; used by the model policy + briefing).
@@ -124,37 +154,58 @@ def build_engine_tasks(
 # ── Deliverable 2 — pre-bound closures (F7-trailer stripped) ────────────────
 
 
-# Stable anchor phrases for the THREE team-mode comms paragraphs the rendered
-# Phase-4 briefing carries, in document order:
-#   1. the per-template "Reply format" paragraph (OK:/BLOCKED: + SendMessage),
-#   2. the terse-output rule (references the SendMessage / shutdown_response JSON),
+# Stable anchor phrases for the THREE team-mode comms paragraphs a rendered
+# kaizen briefing can carry, in document order:
+#   1. the per-template "Reply format" paragraph (OK:/BLOCKED: + SendMessage) —
+#      present on `phase_4_implementation.md`, ABSENT on the Phase-5 review/mesh
+#      templates;
+#   2. the always-on terse-output rule (`_inject_terse_before_trailer`), which
+#      references the SendMessage / shutdown_response JSON protocol body — present
+#      on EVERY teammate-bound template that routes through the terse injection;
 #   3. the F7 trailer (TEAMMATE_REPLY_RULE — SendMessage(to="team-lead") + shutdown).
 # ALL THREE are team-mode-only and reference comms primitives that do not exist in
 # host mode (no team-lead, no SendMessage, no shutdown handshake), so host mode
-# cuts at the EARLIEST of them. The reply-format anchor is the byte-frozen opening
-# of `phase_4_implementation.md`'s reply-format line.
+# cuts at the EARLIEST of them. The anchors are the byte-frozen openings of those
+# paragraphs.
+#
+# M8a-2b: the terse-rule anchor was ADDED to the candidate set. The Phase-4
+# implementer template carries the "Reply format" paragraph BEFORE the terse rule,
+# so for Phase-4 the cut point is unchanged (reply-format is still earliest). But
+# the Phase-5 review / mesh templates have NO "Reply format" paragraph — their
+# earliest comms anchor IS the terse rule, which references "SendMessage /
+# shutdown_response JSON protocol body". Without the terse anchor a review brief
+# would cut only the F7 trailer and SHIP the terse rule's SendMessage reference to
+# a host worker that has no SendMessage. Generalizing the cut to the earliest of
+# {reply-format, terse-rule, F7 trailer} fixes both phases with one rule.
 _REPLY_FORMAT_ANCHOR = "IMPORTANT — Reply format:"
+# Byte-frozen opening of `dispatch_templates._TERSE_OUTPUT_RULE` (B1 / caveman).
+_TERSE_OUTPUT_ANCHOR = "IMPORTANT — Output shape (terse):"
 
 
 def _strip_f7_trailer(rendered: str, trailer: str) -> str:
-    """Strip ALL team-mode comms paragraphs from a rendered Phase-4 briefing.
+    """Strip ALL team-mode comms paragraphs from a rendered teammate briefing.
 
-    The team-mode rendered body carries three trailing team-only paragraphs —
-    the "Reply format" OK:/BLOCKED: rule, the terse-output rule (both reference
-    ``SendMessage``), and the F7 trailer (``SendMessage(to="team-lead")`` +
-    shutdown JSON). ALL are MEANINGLESS in host mode: the engine worker emits a
-    terminal ``task_result`` envelope, not a SendMessage; there is no team-lead
-    and no shutdown handshake. Leaving ANY of them would instruct a host worker
-    to use a primitive it does not have.
+    The team-mode rendered body carries up to three trailing team-only paragraphs
+    — the "Reply format" OK:/BLOCKED: rule (Phase-4 only), the always-on
+    terse-output rule (references the SendMessage / shutdown_response JSON), and
+    the F7 trailer (``SendMessage(to="team-lead")`` + shutdown JSON). ALL are
+    MEANINGLESS in host mode: the engine worker emits a terminal ``task_result``
+    envelope, not a SendMessage; there is no team-lead and no shutdown handshake.
+    Leaving ANY of them would instruct a host worker to use a primitive it does
+    not have.
 
     We cut at the EARLIEST comms anchor found — the "Reply format" paragraph
-    opener, else the F7 trailer span. The caller re-appends a host-specific
-    terminal-envelope instruction. Returns the surviving body, right-stripped.
+    opener, the terse-output-rule opener, or the F7 trailer span — whichever
+    appears first. The caller re-appends a host-specific terminal-envelope
+    instruction. Returns the surviving body, right-stripped.
     """
     candidates: list[int] = []
     rf_idx = rendered.find(_REPLY_FORMAT_ANCHOR)
     if rf_idx != -1:
         candidates.append(rf_idx)
+    terse_idx = rendered.find(_TERSE_OUTPUT_ANCHOR)
+    if terse_idx != -1:
+        candidates.append(terse_idx)
     t_idx = rendered.rfind(trailer)
     if t_idx != -1:
         candidates.append(t_idx)
@@ -212,24 +263,48 @@ def _make_briefing_for(
     return briefing_for
 
 
-# Kaizen model policy per CLAUDE.md: implementers run opus on high effort.
-# Pure mapping over persona/phase — no `scripts.*` import at call time.
-_IMPLEMENTER_MODEL = "opus"
+# Kaizen per-phase model policy per CLAUDE.md model-rec: implementers,
+# independent reviewers, AND fix-round implementers ALL run opus (high effort) —
+# the reviewer must catch what the implementer missed (a shallow reviewer model
+# defeats the whole F9 review loop), and the fix round re-runs implementer-grade
+# work. All `opus` today; the per-PHASE seam is the point (M8a-2b) — a future tier
+# tweak edits ONE mapping rather than threading a constant. Pure mapping over
+# ``task["phase"]``; no `scripts.*` import at call time.
+#
+# `review` covers BOTH the round-1/round-2 reviewer tasks AND the PM-acceptance
+# task (the PM gate is dispatched as a read-only `phase="review"` task — see
+# `build_pm_task`), so the PM round resolves to opus through the same key.
+_PHASE_MODEL_POLICY: dict[str, str] = {
+    "implementation": "opus",
+    "review": "opus",
+    "fix": "opus",
+}
 
 
 def _make_model_for() -> Callable[[Mapping[str, Any], int], str]:
-    """Build a ``model_for(task, attempt) -> str`` closure.
+    """Build a ``model_for(task, attempt) -> str`` closure (per-phase policy).
 
-    Pure: kaizen's model policy over ``task["assigned_persona"]`` /
-    ``task["phase"]``. CLAUDE.md recommends opus (high effort) for Phase-4
-    implementers; the engine resolves the ``opus`` alias to the current Opus
-    model. No ``scripts.*`` import at call time.
+    Pure: kaizen's per-phase model policy over ``task["phase"]`` via
+    :data:`_PHASE_MODEL_POLICY`. CLAUDE.md recommends opus (high effort) for
+    Phase-4 implementers, independent reviewers, and fix-round implementers
+    alike; the engine resolves the ``opus`` alias to the current Opus model.
+
+    FAIL LOUD on an unknown phase — a task carrying a ``phase`` the policy does
+    not cover is a wiring bug (a new task kind that forgot its model rec), and
+    silently defaulting it to some model would mask that bug and could under-power
+    a safety-critical phase. We raise ``ValueError`` naming the phase so the
+    omission surfaces at dispatch time, not in a degraded run. No ``scripts.*``
+    import at call time (pre-bind safe).
     """
 
     def model_for(task: Mapping[str, Any], attempt: int) -> str:
-        # Phase-4 implementers → opus (the only phase this PR dispatches; any
-        # future phase keeps the implementer floor until a per-phase policy lands).
-        return _IMPLEMENTER_MODEL
+        phase = task["phase"]
+        try:
+            return _PHASE_MODEL_POLICY[phase]
+        except KeyError:
+            raise ValueError(
+                f"no model policy for phase {phase!r}; known phases: {sorted(_PHASE_MODEL_POLICY)}"
+            ) from None
 
     return model_for
 
@@ -245,6 +320,834 @@ def _make_escalate_fn(
         log.warning("host_executor escalation: %r", dict(record))
 
     return escalate_fn
+
+
+# ── M8a-2b — Phase 5b' review-pairing (re-homed Star→Mesh→Star) ─────────────
+#
+# The engine workers are ISOLATED — a host reviewer cannot SendMessage a peer.
+# So the ORCHESTRATOR is the mesh fabric: round 1 (Star-1) collects each
+# reviewer's independent findings; round 2 (Mesh) shows each reviewer the OTHER
+# reviewers' round-1 findings and asks for a CONFIRM / RETRACT / ESCALATE verdict
+# plus any net-new finding; the orchestrator then consolidates the verdicts
+# (Star-2, pure) per the C4 severity-gated weeding rule.
+#
+# Every review/mesh/PM task is dispatched WITHOUT a `reviews` field, so the
+# engine's own `build_review_pairing` derives an EMPTY pairing and NEVER enters
+# its own (BLIND re-dispatch) review-fix loop — kaizen owns the loop and reuses
+# `fix_loop.py` verbatim. See the spec's "VERIFIED ENGINE FINDING".
+
+# The constant `phase` for read-only review / mesh / PM-acceptance tasks (resolves
+# to `opus` via `_PHASE_MODEL_POLICY["review"]`).
+_REVIEW_PHASE = "review"
+# The constant `phase` for fix-round writer tasks (resolves to `opus`).
+_FIX_PHASE = "fix"
+
+# The host-mode terminal-envelope instruction appended to a READ-ONLY review/mesh/
+# PM brief (replaces the F7 SendMessage/shutdown trailer). A read-only worker
+# writes NOTHING — it inspects the merged change set via `git diff` in its cwd
+# (the SHARED base clone — C1) and emits its verdict prose as `notes_md` on a
+# terminal `done` envelope with EMPTY `artifacts` (legal for a read-only task —
+# the engine's false-`done` guard is exempt for non-writers, host_scheduler.py:
+# 1212-1217). The "run `git diff` in cwd" line closes the C1 "reviewer not given
+# the diff" gotcha: the shared clone has every Phase-4 implementer's work merged
+# into HEAD before any reviewer is dispatched (eager merge, host_scheduler.py:
+# 1261-1277), so a `git diff HEAD~..HEAD` / `git show` over the cycle's merge
+# commits IS the diff under review.
+_REVIEW_TERMINAL_RULE = (
+    "You are in the SHARED base clone (your current working directory); every "
+    "Phase-4 implementer's change is ALREADY merged into HEAD. Run `git diff` "
+    "(and `git log`/`git show`) in your cwd to inspect the change set under "
+    "review — do NOT change directories and write NO files. Emit ONLY the "
+    "terminal task_result envelope matching the provided json-schema: status "
+    "'done' with a SINGLE summary artifact (you write no files, so give it a "
+    "synthetic path such as `review-notes.md` — the envelope schema rejects a "
+    "`done` with empty artifacts) and your verdict/finding lines in `notes_md`. "
+    "The envelope is your sole output channel — do not narrate."
+)
+
+# The host-mode terminal-envelope instruction appended to a FIX (writer) brief.
+# A fix worker writes the file in its OWN carved worktree (its cwd) and emits a
+# `done` envelope on success (with one artifact per file written), or `blocked`
+# with a one-line notes_md naming the obstacle (the host analog of the team-mode
+# `ABANDON:` prefix). The engine's false-`done` guard DISCARDS a `done` whose
+# declared write did not change vs HEAD, so a fix that touched nothing is caught.
+_FIX_TERMINAL_RULE = (
+    "Apply the fix to the file on disk in your CURRENT working directory (your "
+    "task's isolated worktree — use bare relative paths, do not change "
+    "directories), then emit ONLY the terminal task_result envelope matching the "
+    "provided json-schema: status 'done' (with one artifact per file you wrote) "
+    "on success, or status 'blocked' with a one-line notes_md naming the obstacle "
+    "if the fix cannot be applied. The envelope is your sole output channel — do "
+    "not narrate. Do nothing else."
+)
+
+
+# ── Task-dict builders (orchestrator-side; NO `reviews` key — engine stays single
+#    dispatch per round) ──────────────────────────────────────────────────────
+
+
+def build_review_tasks(
+    reviewers: Sequence[str],
+    action_items: Sequence[Mapping[str, Any]],
+    impl_tasks: Sequence[Mapping[str, Any]],
+    *,
+    iter_n: int,
+    parallel_group: int = 0,
+) -> list[dict[str, Any]]:
+    """Round-1 (Star-1) BROADCAST review tasks — one per reviewer.
+
+    USER DECISION 1 (parity): every reviewer reviews the FULL written-file set
+    (NOT round-robin) — so each task's ``reads`` is the SORTED UNION of every
+    Phase-4 impl task's ``writes``. The tasks are READ-ONLY (``writes=[]``) so
+    the engine runs them in the shared base clone (C1 — no worktree carved for a
+    non-writer) and EXEMPTS them from the false-`done` guard.
+
+    ``depends_on`` is EMPTY. In the single-window design the orchestrator
+    dispatches the Phase-4 impl wave and THIS review round as SEPARATE
+    ``run_host_pipeline_for_project`` calls, so by the time the review round is
+    dispatched the impl tasks have already run-and-merged into the shared clone —
+    they are NOT in the review dispatch's task list. Declaring ``depends_on`` on
+    them would trip the engine's ``OrphanDepsError`` (a dep referencing a task
+    absent from the CURRENT dispatch). The impl→review ordering is enforced by the
+    SEQUENTIAL dispatch, not by an in-dispatch edge. ``impl_tasks`` is still read
+    for the broadcast ``reads`` union. No ``reviews`` key is set: that keeps the
+    engine's derived ``review_pairing`` EMPTY (kaizen owns the loop). ``task_id``
+    is ``R{iter_n}-{reviewer_idx}`` — globally unique per reviewer per iteration
+    (the finding-id re-stamp in :func:`_collect_review_findings` makes the
+    per-FINDING ids unique too).
+    """
+    union_reads = sorted({w for t in impl_tasks for w in (t.get("writes") or [])})
+    tasks: list[dict[str, Any]] = []
+    for idx, reviewer in enumerate(reviewers):
+        tasks.append(
+            {
+                "task_id": f"R{iter_n}-{idx}",
+                "parallel_group": parallel_group,
+                "depends_on": [],
+                "writes": [],
+                "reads": list(union_reads),
+                "assigned_persona": reviewer,
+                "phase": _REVIEW_PHASE,
+                # NO "reviews" key — see the module-level decision note.
+            }
+        )
+    return tasks
+
+
+def build_mesh_tasks(
+    reviewers: Sequence[str],
+    action_items: Sequence[Mapping[str, Any]],
+    r1_findings_by_reviewer: Mapping[str, Sequence[Finding]],
+    *,
+    iter_n: int,
+    parallel_group: int = 0,
+) -> list[dict[str, Any]]:
+    """Round-2 (Mesh) cross-confirmation tasks — one per reviewer.
+
+    Same READ-ONLY shape as :func:`build_review_tasks`, but ``task_id`` is
+    ``M{iter_n}-{reviewer_idx}``. The PEER findings each reviewer cross-checks
+    ride via the BRIEFING CLOSURE (``_make_mesh_briefing_for``), NOT in the task
+    dict — the dict carries only routing/identity fields the engine consumes. The
+    closure looks up ``M{iter_n}-{idx}`` → that reviewer's peer-finding set.
+
+    ``r1_findings_by_reviewer`` is informational here (the closure owns the peer
+    map); it is accepted so the builder signature documents the round-2 input and
+    a future builder could derive ``reads`` from the findings' files. ``reads`` is
+    kept as the full union (parity with round 1 — the reviewer re-inspects the
+    same merged change set). No ``reviews`` key.
+    """
+    # `reads` parity with round 1: the reviewer re-inspects the same merged set.
+    union_reads = sorted(
+        {
+            f.file_line.split(":", 1)[0]
+            for findings in r1_findings_by_reviewer.values()
+            for f in findings
+        }
+    )
+    tasks: list[dict[str, Any]] = []
+    for idx, reviewer in enumerate(reviewers):
+        tasks.append(
+            {
+                "task_id": f"M{iter_n}-{idx}",
+                "parallel_group": parallel_group,
+                "depends_on": [],
+                "writes": [],
+                "reads": list(union_reads),
+                "assigned_persona": reviewer,
+                "phase": _REVIEW_PHASE,
+            }
+        )
+    return tasks
+
+
+def build_fix_tasks(
+    coalesced_by_file: Mapping[str, Sequence[Finding]],
+    file_to_owner: Mapping[str, str],
+    pm: str,
+    *,
+    iter_n: int,
+    parallel_group: int = 0,
+) -> list[dict[str, Any]]:
+    """Fix-round WRITER tasks — ONE per file (same-file findings coalesced).
+
+    Per SKILL Phase 5b' the IMPLEMENTER (the file's Phase-4 owner), NOT the
+    reviewer who flagged it, fixes a finding. The owner is resolved via the
+    reused :func:`scripts.team_executor._find_owner_for_finding` over the file's
+    representative finding (any same-file finding routes to the same owner — they
+    share a file → share an owner). ``writes=[file]`` makes the task a WRITER, so
+    the engine carves it an isolated worktree and the false-`done` guard applies.
+    ``depends_on=[]`` (the fixes for one round are write-disjoint by file).
+    ``task_id`` is ``FIX{iter_n}-{file_idx}``. No ``reviews`` key.
+
+    Files are iterated in SORTED order so the ``file_idx`` (and thus the task_id)
+    is deterministic regardless of the input mapping's iteration order.
+    """
+    tasks: list[dict[str, Any]] = []
+    for file_idx, file in enumerate(sorted(coalesced_by_file)):
+        findings = list(coalesced_by_file[file])
+        rep = findings[0]
+        owner = _find_owner_for_finding(rep, dict(file_to_owner), pm)
+        tasks.append(
+            {
+                "task_id": f"FIX{iter_n}-{file_idx}",
+                "parallel_group": parallel_group,
+                "depends_on": [],
+                "writes": [file],
+                "reads": [],
+                "assigned_persona": owner,
+                "phase": _FIX_PHASE,
+            }
+        )
+    return tasks
+
+
+def build_pm_task(
+    blockers: Sequence[Finding],
+    pm: str,
+    *,
+    iter_n: int,
+    parallel_group: int = 0,
+) -> dict[str, Any]:
+    """The PM-acceptance gate as a READ-ONLY (``writes=[]``) dispatched task.
+
+    The PM decides whether the round's surviving blocker/major findings are
+    acceptable out-of-scope for THIS cycle (a legitimate fix-loop exit per SKILL)
+    or whether to keep iterating. Read-only (false-`done`-exempt — the PM writes
+    nothing). ``phase="review"`` resolves to opus through the same model key as the
+    reviewers. ``task_id`` is ``PM{iter_n}``. No ``reviews`` key.
+    """
+    return {
+        "task_id": f"PM{iter_n}",
+        "parallel_group": parallel_group,
+        "depends_on": [],
+        "writes": [],
+        "reads": [],
+        "assigned_persona": pm,
+        "phase": _REVIEW_PHASE,
+    }
+
+
+# ── Briefing-closure factories (pre-bound BEFORE the engine window) ──────────
+
+
+def _make_review_briefing_for(
+    items_by_id: Mapping[str, Mapping[str, Any]],
+    action_items: Sequence[Mapping[str, Any]],
+    phase_5b_prime_reviewer: Callable[..., str],
+    prior_findings: Sequence[Finding] | None,
+    teammate_reply_rule: str,
+) -> Callable[[Mapping[str, Any], int], str]:
+    """Build a round-1 reviewer ``briefing_for(task, attempt) -> str`` closure.
+
+    ALL kaizen references are PRE-BOUND arguments captured BEFORE the engine
+    window: the kaizen template fn, the (immutable) Action-Items list, the
+    carry-forward prior-findings list, and the F7 trailer to strip. The closure
+    does NO ``scripts.*`` import at call time. ``attempt`` is ignored for content
+    (the prompt is iteration-stamped, not attempt-stamped). The F7/terse/reply-
+    format trailer is cut via :func:`_strip_f7_trailer` and replaced by the host
+    read-only terminal rule (which includes the C1 `git diff` instruction).
+
+    The prior-findings carry-forward is the SAME ``prior_findings`` the team-mode
+    loop passes (iteration 2+ reviewers do incremental review). It is fixed for
+    THIS iteration's closure — the next iteration builds a fresh closure with that
+    iteration's survivors.
+    """
+    trailer = teammate_reply_rule.strip()
+    items = [dict(i) for i in action_items]
+    prior = list(prior_findings) if prior_findings else None
+
+    def briefing_for(task: Mapping[str, Any], attempt: int) -> str:
+        iter_n = int(str(task["task_id"]).split("-", 1)[0][1:])  # "R{iter}-{idx}"
+        rendered = phase_5b_prime_reviewer(
+            iter_n=iter_n,
+            action_items=items,
+            prior_findings=prior,
+        )
+        body = _strip_f7_trailer(rendered, trailer)
+        return f"{body}\n\n{_REVIEW_TERMINAL_RULE}"
+
+    return briefing_for
+
+
+def _make_mesh_briefing_for(
+    items_by_id: Mapping[str, Mapping[str, Any]],
+    action_items: Sequence[Mapping[str, Any]],
+    peer_findings_by_task_id: Mapping[str, Sequence[Finding]],
+    phase_5b_prime_reviewer_mesh: Callable[..., str],
+    teammate_reply_rule: str,
+) -> Callable[[Mapping[str, Any], int], str]:
+    """Build a round-2 MESH ``briefing_for(task, attempt) -> str`` closure.
+
+    ``peer_findings_by_task_id`` maps each mesh task_id (``M{iter}-{idx}``) to the
+    PEER findings that reviewer must cross-check — i.e. the round-1 set MINUS that
+    reviewer's OWN findings (the caller computes the exclusion). The closure looks
+    the addressed task up and renders the mesh template with exactly that peer set,
+    so reviewer A never sees A's own findings (no self-leak) and DOES see B's/C's
+    (the cross-confirmation point). All refs pre-bound; no ``scripts.*`` at call
+    time.
+    """
+    trailer = teammate_reply_rule.strip()
+    items = [dict(i) for i in action_items]
+    # Snapshot the peer map by value (lists) so a later mutation of the source
+    # cannot retro-change a built closure's peer set.
+    peer_map = {tid: list(findings) for tid, findings in peer_findings_by_task_id.items()}
+
+    def briefing_for(task: Mapping[str, Any], attempt: int) -> str:
+        tid = str(task["task_id"])
+        iter_n = int(tid.split("-", 1)[0][1:])  # "M{iter}-{idx}"
+        peer_findings = peer_map.get(tid, [])
+        rendered = phase_5b_prime_reviewer_mesh(
+            iter_n=iter_n,
+            action_items=items,
+            peer_findings=peer_findings,
+        )
+        body = _strip_f7_trailer(rendered, trailer)
+        return f"{body}\n\n{_REVIEW_TERMINAL_RULE}"
+
+    return briefing_for
+
+
+def _make_pm_briefing_for(
+    blockers_by_task_id: Mapping[str, Sequence[Finding]],
+    phase_5b_prime_pm_acceptance: Callable[..., str],
+    teammate_reply_rule: str,
+) -> Callable[[Mapping[str, Any], int], str]:
+    """Build a PM-acceptance ``briefing_for(task, attempt) -> str`` closure.
+
+    ``blockers_by_task_id`` maps each PM task_id (``PM{iter}``) to that round's
+    surviving blocker/major findings. The closure renders the UNCHANGED PM template
+    over them, strips F7, and appends the host read-only terminal rule. All refs
+    pre-bound; no ``scripts.*`` at call time.
+    """
+    trailer = teammate_reply_rule.strip()
+    blockers_map = {tid: list(fs) for tid, fs in blockers_by_task_id.items()}
+
+    def briefing_for(task: Mapping[str, Any], attempt: int) -> str:
+        tid = str(task["task_id"])
+        iter_n = int(tid[2:])  # "PM{iter}"
+        blockers = blockers_map.get(tid, [])
+        rendered = phase_5b_prime_pm_acceptance(findings=blockers, iter_n=iter_n)
+        body = _strip_f7_trailer(rendered, trailer)
+        return f"{body}\n\n{_REVIEW_TERMINAL_RULE}"
+
+    return briefing_for
+
+
+def _make_fix_briefing_for(
+    finding_by_task_id: Mapping[str, Finding],
+    phase_5b_prime_fix: Callable[..., str],
+    teammate_reply_rule: str,
+) -> Callable[[Mapping[str, Any], int], str]:
+    """Build a FIX ``briefing_for(task, attempt) -> str`` closure.
+
+    ``finding_by_task_id`` maps each fix task_id (``FIX{iter}-{file_idx}``) to the
+    REPRESENTATIVE finding for that file. The closure renders the UNCHANGED fix
+    template over it, strips F7, and appends the host WRITER terminal rule (write
+    in cwd → emit `done`/`blocked` envelope). All refs pre-bound; no ``scripts.*``
+    at call time.
+    """
+    trailer = teammate_reply_rule.strip()
+    finding_map = dict(finding_by_task_id)
+
+    def briefing_for(task: Mapping[str, Any], attempt: int) -> str:
+        tid = str(task["task_id"])
+        finding = finding_map[tid]
+        rendered = phase_5b_prime_fix(finding=finding)
+        body = _strip_f7_trailer(rendered, trailer)
+        return f"{body}\n\n{_FIX_TERMINAL_RULE}"
+
+    return briefing_for
+
+
+# ── Round-1 collection + mesh parse + consolidation (pure, orchestrator-side) ─
+
+
+def _collect_review_findings(
+    reviewers: Sequence[str],
+    results: Sequence[Mapping[str, Any]] | Sequence[Any],
+    *,
+    iter_n: int,
+    is_failed_attempt: Callable[[Any], bool],
+) -> list[Finding]:
+    """Parse round-1 reviewer envelopes into globally-unique :class:`Finding`s.
+
+    STRICT zip(reviewers, results) — the round-1 pipeline dispatched exactly one
+    task per reviewer in ``R{iter_n}-{idx}`` order (all ``parallel_group=0``), and
+    the engine returns results in ``(parallel_group, task_id)`` order, which for
+    single-digit ``idx`` IS reviewer order.
+
+    SAFETY (P2/F9 — must NOT collapse): a reviewer whose envelope is a failed-
+    attempt sentinel OR carries a non-``done`` status is a SILENT reviewer — the
+    caller HARD-abandons (review/`review_unrecoverable`). Soft-skipping it would
+    ship an unreviewed change. This function signals that by raising
+    :class:`_ReviewHardAbandon`; the loop converts it to the abandonment dict.
+
+    Findings are parsed from ``result["notes_md"]`` (TOP-LEVEL on the validated
+    envelope — R2) via the reused byte-sensitive
+    :func:`scripts.team_executor._parse_reviewer_response`, then the per-reviewer
+    ``finding_id`` is RE-STAMPED to ``R{iter_n}-{reviewer_idx}-{k}`` so two
+    reviewers' first findings get DISTINCT ids (the parser alone would mint
+    ``R{iter_n}-1`` for BOTH — a collision that would drop one in the attribution
+    map). ``Finding`` is frozen, so the re-stamp reconstructs via ``Finding(...)``
+    (its ``__post_init__`` severity validation stays fail-loud).
+    """
+    out: list[Finding] = []
+    for idx, (reviewer, result) in enumerate(zip(reviewers, results, strict=True)):
+        if is_failed_attempt(result):
+            raise _ReviewHardAbandon(
+                f"round-{iter_n} reviewer {reviewer!r} (R{iter_n}-{idx}) "
+                f"returned a failed-attempt sentinel"
+            )
+        status = result.get("status") if isinstance(result, Mapping) else None
+        if status != "done":
+            raise _ReviewHardAbandon(
+                f"round-{iter_n} reviewer {reviewer!r} (R{iter_n}-{idx}) "
+                f"returned status={status!r} (expected 'done')"
+            )
+        notes = result.get("notes_md") if isinstance(result, Mapping) else None
+        parsed = _parse_reviewer_response(notes or "", reviewer, prefix=f"R{iter_n}")
+        for k, f in enumerate(parsed, start=1):
+            out.append(
+                Finding(
+                    finding_id=f"R{iter_n}-{idx}-{k}",
+                    reviewer=f.reviewer,
+                    severity=f.severity,
+                    finding=f.finding,
+                    file_line=f.file_line,
+                )
+            )
+    return out
+
+
+# A recognized mesh verdict line: `CONFIRM <id>` | `RETRACT <id>` |
+# `ESCALATE <id> <severity>` (one per line). The id token is the finding id
+# (`R{iter}-{idx}-{k}`); the severity token (ESCALATE only) is one of the four.
+_MESH_VERDICT_RE = re.compile(
+    r"^\s*(?P<verb>CONFIRM|RETRACT|ESCALATE)\s+(?P<id>\S+)"
+    r"(?:\s+(?P<sev>blocker|major|minor|nit))?\s*$"
+)
+
+
+def _parse_mesh_response(
+    resp: str,
+    reviewer: str,
+    prefix: str,
+) -> tuple[dict[str, Any], list[Finding]]:
+    """Parse ONE reviewer's round-2 mesh reply.
+
+    Returns ``(verdicts, net_new_findings)`` where ``verdicts`` maps
+    ``finding_id -> "CONFIRM" | "RETRACT" | ("ESCALATE", severity)`` and
+    ``net_new_findings`` are findings the reviewer raised that no peer had (parsed
+    via the reused :func:`_parse_reviewer_response` over the raw reply, prefixed
+    ``{prefix}-mesh-...`` by the caller's re-stamp).
+
+    An UNRECOGNIZED verdict line is IGNORED (treated as a non-confirm — silence is
+    not confirmation). BUT a reply that parses to ZERO recognized verdict lines AND
+    zero finding lines is MALFORMED — the caller HARD-abandons it (C4 strict
+    posture: a malformed/zero-verdict mesh reply is treated like a silent reviewer,
+    never as a silent no-confirm that could let an unreviewed change ship).
+
+    An ``ESCALATE <id>`` with a MISSING/invalid severity token does NOT match
+    ``_MESH_VERDICT_RE`` (the severity group is required for an escalate to be
+    recognized) → that line is ignored (non-confirm), not a silent demote.
+    """
+    verdicts: dict[str, Any] = {}
+    n_verdict_lines = 0
+    for line in (resp or "").splitlines():
+        m = _MESH_VERDICT_RE.match(line)
+        if m is None:
+            continue
+        verb = m.group("verb")
+        fid = m.group("id")
+        if verb == "ESCALATE":
+            sev = m.group("sev")
+            if sev is None:
+                # An ESCALATE without a severity token is not actionable —
+                # ignore it (do not silently demote / pick a default).
+                continue
+            verdicts[fid] = ("ESCALATE", sev)
+        else:
+            verdicts[fid] = verb
+        n_verdict_lines += 1
+    # Net-new findings: the reviewer may add issues no peer raised. The raw reply
+    # is parsed for finding lines (the verdict lines do not match the finding
+    # grammar, so they are not double-counted as findings).
+    net_new = _parse_reviewer_response(resp or "", reviewer, prefix=prefix)
+    # MALFORMED / zero-signal reply → caller HARD-abandons. We return a sentinel
+    # (empty verdicts AND empty net_new) and let the caller decide, so this stays a
+    # pure parser; but we record whether ANY recognized line was seen via the
+    # combined emptiness check the caller performs.
+    return verdicts, net_new
+
+
+def _consolidate_mesh(
+    r1_findings: Sequence[Finding],
+    mesh_verdicts_by_reviewer: Mapping[str, Mapping[str, Any]],
+    mesh_net_new: Sequence[Finding],
+    *,
+    n_reviewers: int,
+) -> tuple[list[Finding], dict[str, bool]]:
+    """Star-2 consolidation (PURE) — apply the C4 severity-gated weeding rule.
+
+    For each round-1 finding ``f`` (keyed by its globally-unique ``finding_id``):
+
+    * **self-retract** — if ANY reviewer issued ``RETRACT <f.id>`` → DROP (any
+      severity). (Conservatively any reviewer's retract drops it; the author is
+      the common case but the id is globally unique so only the author's own
+      finding carries that id.)
+    * **escalate** — the MAX asserted ``ESCALATE <f.id> <sev>`` across peers RAISES
+      ``f.severity`` (never demotes — a lower escalate target is ignored).
+      Reconstructed via ``Finding(...)`` so ``__post_init__`` stays fail-loud.
+    * **peer-confirm weed (SEVERITY-GATED — F9 integrity, C4):**
+        - ``blocker`` / ``major``: RETAINED even with ZERO peer confirms; if
+          unconfirmed it is flagged ``peer_unconfirmed=True`` in the RETURNED
+          side-map. NEVER silently dropped — it stays in ``survivors`` so it
+          counts as a blocker, drives a fix, and hits the PM gate regardless of
+          the flag. (Surfacing the flag in the PM briefing / convergence summary
+          is deferred to M8a-2c; the current loop consumes ``survivors`` and does
+          not yet read the side-map.)
+        - ``minor`` / ``nit``: DROPPED unless confirmed by >=1 peer.
+
+    ``n_reviewers == 1`` is the VACUOUS-QUORUM case (spec §2.3 step 4): there are
+    no peers, the mesh round is SKIPPED, so there are no verdicts at all. With one
+    reviewer NOTHING is weeded — EVERY round-1 finding survives at its original
+    severity (the minor/nit peer-confirm gate is a multi-reviewer rule; applying it
+    to a sole reviewer would silently empty the set even though that reviewer DID
+    flag the issue). This function takes the ``n_reviewers == 1`` branch explicitly
+    rather than relying on the confirm-count incidentally being 0.
+
+    Net-new round-2 findings are admitted at face value and ride forward.
+
+    Returns ``(survivors, peer_unconfirmed_map)``. ``Finding`` is frozen so the
+    side-map (not a mutated field) carries the ``peer_unconfirmed`` flag.
+    """
+    if n_reviewers == 1:
+        # Vacuous quorum — no peers, mesh skipped. Keep every round-1 finding
+        # verbatim (no self-retract verdicts exist either; mesh did not run).
+        # Net-new is empty in this path (no mesh round produced any), but we
+        # extend defensively for shape parity.
+        return list(r1_findings) + list(mesh_net_new), {}
+    # Flatten verdicts across reviewers. self-retract = any RETRACT for the id;
+    # escalate target = max severity asserted; confirm count = number of CONFIRM
+    # verdicts (escalate also counts as a confirm — a peer asserting a HIGHER
+    # severity has plainly confirmed the finding is real).
+    retracted: set[str] = set()
+    escalate_to: dict[str, str] = {}
+    confirm_count: dict[str, int] = {}
+    for _reviewer, verdicts in mesh_verdicts_by_reviewer.items():
+        for fid, verdict in verdicts.items():
+            if verdict == "RETRACT":
+                retracted.add(fid)
+            elif verdict == "CONFIRM":
+                confirm_count[fid] = confirm_count.get(fid, 0) + 1
+            elif isinstance(verdict, tuple) and verdict and verdict[0] == "ESCALATE":
+                sev = verdict[1]
+                confirm_count[fid] = confirm_count.get(fid, 0) + 1
+                cur = escalate_to.get(fid)
+                if cur is None or _severity_rank(sev) > _severity_rank(cur):
+                    escalate_to[fid] = sev
+
+    survivors: list[Finding] = []
+    peer_unconfirmed: dict[str, bool] = {}
+    for f in r1_findings:
+        fid = f.finding_id
+        if fid in retracted:
+            continue  # self-retract drops any severity.
+        # Apply escalation (raise only — _consolidate never demotes).
+        eff_severity = f.severity
+        target = escalate_to.get(fid)
+        if target is not None and _severity_rank(target) > _severity_rank(f.severity):
+            eff_severity = target
+        confirms = confirm_count.get(fid, 0)
+        if eff_severity in _BLOCKING_SEVERITIES:
+            # blocker/major: ALWAYS retained; flag if no peer confirmed it.
+            survivor = (
+                f if eff_severity == f.severity else _reconstruct_with_severity(f, eff_severity)
+            )
+            survivors.append(survivor)
+            if confirms == 0:
+                peer_unconfirmed[fid] = True
+        else:
+            # minor/nit: weeded unless a peer confirmed it.
+            if confirms >= 1:
+                survivor = (
+                    f if eff_severity == f.severity else _reconstruct_with_severity(f, eff_severity)
+                )
+                survivors.append(survivor)
+    # Net-new findings ride forward at face value.
+    survivors.extend(mesh_net_new)
+    return survivors, peer_unconfirmed
+
+
+# Severity ordering for the escalate "raise only" rule (higher index = higher).
+_SEVERITY_ORDER: tuple[str, ...] = ("nit", "minor", "major", "blocker")
+
+
+def _severity_rank(severity: str) -> int:
+    """Ordinal rank of a severity (higher = more severe). FAIL LOUD on unknown —
+    an unrecognized severity would otherwise sort as -1 and silently never
+    escalate (or always demote)."""
+    try:
+        return _SEVERITY_ORDER.index(severity)
+    except ValueError:
+        raise ValueError(f"unknown severity {severity!r}; known: {list(_SEVERITY_ORDER)}") from None
+
+
+def _reconstruct_with_severity(f: Finding, severity: str) -> Finding:
+    """Rebuild ``f`` with a new ``severity`` (``Finding`` is frozen). Goes through
+    ``Finding(...)`` so ``__post_init__`` validates the new severity fail-loud."""
+    return Finding(
+        finding_id=f.finding_id,
+        reviewer=f.reviewer,
+        severity=severity,
+        finding=f.finding,
+        file_line=f.file_line,
+    )
+
+
+class _ReviewHardAbandon(RuntimeError):
+    """Internal control-flow signal: a review/mesh round hit a HARD-abandon
+    condition (a silent/failed reviewer, or a malformed/zero-verdict mesh reply).
+    The loop catches it and builds the canonical ``review_unrecoverable``
+    abandonment dict. NEVER leaks out of :func:`_run_review_fix_loop`."""
+
+
+def _coalesce_blockers_by_file(blockers: Sequence[Finding]) -> dict[str, list[Finding]]:
+    """Group blocker/major findings by their file (the ``file_line`` path part).
+
+    Per SKILL the fix round dispatches ONE writer per file (not one per finding) —
+    several findings on the same file are coalesced so they are fixed in a single
+    write-isolated worktree. The representative finding (first in input order)
+    routes the owner; the rest are listed in the fix briefing's prose.
+    """
+    by_file: dict[str, list[Finding]] = {}
+    for f in blockers:
+        raw = f.file_line or ""
+        file = raw.split(":", 1)[0] if ":" in raw else raw
+        by_file.setdefault(file, []).append(f)
+    return by_file
+
+
+def _run_review_fix_loop(
+    *,
+    reviewers: Sequence[str],
+    action_items: Sequence[Mapping[str, Any]],
+    impl_tasks: Sequence[Mapping[str, Any]],
+    file_to_owner: Mapping[str, str],
+    pm: str,
+    subject: str | None,
+    participants: Sequence[str],
+    dispatch_round: Callable[..., list[Any]],
+    review_briefing_factory: Callable[
+        [Sequence[Finding] | None], Callable[[Mapping[str, Any], int], str]
+    ],
+    mesh_briefing_factory: Callable[
+        [Mapping[str, Sequence[Finding]]], Callable[[Mapping[str, Any], int], str]
+    ],
+    pm_briefing_factory: Callable[
+        [Mapping[str, Sequence[Finding]]], Callable[[Mapping[str, Any], int], str]
+    ],
+    fix_briefing_factory: Callable[
+        [Mapping[str, Finding]], Callable[[Mapping[str, Any], int], str]
+    ],
+    is_failed_attempt: Callable[[Any], bool],
+) -> dict[str, Any] | None:
+    """Orchestrator-owned Phase 5b' review→fix loop (re-homed Star→Mesh→Star).
+
+    ``FixLoopState`` is the single source of truth for the iteration counter +
+    history. Returns a ``review_unrecoverable`` abandonment dict (to be folded into
+    the cycle outcome) OR ``None`` on a clean exit (zero blockers / PM-accept).
+
+    Each round's engine dispatch goes through ``dispatch_round(tasks, briefing_for)``
+    — a closure supplied by :func:`host_cycle_executor` that runs ONE
+    ``run_host_pipeline_for_project`` call INSIDE the already-open
+    ``atelier_engine`` window (single-window design, R4/R5). The CONSOLIDATION,
+    PARSE, and CONSENSUS run OUT of the engine call (pure Python over the returned
+    results), exactly as the spec's §2.2 requires.
+
+    The ``*_briefing_factory`` callables build the per-round briefing closure given
+    that round's data (prior findings / peer-finding map / blocker map / fix-finding
+    map). Each factory was itself pre-bound to the module-level template fns BEFORE
+    the window (no ``scripts.*`` import at call time).
+    """
+    state = FixLoopState()
+    n_reviewers = len(reviewers)
+    try:
+        while True:
+            iter_n = start_iteration(state)
+            prior = state.history[-1] if state.history else None
+
+            # ── ROUND 1 (Star-1, broadcast) ──────────────────────────────────
+            r1_tasks = build_review_tasks(reviewers, action_items, impl_tasks, iter_n=iter_n)
+            r1_briefing = review_briefing_factory(prior)
+            r1_results = dispatch_round(r1_tasks, r1_briefing)
+            r1_findings = _collect_review_findings(
+                reviewers, r1_results, iter_n=iter_n, is_failed_attempt=is_failed_attempt
+            )
+
+            # ── Skip-mesh fast paths ─────────────────────────────────────────
+            if not r1_findings:
+                # Zero round-1 findings → no mesh dispatch, clean exit.
+                survivors: list[Finding] = []
+                record_findings(state, survivors)
+            elif n_reviewers == 1:
+                # Single reviewer → mesh is vacuous; consolidate with no peers.
+                survivors, _peer_unconfirmed = _consolidate_mesh(r1_findings, {}, [], n_reviewers=1)
+                record_findings(state, survivors)
+            else:
+                # ── ROUND 2 (Mesh) ───────────────────────────────────────────
+                # Each reviewer cross-checks its PEERS' findings (own findings
+                # excluded). A reviewer whose peers found NOTHING has nothing to
+                # cross-check, so it is NOT dispatched a mesh task — an empty peer
+                # set would be rejected by the mesh template AND would spuriously
+                # trip the zero-signal HARD-abandon below. When all round-1
+                # findings come from ONE reviewer, only the OTHER reviewer(s) are
+                # polled — exactly the cross-confirmation we want.
+                findings_by_reviewer_idx: dict[int, list[Finding]] = {}
+                for f in r1_findings:
+                    # finding_id is "R{iter}-{reviewer_idx}-{k}".
+                    rev_idx = int(f.finding_id.split("-")[1])
+                    findings_by_reviewer_idx.setdefault(rev_idx, []).append(f)
+
+                peer_findings_by_task_id: dict[str, list[Finding]] = {}
+                dispatch_idxs: list[int] = []
+                for idx in range(n_reviewers):
+                    peers = [
+                        f
+                        for other_idx, fs in findings_by_reviewer_idx.items()
+                        if other_idx != idx
+                        for f in fs
+                    ]
+                    if not peers:
+                        continue  # nothing for this reviewer to cross-check
+                    peer_findings_by_task_id[f"M{iter_n}-{idx}"] = peers
+                    dispatch_idxs.append(idx)
+
+                # build_mesh_tasks emits one task per reviewer (task_id
+                # M{iter}-{idx}); dispatch ONLY the subset that has peers to review.
+                all_mesh_tasks = build_mesh_tasks(
+                    reviewers,
+                    action_items,
+                    {reviewers[i]: findings_by_reviewer_idx.get(i, []) for i in range(n_reviewers)},
+                    iter_n=iter_n,
+                )
+                mesh_tasks = [all_mesh_tasks[idx] for idx in dispatch_idxs]
+                mesh_briefing = mesh_briefing_factory(peer_findings_by_task_id)
+                mesh_results = dispatch_round(mesh_tasks, mesh_briefing)
+
+                # STRICT zip over the DISPATCHED subset; HARD-abandon on any
+                # failed/non-`done` envelope, and on a polled reviewer whose reply
+                # parses to ZERO recognized lines (it has >=1 peer finding to
+                # CONFIRM/RETRACT, so a zero-signal reply is malformed).
+                mesh_verdicts_by_reviewer: dict[str, dict[str, Any]] = {}
+                mesh_net_new: list[Finding] = []
+                for idx, result in zip(dispatch_idxs, mesh_results, strict=True):
+                    reviewer = reviewers[idx]
+                    if is_failed_attempt(result):
+                        raise _ReviewHardAbandon(
+                            f"round-{iter_n} mesh reviewer {reviewer!r} (M{iter_n}-{idx}) "
+                            f"returned a failed-attempt sentinel"
+                        )
+                    status = result.get("status") if isinstance(result, Mapping) else None
+                    if status != "done":
+                        raise _ReviewHardAbandon(
+                            f"round-{iter_n} mesh reviewer {reviewer!r} (M{iter_n}-{idx}) "
+                            f"returned status={status!r} (expected 'done')"
+                        )
+                    notes = result.get("notes_md") if isinstance(result, Mapping) else None
+                    verdicts, net_new = _parse_mesh_response(
+                        notes or "", reviewer, prefix=f"R{iter_n}-mesh-{idx}"
+                    )
+                    if not verdicts and not net_new:
+                        # Malformed / zero-signal reply → HARD abandon (C4).
+                        raise _ReviewHardAbandon(
+                            f"round-{iter_n} mesh reviewer {reviewer!r} (M{iter_n}-{idx}) "
+                            f"reply parsed to ZERO recognized verdict/finding lines"
+                        )
+                    mesh_verdicts_by_reviewer[reviewer] = verdicts
+                    mesh_net_new.extend(net_new)
+
+                survivors, _peer_unconfirmed = _consolidate_mesh(
+                    r1_findings,
+                    mesh_verdicts_by_reviewer,
+                    mesh_net_new,
+                    n_reviewers=n_reviewers,
+                )
+                record_findings(state, survivors)
+
+            # ── Convergence check ────────────────────────────────────────────
+            latest_blockers = [f for f in survivors if f.severity in _BLOCKING_SEVERITIES]
+            if not latest_blockers:
+                return None  # clean exit (zero blocking findings).
+
+            # ── PM-acceptance (read-only dispatched task) ────────────────────
+            pm_task = build_pm_task(latest_blockers, pm, iter_n=iter_n)
+            pm_briefing = pm_briefing_factory({pm_task["task_id"]: latest_blockers})
+            pm_results = dispatch_round([pm_task], pm_briefing)
+            pm_result = pm_results[0]
+            pm_resp = pm_result.get("notes_md") if isinstance(pm_result, Mapping) else None
+            # Verbatim team_executor.py:2381 — a literal ACCEPT prefix (after
+            # strip + upper) is the ONLY clean-accept signal; everything else
+            # (incl. an "ABANDON:" prefix) is a REJECT.
+            pm_accepts = (pm_resp or "").strip().upper().startswith("ACCEPT")
+
+            if not should_continue(state, pm_accepts_remaining=pm_accepts):
+                if pm_accepts:
+                    return None  # clean exit — PM ruled remaining issues acceptable.
+                # MAX_ITERATIONS reached with blockers still present.
+                return build_abandonment_outcome(
+                    state, subject=subject, participants=list(participants)
+                )
+
+            # ── FIX round (writers, one per coalesced file) ──────────────────
+            coalesced = _coalesce_blockers_by_file(latest_blockers)
+            fix_tasks = build_fix_tasks(coalesced, file_to_owner, pm, iter_n=iter_n)
+            # Map each fix task_id → its representative finding for the briefing.
+            finding_by_task_id: dict[str, Finding] = {}
+            for file_idx, file in enumerate(sorted(coalesced)):
+                finding_by_task_id[f"FIX{iter_n}-{file_idx}"] = coalesced[file][0]
+            fix_briefing = fix_briefing_factory(finding_by_task_id)
+            fix_results = dispatch_round(fix_tasks, fix_briefing)
+            # Any fix envelope failed / blocked → abandonment.
+            for _fix_task, fix_result in zip(fix_tasks, fix_results, strict=True):
+                if is_failed_attempt(fix_result):
+                    return build_abandonment_outcome(
+                        state, subject=subject, participants=list(participants)
+                    )
+                status = fix_result.get("status") if isinstance(fix_result, Mapping) else None
+                if status != "done":
+                    return build_abandonment_outcome(
+                        state, subject=subject, participants=list(participants)
+                    )
+            # Loop back to round 1 for re-review of the fixes.
+    except _ReviewHardAbandon as exc:
+        # A silent/failed reviewer or a malformed/zero-verdict mesh reply →
+        # canonical review_unrecoverable abandonment. Ensure `state.history` has
+        # at least one entry so build_abandonment_outcome renders a stable shape.
+        _log.warning("host Phase 5b' HARD abandon: %s", exc)
+        if not state.history:
+            record_findings(state, [])
+        return build_abandonment_outcome(state, subject=subject, participants=list(participants))
 
 
 # ── Deliverable 1b — host cycle executor ────────────────────────────────────
@@ -302,6 +1205,33 @@ def _interpret_engine_results(
     }
 
 
+def _review_roster_abandon(
+    subject: str | None,
+    participants: Sequence[str],
+    detail: str,
+) -> dict[str, Any]:
+    """Abandonment dict for the pre-loop 'cannot select disjoint reviewers' case.
+
+    Mirrors team mode's reviewer-selection abandon (``phase_reached="review"``,
+    ``reason="other"``). Carries the four review-outcome keys as ``None`` (no fix
+    loop ran), so the dict is key-compatible with :func:`build_abandonment_outcome`
+    consumers (run.py / abandonment.py) and the parity contract.
+    """
+    return {
+        "status": "abandoned",
+        "subject": subject,
+        "participants": list(participants),
+        "phase_reached": "review",
+        "reason": "other",
+        "detail": detail,
+        "artifacts": [],
+        "review_iteration_count": None,
+        "unresolved_findings": None,
+        "convergence_summary": None,
+        "reviewer_attribution": None,
+    }
+
+
 def host_cycle_executor(
     *,
     action_items: Sequence[Mapping[str, Any]],
@@ -313,6 +1243,7 @@ def host_cycle_executor(
     budget_total_tokens: int = 4_000_000,
     runner: Any = None,
     journal_path: str | Path | None = None,
+    review: bool = True,
 ) -> dict[str, Any]:
     """Run a cycle's Phase-4 implementation waves through atelier's host engine.
 
@@ -365,7 +1296,14 @@ def host_cycle_executor(
     # ── Pre-bind ALL kaizen refs the engine will call back into, BEFORE the
     #    window. Inside the window `scripts` == atelier, so these imports MUST
     #    happen now. ────────────────────────────────────────────────────────
-    from scripts.dispatch_templates import TEAMMATE_REPLY_RULE, phase_4_implementer
+    from scripts.dispatch_templates import (
+        TEAMMATE_REPLY_RULE,
+        phase_4_implementer,
+        phase_5b_prime_fix,
+        phase_5b_prime_pm_acceptance,
+        phase_5b_prime_reviewer,
+        phase_5b_prime_reviewer_mesh,
+    )
 
     # Per-item lookup maps the briefing closure reads (item body + 1-based wave).
     # These are plain kaizen dicts captured here, OUTSIDE the window — the closure
@@ -415,33 +1353,158 @@ def host_cycle_executor(
         # engine + e2e reference.
         disallowed = list(cli_dispatch.DEFAULT_DISALLOWED_TOOLS)
 
-        # CRITICAL: the ENTIRE asyncio.run is INSIDE the window — the coroutine
+        # CRITICAL: every asyncio.run is INSIDE the window — the coroutine
         # touches atelier scripts.* throughout; closing early = ImportError.
-        results = asyncio.run(
-            host.run_host_pipeline_for_project(
-                tasks,
-                clone_dir=str(clone_path),
-                budget=budget,
-                journal=journal,
-                existing_files=sorted(existing),
-                model_for=model_for,
-                briefing_for=briefing_for,
-                worktree_factory=wt,
-                runner=eff_runner,
-                sandbox_wrap=sandbox,
-                escalate_fn=escalate_fn,
-                run_mode=neutral_run_mode,
-                disallowed_tools=disallowed,
+        # `_dispatch_round` runs ONE pipeline call; it is reused for the Phase-4
+        # wave AND every Phase-5b' review/mesh/PM/fix round (single-window design
+        # — see _run_review_fix_loop). review_pairing is left unset, so the engine
+        # NEVER runs its own nested review loop (kaizen owns the loop).
+        def _dispatch_round(
+            round_tasks: Sequence[Mapping[str, Any]],
+            round_briefing: Callable[[Mapping[str, Any], int], str],
+            *,
+            round_existing: Sequence[str] | None = None,
+        ) -> list[Any]:
+            # `round_existing` overrides the dispatch's existing-file set. Phase-4
+            # uses the original `existing`; the review/mesh rounds pass the
+            # POST-MERGE set (original + every impl write) so a reviewer's
+            # broadcast `reads` resolve as pre-existing (the producing impl tasks
+            # are not in the review-only dispatch — declaring them via reads/deps
+            # would trip validate_dag's reads-satisfiable / orphan-deps gates).
+            return asyncio.run(
+                host.run_host_pipeline_for_project(
+                    round_tasks,
+                    clone_dir=str(clone_path),
+                    budget=budget,
+                    journal=journal,
+                    existing_files=sorted(existing)
+                    if round_existing is None
+                    else list(round_existing),
+                    model_for=model_for,
+                    briefing_for=round_briefing,
+                    worktree_factory=wt,
+                    runner=eff_runner,
+                    sandbox_wrap=sandbox,
+                    escalate_fn=escalate_fn,
+                    run_mode=neutral_run_mode,
+                    disallowed_tools=disallowed,
+                )
             )
-        )
+
+        results = _dispatch_round(tasks, briefing_for)
         is_failed_attempt = cli_dispatch.is_failed_attempt
 
-    # ── Back OUTSIDE the window: interpret. (is_failed_attempt was captured as
-    #    a bound callable inside the window; it remains callable here.) ────────
-    return _interpret_engine_results(
-        results,
-        tasks,
-        participants=participants,
-        subject=subject,
-        is_failed_attempt=is_failed_attempt,
-    )
+        # Phase-4 outcome (pure interpret, IN-window so the review loop can run in
+        # the SAME window on success).
+        phase4_outcome = _interpret_engine_results(
+            results,
+            tasks,
+            participants=participants,
+            subject=subject,
+            is_failed_attempt=is_failed_attempt,
+        )
+
+        # ── Phase 5b' — independent review + fix loop (re-homed Star→Mesh→Star).
+        #    Only on a clean Phase-4 success; mirrors team mode's ordering. ──────
+        review_outcome: dict[str, Any] | None = None
+        if review and phase4_outcome.get("status") == "success":
+            # Reviewer selection (§2.4) — VERBATIM parity with team_executor: the
+            # disjoint pool excludes every implementer persona; <1 disjoint role →
+            # abandon at the review phase.
+            implementers = [str(item["owner"]) for item in action_items if item.get("owner")]
+            disjoint_pool_size = len([r for r in roster if r not in set(implementers)])
+            n_reviewers = min(3, disjoint_pool_size) if disjoint_pool_size > 0 else 0
+            if n_reviewers < 1:
+                review_outcome = _review_roster_abandon(
+                    subject,
+                    participants,
+                    "Cannot select any disjoint reviewer — roster too small "
+                    f"({len(roster)} role(s), {len(set(implementers))} implementer(s)).",
+                )
+            else:
+                try:
+                    reviewers = select_reviewers(
+                        list(roster),
+                        implementers,
+                        n=n_reviewers,
+                        preferred_lenses=list(_REVIEWER_LENSES),
+                    )
+                except InsufficientRosterError as exc:
+                    review_outcome = _review_roster_abandon(
+                        subject, participants, f"Cannot select disjoint reviewers: {exc}"
+                    )
+                else:
+                    # file → Phase-4 owner, for fix-task routing via the reused
+                    # _find_owner_for_finding. Built OUTSIDE the engine call.
+                    file_to_owner = {
+                        path: str(item["owner"])
+                        for item in action_items
+                        if item.get("owner")
+                        for path in (item.get("touches") or [])
+                    }
+
+                    # Briefing-closure FACTORIES — closed over the module-level
+                    # kaizen template fns (imported before the window) + the
+                    # immutable items/action_items. The loop calls each per round
+                    # with that round's data; no scripts.* import at call time.
+                    def _review_fac(prior):
+                        return _make_review_briefing_for(
+                            items_by_id,
+                            action_items,
+                            phase_5b_prime_reviewer,
+                            prior,
+                            TEAMMATE_REPLY_RULE,
+                        )
+
+                    def _mesh_fac(peer_map):
+                        return _make_mesh_briefing_for(
+                            items_by_id,
+                            action_items,
+                            peer_map,
+                            phase_5b_prime_reviewer_mesh,
+                            TEAMMATE_REPLY_RULE,
+                        )
+
+                    def _pm_fac(bmap):
+                        return _make_pm_briefing_for(
+                            bmap, phase_5b_prime_pm_acceptance, TEAMMATE_REPLY_RULE
+                        )
+
+                    def _fix_fac(fmap):
+                        return _make_fix_briefing_for(fmap, phase_5b_prime_fix, TEAMMATE_REPLY_RULE)
+
+                    # Post-merge existing-file set: every Phase-4 impl write now
+                    # lives in the shared clone. The review loop dispatches each
+                    # round with THIS set so broadcast reviewer `reads` (the impl
+                    # writes) satisfy the engine's reads-satisfiable gate.
+                    review_existing = sorted(
+                        set(existing) | {w for t in tasks for w in (t.get("writes") or [])}
+                    )
+
+                    def _review_dispatch_round(round_tasks, round_briefing):
+                        return _dispatch_round(
+                            round_tasks, round_briefing, round_existing=review_existing
+                        )
+
+                    review_outcome = _run_review_fix_loop(
+                        reviewers=reviewers,
+                        action_items=action_items,
+                        impl_tasks=tasks,
+                        file_to_owner=file_to_owner,
+                        pm=pm,
+                        subject=subject,
+                        participants=participants,
+                        dispatch_round=_review_dispatch_round,
+                        review_briefing_factory=_review_fac,
+                        mesh_briefing_factory=_mesh_fac,
+                        pm_briefing_factory=_pm_fac,
+                        fix_briefing_factory=_fix_fac,
+                        is_failed_attempt=is_failed_attempt,
+                    )
+
+    # ── OUTSIDE the window. A review abandonment (roster-too-small or fix-loop
+    #    exhaustion) SUPERSEDES the Phase-4 success; else return the Phase-4
+    #    outcome (success, or a Phase-4 abandonment that skipped review). ────────
+    if review_outcome is not None:
+        return review_outcome
+    return phase4_outcome

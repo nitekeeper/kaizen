@@ -26,13 +26,33 @@ from pathlib import Path
 
 import pytest
 
-from scripts.dispatch_templates import TEAMMATE_REPLY_RULE, phase_4_implementer
+from scripts.dispatch_templates import (
+    TEAMMATE_REPLY_RULE,
+    phase_4_implementer,
+    phase_5b_prime_fix,
+    phase_5b_prime_pm_acceptance,
+    phase_5b_prime_reviewer,
+    phase_5b_prime_reviewer_mesh,
+)
+from scripts.fix_loop import Finding
 from scripts.host_executor import (
+    _collect_review_findings,
+    _consolidate_mesh,
     _interpret_engine_results,
     _make_briefing_for,
     _make_escalate_fn,
+    _make_fix_briefing_for,
+    _make_mesh_briefing_for,
     _make_model_for,
+    _make_pm_briefing_for,
+    _make_review_briefing_for,
+    _parse_mesh_response,
+    _ReviewHardAbandon,
     build_engine_tasks,
+    build_fix_tasks,
+    build_mesh_tasks,
+    build_pm_task,
+    build_review_tasks,
     host_cycle_executor,
 )
 
@@ -491,6 +511,7 @@ def test_host_cycle_executor_e2e_two_wave_dag(tmp_path):
         subject="test subject",
         runner=runner,
         journal_path=tmp_path / "journal.json",
+        review=False,  # Phase-4-only test; M8a-2b review covered by dedicated tests below
     )
 
     # ── outcome dict shape matches team mode's success variant ──────────────
@@ -542,6 +563,7 @@ def test_host_cycle_executor_e2e_tasks_carry_correct_fields(tmp_path):
         roster=["backend-engineer-1", "sdet-1"],
         runner=runner,
         journal_path=tmp_path / "journal.json",
+        review=False,  # Phase-4-only test; M8a-2b review covered by dedicated tests below
     )
     assert out["status"] == "success"
     # AI-3 (wave 2) must dispatch AFTER AI-1 (wave 1) — the barrier. The runner
@@ -615,3 +637,846 @@ def test_host_cycle_executor_e2e_blocked_task_abandons(tmp_path):
     dispatched_tids = sorted(runner._tid_attempt(c["argv"])[0] for c in runner.calls)
     assert dispatched_tids == ["AI-1", "AI-2"]
     assert not (clone / "scripts" / "bar.py").exists()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# M8a-2b — Phase 5b' review-pairing (re-homed Star→Mesh→Star) + fix loop tests.
+#
+# The unit tests below are PURE (no engine): task-dict builders, the briefing
+# closures, the mesh parser, and the C4 severity-gated consolidation. The two
+# e2e tests at the bottom drive the REAL engine via a phase-aware FakeCliRunner
+# (`@_SKIP_ENGINE`). Several tests (C4 #5-#8, hard-abandon #9-#10, unique-id #11)
+# are mutation-proven against `scripts/host_executor.py` — the named mutation was
+# applied, the test confirmed RED for the right reason, then REVERTED (the
+# evidence is in the agent's final report; the committed tree carries ONLY the
+# test additions).
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _finding(
+    fid: str, severity: str, reviewer: str, file_line: str = "scripts/foo.py:1"
+) -> Finding:
+    """Build a Finding with a one-line prose body (avoids the Layer-B
+    multi-line blockquote path so the assertions stay byte-stable)."""
+    return Finding(
+        finding_id=fid,
+        reviewer=reviewer,
+        severity=severity,
+        finding=f"{severity} issue from {reviewer}",
+        file_line=file_line,
+    )
+
+
+# ── #1 — build_review_tasks: broadcast reads-union + read-only ──────────────
+
+
+def test_build_review_tasks_broadcast_reads_union_and_readonly():
+    """USER DECISION 1 (parity): every reviewer task reads the SORTED UNION of
+    ALL impl writes (NOT round-robin), is READ-ONLY (writes==[]), depends on EVERY
+    impl id, carries NO `reviews` key, phase=='review', and the ids are globally
+    unique per reviewer. Mut: round-robin reads (each reviewer sees only one file)
+    OR a `reviews` field (would double-dispatch through the engine's own loop)."""
+    impl_tasks = [
+        {"task_id": "AI-1", "writes": ["scripts/b.py"]},
+        {"task_id": "AI-2", "writes": ["scripts/a.py", "scripts/c.py"]},
+    ]
+    reviewers = ["security-engineer-1", "software-architect-1"]
+    tasks = build_review_tasks(reviewers, [], impl_tasks, iter_n=1)
+
+    assert len(tasks) == 2
+    union = ["scripts/a.py", "scripts/b.py", "scripts/c.py"]  # SORTED union of all writes
+    for t in tasks:
+        assert t["writes"] == []  # read-only — no worktree carved, false-done exempt
+        assert t["reads"] == union  # broadcast: EVERY reviewer sees the FULL set
+        # depends_on EMPTY: single-window design dispatches impl + review as
+        # separate pipeline calls, so an in-dispatch dep on the (absent) impl
+        # tasks would trip the engine's OrphanDepsError. Ordering is enforced by
+        # the sequential dispatch, not an edge.
+        assert t["depends_on"] == []
+        assert t["phase"] == "review"
+        assert "reviews" not in t  # engine's own review_pairing stays empty
+        assert t["parallel_group"] == 0
+    # ids are globally unique per reviewer.
+    assert [t["task_id"] for t in tasks] == ["R1-0", "R1-1"]
+    assert len({t["task_id"] for t in tasks}) == 2
+
+
+# ── #2 — no `reviews` field ⇒ engine stays single-dispatch (pure proxy) ─────
+
+
+def test_no_reviews_field_keeps_pipeline_single_dispatch():
+    """The review/mesh/PM/fix builders emit NO `reviews` key, so the engine's
+    `build_review_pairing` derives an EMPTY pairing and never enters its own
+    (BLIND-redispatch) review loop — kaizen owns the loop. Asserting the absence
+    of the key on EVERY builder is the pure proxy for "single dispatch per round".
+    Mut: a `reviews` key on any builder would make the engine double-dispatch."""
+    impl_tasks = [{"task_id": "AI-1", "writes": ["scripts/foo.py"]}]
+    r = build_review_tasks(["security-engineer-1"], [], impl_tasks, iter_n=1)
+    m = build_mesh_tasks(["security-engineer-1"], [], {"security-engineer-1": []}, iter_n=1)
+    f = build_fix_tasks(
+        {"scripts/foo.py": [_finding("R1-0-1", "blocker", "security-engineer-1")]},
+        {"scripts/foo.py": "backend-engineer-1"},
+        "pm-1",
+        iter_n=1,
+    )
+    pm = build_pm_task([_finding("R1-0-1", "blocker", "security-engineer-1")], "pm-1", iter_n=1)
+    for t in (*r, *m, *f, pm):
+        assert "reviews" not in t, f"task {t['task_id']} leaked a `reviews` key"
+
+
+# ── #3 — review task read-only ⇒ runs in clone, not a worktree ──────────────
+
+
+@_SKIP_ENGINE
+def test_review_task_readonly_runs_in_clone_not_worktree(tmp_path):
+    """Drive ONE review task (writes==[]) through the REAL engine: its runner cwd
+    is the SHARED base clone (NO worktree carved — C1), and a `done` envelope with
+    a noop artifact + empty declared writes is NOT converted to FAILED_ATTEMPT (the
+    false-`done` guard is exempt for non-writers). Mut: declaring `writes` would
+    carve a worktree (cwd != clone) AND trip the false-done guard."""
+    clone = _git_init_clone(tmp_path)
+    runner = _PhaseAwareHostFakeRunner(notes_by_task={"R1-0": "NO ISSUES"})
+    results = _drive_single_review_round(
+        clone,
+        tmp_path,
+        tasks=[
+            {
+                "task_id": "R1-0",
+                "parallel_group": 0,
+                "depends_on": [],  # no impl deps — keep this isolated probe orphan-free
+                "writes": [],
+                "reads": [],
+                "assigned_persona": "security-engineer-1",
+                "phase": "review",
+            }
+        ],
+        runner=runner,
+    )
+    # The review worker ran in the base clone, NOT an isolated worktree.
+    assert len(runner.calls) == 1
+    assert Path(runner.calls[0]["cwd"]).resolve() == clone.resolve()
+    # The done+empty-writes envelope survived (not a failed-attempt sentinel).
+    assert isinstance(results[0], dict)
+    assert results[0]["status"] == "done"
+    # notes_md is TOP-LEVEL on the returned envelope (R2).
+    assert results[0]["notes_md"] == "NO ISSUES"
+
+
+# ── #4 — mesh round injects PEER findings (not self) into each brief ────────
+
+
+def test_mesh_round_redispatches_with_peer_findings_injected():
+    """Round-2 mesh brief for reviewer A (M1-0) contains B's round-1 finding
+    (blockquoted/bulleted by the template), NOT A's own. Mut: peer findings omitted
+    (brief empty) OR self-leak (A sees A's own finding)."""
+    a_finding = _finding("R1-0-1", "major", "security-engineer-1", "scripts/a.py:10")
+    b_finding = _finding("R1-1-1", "minor", "software-architect-1", "scripts/b.py:20")
+    # Caller computes the exclusion: M1-0 (reviewer A) sees only B's finding.
+    peer_map = {"M1-0": [b_finding], "M1-1": [a_finding]}
+    items = [{"id": "AI-1", "touches": ["scripts/a.py"]}]
+    briefing = _make_mesh_briefing_for(
+        {"AI-1": items[0]},
+        items,
+        peer_map,
+        phase_5b_prime_reviewer_mesh,
+        TEAMMATE_REPLY_RULE,
+    )
+    brief_a = briefing({"task_id": "M1-0"}, 1)
+    # A sees B's finding id + prose; NOT A's own.
+    assert "R1-1-1" in brief_a
+    assert "minor issue from software-architect-1" in brief_a
+    assert "R1-0-1" not in brief_a  # no self-leak
+    assert "major issue from security-engineer-1" not in brief_a
+    # Symmetric: B's brief sees A's finding, not B's own.
+    brief_b = briefing({"task_id": "M1-1"}, 1)
+    assert "R1-0-1" in brief_b
+    assert "R1-1-1" not in brief_b
+
+
+# ── #5 — C4: drop unconfirmed minor, RETAIN unconfirmed blocker (+flag) ─────
+
+
+def test_consolidation_drops_unconfirmed_minor_keeps_unconfirmed_blocker():
+    """C4 severity-gated weeding: an unconfirmed `minor` is DROPPED; an unconfirmed
+    `blocker` is RETAINED and flagged peer_unconfirmed=True. Mut: applying the
+    ≥1-peer rule to blockers (F9 collapse — would drop the unconfirmed blocker) OR
+    keeping every minor verbatim (would keep the unconfirmed minor)."""
+    blocker = _finding("R1-0-1", "blocker", "security-engineer-1", "scripts/a.py:1")
+    minor = _finding("R1-0-2", "minor", "security-engineer-1", "scripts/b.py:1")
+    # Two reviewers, NEITHER confirms anything (empty verdicts each).
+    survivors, peer_unconfirmed = _consolidate_mesh(
+        [blocker, minor],
+        {"security-engineer-1": {}, "software-architect-1": {}},
+        [],
+        n_reviewers=2,
+    )
+    surviving_ids = {f.finding_id for f in survivors}
+    assert "R1-0-1" in surviving_ids  # unconfirmed blocker RETAINED
+    assert "R1-0-2" not in surviving_ids  # unconfirmed minor DROPPED
+    assert peer_unconfirmed.get("R1-0-1") is True  # blocker flagged for the PM gate
+    assert "R1-0-2" not in peer_unconfirmed
+
+
+# ── #6 — C4: self-retract drops ANY severity ────────────────────────────────
+
+
+def test_consolidation_self_retract_drops_any_severity():
+    """A RETRACT verdict on a finding drops it regardless of severity — even a
+    blocker. Mut: ignore self-retract (the retracted blocker would survive)."""
+    blocker = _finding("R1-0-1", "blocker", "security-engineer-1")
+    survivors, peer_unconfirmed = _consolidate_mesh(
+        [blocker],
+        {"security-engineer-1": {"R1-0-1": "RETRACT"}, "software-architect-1": {}},
+        [],
+        n_reviewers=2,
+    )
+    assert survivors == []  # retracted blocker dropped
+    assert peer_unconfirmed == {}  # nothing retained → nothing flagged
+
+
+# ── #7 — C4: escalation raises severity (never demotes) ─────────────────────
+
+
+def test_consolidation_escalation_raises_severity():
+    """A peer ESCALATE raises a `minor` to `major` (now blocking). The escalate
+    also counts as a confirm, so the raised finding survives the minor/nit weed
+    AND blocks. Mut: escalate ignored (minor weeded out) OR demote allowed (a
+    lower-severity escalate target would lower a blocker)."""
+    minor = _finding("R1-0-1", "minor", "security-engineer-1", "scripts/a.py:1")
+    survivors, _peer = _consolidate_mesh(
+        [minor],
+        {"security-engineer-1": {}, "software-architect-1": {"R1-0-1": ("ESCALATE", "major")}},
+        [],
+        n_reviewers=2,
+    )
+    assert len(survivors) == 1
+    assert survivors[0].finding_id == "R1-0-1"
+    assert survivors[0].severity == "major"  # raised from minor
+    # Non-vacuity / no-demote anchor: a LOWER escalate target never demotes a blocker.
+    blocker = _finding("R1-0-9", "blocker", "security-engineer-1", "scripts/z.py:1")
+    surv2, _ = _consolidate_mesh(
+        [blocker],
+        {"security-engineer-1": {}, "software-architect-1": {"R1-0-9": ("ESCALATE", "minor")}},
+        [],
+        n_reviewers=2,
+    )
+    assert surv2[0].severity == "blocker"  # never demoted to minor
+
+
+# ── #8 — single-reviewer vacuous quorum ─────────────────────────────────────
+
+
+def test_single_reviewer_vacuous_quorum():
+    """n_reviewers==1: no peers ⇒ no weeding ⇒ EVERY non-self-retracted finding
+    survives at its ORIGINAL severity (even a minor — the peer-confirm gate is a
+    multi-reviewer rule). Mut: applying the ≥1-peer rule unconditionally would
+    empty the set even though the sole reviewer DID flag the issue."""
+    blocker = _finding("R1-0-1", "blocker", "security-engineer-1")
+    minor = _finding("R1-0-2", "minor", "security-engineer-1", "scripts/b.py:1")
+    survivors, peer_unconfirmed = _consolidate_mesh([blocker, minor], {}, [], n_reviewers=1)
+    surviving_ids = {f.finding_id for f in survivors}
+    assert surviving_ids == {"R1-0-1", "R1-0-2"}  # BOTH survive (minor not weeded)
+    assert peer_unconfirmed == {}  # vacuous quorum sets no flags
+
+
+# ── #9 — silent/failed round-1 reviewer ⇒ HARD abandon ──────────────────────
+
+
+def test_silent_reviewer_is_hard_abandon():
+    """A round-1 reviewer whose envelope is a failed-attempt sentinel OR a
+    non-`done` status is a SILENT reviewer — `_collect_review_findings` raises
+    `_ReviewHardAbandon` (the loop turns it into review_unrecoverable). Mut:
+    soft-skip would ship an UNREVIEWED change."""
+    reviewers = ["security-engineer-1", "software-architect-1"]
+    sentinel = object()
+
+    def is_failed_attempt(v):
+        return v is sentinel
+
+    # Sub-branch A — failed-attempt sentinel.
+    results_a = [
+        {"type": "task_result", "task_id": "R1-0", "status": "done", "notes_md": "NO ISSUES"},
+        sentinel,
+    ]
+    with pytest.raises(_ReviewHardAbandon, match="failed-attempt sentinel"):
+        _collect_review_findings(
+            reviewers, results_a, iter_n=1, is_failed_attempt=is_failed_attempt
+        )
+
+    # Sub-branch B — a VALID terminal envelope with a non-`done` status.
+    results_b = [
+        {"type": "task_result", "task_id": "R1-0", "status": "done", "notes_md": "NO ISSUES"},
+        {"type": "task_result", "task_id": "R1-1", "status": "blocked", "notes_md": "stuck"},
+    ]
+    with pytest.raises(_ReviewHardAbandon, match="expected 'done'"):
+        _collect_review_findings(
+            reviewers, results_b, iter_n=1, is_failed_attempt=is_failed_attempt
+        )
+
+
+# ── #10 — malformed / zero-verdict mesh reply ⇒ HARD abandon ────────────────
+
+
+def test_malformed_mesh_reply_is_hard_abandon():
+    """A mesh reply that parses to ZERO recognized verdict lines AND zero finding
+    lines is MALFORMED — the loop HARD-abandons it (C4 strict posture). The pure
+    parser surfaces this as an empty (verdicts, net_new); the loop's emptiness
+    check raises. Mut: silently treating a zero-signal reply as 'all unconfirmed'
+    would let an unreviewed change ship."""
+    # A reply full of prose but NO verdict/finding grammar.
+    verdicts, net_new = _parse_mesh_response(
+        "I looked at the diff and it all seems fine to me, nothing to report.",
+        "security-engineer-1",
+        prefix="R1-mesh-0",
+    )
+    assert verdicts == {}
+    assert net_new == []  # the combined emptiness is what the loop HARD-abandons on
+
+    # Non-vacuity anchor: a recognized verdict line is NOT treated as malformed.
+    verdicts2, _net2 = _parse_mesh_response(
+        "CONFIRM R1-1-1", "security-engineer-1", prefix="R1-mesh-0"
+    )
+    assert verdicts2 == {"R1-1-1": "CONFIRM"}
+
+    # An ESCALATE without a severity token is IGNORED (not a silent demote) — but
+    # is also not, by itself, a recognized verdict (so a reply of only that line
+    # would be malformed). An ESCALATE WITH a severity IS recognized.
+    v_no_sev, _ = _parse_mesh_response("ESCALATE R1-1-1", "r", prefix="R1-mesh-0")
+    assert v_no_sev == {}
+    v_sev, _ = _parse_mesh_response("ESCALATE R1-1-1 major", "r", prefix="R1-mesh-0")
+    assert v_sev == {"R1-1-1": ("ESCALATE", "major")}
+
+
+# ── #11 — globally-unique finding ids across reviewers ──────────────────────
+
+
+def test_globally_unique_finding_ids_across_reviewers():
+    """Two reviewers' FIRST findings re-stamp to DISTINCT ids (R1-0-1 vs R1-1-1),
+    so an attribution map keys both. Mut: a per-reviewer `R{iter}-{k}` scheme would
+    mint `R1-1` for BOTH first findings → a collision that drops one in the
+    attribution map (a real F9-attribution loss)."""
+    reviewers = ["security-engineer-1", "software-architect-1"]
+    results = [
+        {
+            "type": "task_result",
+            "task_id": "R1-0",
+            "status": "done",
+            "notes_md": "[blocker] scripts/a.py:1 — A's first finding",
+        },
+        {
+            "type": "task_result",
+            "task_id": "R1-1",
+            "status": "done",
+            "notes_md": "[major] scripts/b.py:2 — B's first finding",
+        },
+    ]
+    findings = _collect_review_findings(
+        reviewers, results, iter_n=1, is_failed_attempt=lambda _v: False
+    )
+    ids = [f.finding_id for f in findings]
+    assert ids == ["R1-0-1", "R1-1-1"]  # globally unique, NOT a colliding R1-1/R1-1
+    # Both survive an attribution map (no collision dropping one).
+    attribution = {f.finding_id: f.reviewer for f in findings}
+    assert attribution == {
+        "R1-0-1": "security-engineer-1",
+        "R1-1-1": "software-architect-1",
+    }
+
+
+# ── #12 — PM acceptance literal-prefix gate ─────────────────────────────────
+
+
+def test_pm_acceptance_literal_prefix_exits_loop():
+    """PM-acceptance is the verbatim team_executor.py:2381 gate: a reply whose
+    stripped+uppercased text STARTS WITH `ACCEPT` is a clean accept; everything
+    else (incl. an `ABANDON:` prefix) is a REJECT. Mut: a relaxed prefix (e.g.
+    substring `accept` anywhere, or treating `ABANDON` as accept)."""
+
+    def pm_accepts(resp: str) -> bool:
+        # The exact production expression (host_executor.py:1085).
+        return (resp or "").strip().upper().startswith("ACCEPT")
+
+    assert pm_accepts("ACCEPT — out of scope for this cycle") is True
+    assert pm_accepts("  accept, these are fine  ") is True  # strip + upper
+    assert pm_accepts("ABANDON: cannot proceed") is False  # NOT an accept
+    assert pm_accepts("REJECT — keep fixing") is False
+    assert pm_accepts("We should accept these eventually") is False  # not a PREFIX
+    assert pm_accepts("") is False
+    assert pm_accepts(None) is False
+
+
+# ── #13 — fix routes to the file's Phase-4 owner + coalesces same-file ──────
+
+
+def test_fix_routes_to_implementer_not_reviewer_and_coalesces():
+    """Two blockers on the SAME file → ONE fix task routed to that file's Phase-4
+    OWNER (never the reviewer who flagged it). Mut: route to the reviewer
+    (assigned_persona == reviewer) OR one-fix-per-finding (two tasks)."""
+    f1 = _finding("R1-0-1", "blocker", "security-engineer-1", "scripts/foo.py:1")
+    f2 = _finding("R1-1-1", "major", "software-architect-1", "scripts/foo.py:99")
+    coalesced = {"scripts/foo.py": [f1, f2]}  # same file → coalesced
+    tasks = build_fix_tasks(
+        coalesced,
+        {"scripts/foo.py": "backend-engineer-1"},  # the Phase-4 owner
+        "pm-1",
+        iter_n=2,
+    )
+    assert len(tasks) == 1  # ONE task for the file (coalesced), not two
+    t = tasks[0]
+    assert t["assigned_persona"] == "backend-engineer-1"  # the OWNER, not a reviewer
+    assert t["assigned_persona"] not in ("security-engineer-1", "software-architect-1")
+    assert t["writes"] == ["scripts/foo.py"]  # WRITER task
+    assert t["task_id"] == "FIX2-0"
+    assert t["phase"] == "fix"
+    # An UNOWNED file falls back to the PM (the reused _find_owner_for_finding).
+    orphan = _finding("R1-0-2", "blocker", "security-engineer-1", "scripts/unowned.py:5")
+    t2 = build_fix_tasks({"scripts/unowned.py": [orphan]}, {}, "pm-1", iter_n=2)[0]
+    assert t2["assigned_persona"] == "pm-1"
+
+
+# ── #14 — iter-2 round-1 brief carries iter-1 survivors as prior_findings ───
+
+
+def test_mesh_iter2_carries_prior_survivors_forward():
+    """The round-1 reviewer briefing factory closes over `prior_findings`; the
+    iter-2 closure (built with iter-1 survivors) renders those survivors into the
+    incremental-review brief. Mut: dropping the carry-forward (the iter-1 survivor
+    would be absent from the iter-2 brief)."""
+    prior = [_finding("R1-0-1", "blocker", "security-engineer-1", "scripts/foo.py:1")]
+    items = [{"id": "AI-1", "touches": ["scripts/foo.py"]}]
+    # iter-2 closure carries the iter-1 survivor.
+    briefing2 = _make_review_briefing_for(
+        {"AI-1": items[0]},
+        items,
+        phase_5b_prime_reviewer,
+        prior,
+        TEAMMATE_REPLY_RULE,
+    )
+    brief = briefing2({"task_id": "R2-0"}, 1)
+    assert "R1-0-1" in brief  # the carried-forward survivor id is in the iter-2 brief
+    assert "blocker issue from security-engineer-1" in brief
+    # Control: a closure built with NO prior findings does NOT render it.
+    briefing_none = _make_review_briefing_for(
+        {"AI-1": items[0]}, items, phase_5b_prime_reviewer, None, TEAMMATE_REPLY_RULE
+    )
+    brief_none = briefing_none({"task_id": "R1-0"}, 1)
+    assert "R1-0-1" not in brief_none
+
+
+# ── closure coverage: PM + fix briefings strip F7 and render the finding ────
+
+
+def test_pm_and_fix_briefing_closures_strip_f7_and_render():
+    """The PM and fix briefing closures render the canonical templates, STRIP the
+    F7/terse/reply-format comms trailer (host workers have no SendMessage), and
+    append the host terminal rule. Extends the closure-coverage contract to the
+    mesh/PM/fix factories (spec §156). Mut: leaving the F7 trailer would instruct a
+    host worker to use a primitive it does not have."""
+    blocker = _finding("R1-0-1", "blocker", "security-engineer-1", "scripts/foo.py:7")
+
+    pm_briefing = _make_pm_briefing_for(
+        {"PM1": [blocker]}, phase_5b_prime_pm_acceptance, TEAMMATE_REPLY_RULE
+    )
+    pm_body = pm_briefing({"task_id": "PM1"}, 1)
+    assert "PM acceptance" in pm_body  # the PM template body survives
+    assert "R1-0-1" in pm_body  # the blocker is rendered for the PM
+    assert 'SendMessage(to="team-lead"' not in pm_body  # F7 stripped
+    assert "shutdown_response JSON protocol body" not in pm_body  # terse rule stripped
+    assert "terminal task_result envelope" in pm_body  # host terminal rule appended
+
+    fix_briefing = _make_fix_briefing_for(
+        {"FIX1-0": blocker}, phase_5b_prime_fix, TEAMMATE_REPLY_RULE
+    )
+    fix_body = fix_briefing({"task_id": "FIX1-0"}, 1)
+    assert "scripts/foo.py:7" in fix_body  # the finding the fix addresses
+    assert 'SendMessage(to="team-lead"' not in fix_body  # F7 stripped
+    assert "terminal task_result envelope" in fix_body  # host WRITER terminal rule
+
+
+@_SKIP_ENGINE
+def test_pm_fix_closures_work_inside_engine_window():
+    """The PM/fix/mesh briefing closures render correctly AFTER entering a real
+    atelier_engine() window (where `scripts` resolves to atelier), proving they
+    reference pre-bound kaizen objects, not an in-window `scripts.*` import."""
+    from scripts.atelier_engine import assert_engine_available, atelier_engine
+
+    blocker = _finding("R1-0-1", "blocker", "security-engineer-1", "scripts/foo.py:7")
+    items = [{"id": "AI-1", "touches": ["scripts/foo.py"]}]
+    pm_b = _make_pm_briefing_for(
+        {"PM1": [blocker]}, phase_5b_prime_pm_acceptance, TEAMMATE_REPLY_RULE
+    )
+    fix_b = _make_fix_briefing_for({"FIX1-0": blocker}, phase_5b_prime_fix, TEAMMATE_REPLY_RULE)
+    mesh_b = _make_mesh_briefing_for(
+        {"AI-1": items[0]},
+        items,
+        {"M1-0": [blocker]},
+        phase_5b_prime_reviewer_mesh,
+        TEAMMATE_REPLY_RULE,
+    )
+
+    root = assert_engine_available()
+    with atelier_engine(root):
+        pm_body = pm_b({"task_id": "PM1"}, 1)
+        fix_body = fix_b({"task_id": "FIX1-0"}, 1)
+        mesh_body = mesh_b({"task_id": "M1-0"}, 1)
+
+    assert "R1-0-1" in pm_body
+    assert "scripts/foo.py:7" in fix_body
+    assert "R1-0-1" in mesh_body
+
+
+# ── #15 — model_for per-phase + fail-loud on unknown ────────────────────────
+
+
+def test_model_for_per_phase_and_fail_loud():
+    """The per-phase model policy maps implementation/review/fix → opus and RAISES
+    ValueError on an unknown phase (a wiring bug must surface at dispatch, not
+    degrade silently). Mut: a constant return (every phase → opus, swallowing the
+    unknown) OR a swallowed default."""
+    mf = _make_model_for()
+    assert mf({"phase": "implementation"}, 1) == "opus"
+    assert mf({"phase": "review"}, 1) == "opus"
+    assert mf({"phase": "fix"}, 1) == "opus"
+    with pytest.raises(ValueError, match="no model policy for phase"):
+        mf({"phase": "deploy"}, 1)
+
+
+# ── #16 — mesh skipped when round-1 finds nothing ───────────────────────────
+
+
+def test_mesh_skipped_when_round1_empty():
+    """When round 1 surfaces ZERO findings, consolidation with an empty round-1
+    set returns no survivors (the loop's fast path then skips the mesh dispatch
+    entirely and exits clean). Mut: dispatching the mesh on an empty set (wasted
+    round) or fabricating survivors. The orchestration-level no-dispatch is
+    asserted end-to-end in #17's clean-exit path; here the pure consolidation
+    over an empty round-1 is the unit anchor."""
+    survivors, peer_unconfirmed = _consolidate_mesh([], {}, [], n_reviewers=2)
+    assert survivors == []
+    assert peer_unconfirmed == {}
+
+
+# ── #17 / #18 — phase-aware FakeCliRunner + e2e ─────────────────────────────
+
+
+class _PhaseAwareHostFakeRunner:
+    """Phase-aware honest fake of atelier's CLI runner for the Phase-5b' e2e.
+
+    Extends the `_HonestHostFakeRunner` contract by branching on the dispatched
+    `task_id` PREFIX:
+
+      * ``R*`` / ``M*`` (round-1 review / round-2 mesh) — READ-ONLY: writes
+        NOTHING, emits ``status="done"`` with a single NOOP artifact (a `done`
+        envelope MUST carry a non-empty `artifacts` list — empty is rejected by
+        ``validate_envelope`` for `done`) and the verdict/finding prose in the
+        TOP-LEVEL ``notes_md`` (per-task, looked up in ``notes_by_task``).
+      * ``PM*`` (PM-acceptance) — READ-ONLY: emits ``done`` + noop artifact, with
+        ``notes_md`` starting ``ACCEPT`` / ``REJECT`` (looked up in
+        ``pm_by_task``, default ``REJECT``).
+      * ``FIX*`` (fix-round writer) — WRITER: writes + ``git add``s the file the
+        task declares (so the engine's false-`done` guard is satisfied), emits a
+        ``done`` envelope with one artifact per write.
+      * anything else (impl ``AI-*``) — WRITER: same as the existing
+        `_HonestHostFakeRunner` write path.
+
+    Records every ``(argv, cwd)`` so the e2e can assert the reviewer ran in the
+    SHARED base clone (C1) and never an isolated worktree.
+    """
+
+    no_real_process = True
+    is_fake = True
+
+    def __init__(
+        self,
+        impl_writes: dict[str, list[str]] | None = None,
+        notes_by_task: dict[str, str] | None = None,
+        pm_by_task: dict[str, str] | None = None,
+        fix_writes: dict[str, list[str]] | None = None,
+        notes_by_prefix: dict[str, str] | None = None,
+        pm_default: str = "REJECT — keep fixing",
+    ):
+        self.impl_writes = impl_writes or {}
+        self.notes_by_task = notes_by_task or {}
+        # `notes_by_prefix` keys on the task-id prefix WITHOUT the trailing index
+        # (e.g. "R1" matches R1-0, R1-1; "M2" matches M2-0, ...) so a whole round's
+        # reviewers can share one canned reply without enumerating each idx.
+        self.notes_by_prefix = notes_by_prefix or {}
+        self.pm_by_task = pm_by_task or {}
+        self.fix_writes = fix_writes or {}
+        self.pm_default = pm_default
+        self.calls: list[dict] = []
+        # Optional sync hook(argv, cwd) invoked at the START of every __call__.
+        # A regular attribute (NOT a dunder), so per-instance assignment works —
+        # `runner.__call__ = fn` would NOT, since `runner(...)` resolves __call__
+        # on the TYPE, bypassing the instance attribute.
+        self.pre_call_hook = None
+
+    @staticmethod
+    def _tid_attempt(argv) -> tuple[str, int]:
+        m = re.search(r"Perform task (\S+) \(attempt (\d+)\)", argv[2])
+        assert m is not None, f"unexpected prompt argv: {argv!r}"
+        return m.group(1), int(m.group(2))
+
+    def _round_prefix(self, tid: str) -> str:
+        # "R1-0" -> "R1"; "M2-1" -> "M2"; "PM3" -> "PM3"; "FIX1-0" -> "FIX1".
+        return tid.rsplit("-", 1)[0] if "-" in tid else tid
+
+    def _envelope(self, tid: str, attempt: int, status: str, artifacts: list, notes: str) -> dict:
+        return {
+            "usage": {"output_tokens": 5, "input_tokens": 3},
+            "total_cost_usd": 0.0,
+            "is_error": False,
+            "subtype": "success",
+            "session_id": "fake-session",
+            "num_turns": 1,
+            "stop_reason": "end_turn",
+            "structured_output": {
+                "type": "task_result",
+                "task_id": tid,
+                "attempt": attempt,
+                "status": status,
+                "artifacts": artifacts,
+                "notes_md": notes,
+            },
+        }
+
+    def _write_files(self, cwd, writes, tid):
+        for rel in writes:
+            p = Path(cwd) / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            # tid-specific content: a FIX rewriting the file an impl task wrote
+            # must be a REAL change — identical content → no git diff → the
+            # engine's false-`done` guard rejects it.
+            p.write_text(f"# written by {tid}\n")
+            subprocess.run(["git", "add", "--", rel], cwd=cwd, check=False, capture_output=True)
+
+    async def __call__(self, argv, cwd):
+        self.calls.append({"argv": list(argv), "cwd": cwd})
+        if self.pre_call_hook is not None:
+            self.pre_call_hook(argv, cwd)
+        tid, attempt = self._tid_attempt(argv)
+        # NOOP artifact for read-only (review/mesh/PM) tasks — a `done` envelope
+        # MUST carry a non-empty artifacts list (validate_envelope), and a
+        # read-only task is false-done-exempt, so a noop is the honest analog of a
+        # real reviewer's no-write `done`.
+        noop = [{"path": f"{tid}.noop", "sha": "deadbeef"}]
+        if tid.startswith("PM"):
+            notes = self.pm_by_task.get(tid, self.pm_default)
+            return self._envelope(tid, attempt, "done", noop, notes)
+        if tid.startswith(("R", "M")):
+            notes = self.notes_by_task.get(tid)
+            if notes is None:
+                notes = self.notes_by_prefix.get(self._round_prefix(tid), "NO ISSUES")
+            return self._envelope(tid, attempt, "done", noop, notes)
+        if tid.startswith("FIX"):
+            writes = self.fix_writes.get(tid, [])
+            self._write_files(cwd, writes, tid)
+            arts = [{"path": w, "sha": "deadbeef"} for w in writes] or noop
+            return self._envelope(tid, attempt, "done", arts, f"{tid} fixed")
+        # impl (AI-*) writer path.
+        writes = self.impl_writes.get(tid, [])
+        self._write_files(cwd, writes, tid)
+        arts = [{"path": w, "sha": "deadbeef"} for w in writes] or [
+            {"path": f"{tid}.noop", "sha": "deadbeef"}
+        ]
+        return self._envelope(tid, attempt, "done", arts, f"{tid} done")
+
+
+def _drive_single_review_round(clone, tmp_path, *, tasks, runner):
+    """Run ONE engine dispatch of read-only review tasks inside a real
+    atelier_engine window (used by #3 — a minimal probe that does NOT touch the
+    full review-fix loop, so it stays orphan-deps-free)."""
+    import asyncio
+    import importlib
+
+    from scripts.atelier_engine import assert_engine_available, atelier_engine
+
+    root = assert_engine_available()
+    with atelier_engine(root) as host:
+        cli_dispatch = importlib.import_module("scripts.cli_dispatch")
+        budget_pool_mod = importlib.import_module("scripts.budget_pool")
+        result_journal_mod = importlib.import_module("scripts.result_journal")
+        run_mode_mod = importlib.import_module("scripts.run_mode")
+
+        budget = budget_pool_mod.BudgetPool(total_tokens=4_000_000)
+        journal = result_journal_mod.ResultJournal(tmp_path / "probe-journal.json")
+        sandbox = cli_dispatch.native_sandbox_wrap(str(clone))
+        wt = host.simple_worktree_factory(clone)
+        nrm = run_mode_mod.resolve_run_mode(explicit="balanced")
+        return asyncio.run(
+            host.run_host_pipeline_for_project(
+                tasks,
+                clone_dir=str(clone),
+                budget=budget,
+                journal=journal,
+                existing_files=["seed.txt"],
+                model_for=lambda _t, _a: "opus",
+                briefing_for=lambda _t, _a: "Review the merged change set.",
+                worktree_factory=wt,
+                runner=runner,
+                sandbox_wrap=sandbox,
+                escalate_fn=lambda _r: None,
+                run_mode=nrm,
+                disallowed_tools=list(cli_dispatch.DEFAULT_DISALLOWED_TOOLS),
+            )
+        )
+
+
+@_SKIP_ENGINE
+def test_host_cycle_executor_e2e_review_clean_exit(tmp_path):
+    """e2e clean SHIP through the REAL engine with a phase-aware FakeCliRunner:
+    2 impl tasks merge → 2 BROADCAST reviewers (round-1: one reviewer files a
+    blocker) → mesh (peer CONFIRM) → 1 fix (writer) → round-2 review is clean →
+    `status=="success"`. Asserts the reviewer runner cwd is the BASE clone (C1 —
+    NOT a worktree) and the clone holds the merged impl files at reviewer dispatch.
+
+    NOTE: this drives the production review-fix loop end-to-end. It currently
+    surfaces a real production defect (see the agent's bug report) — the test
+    asserts the INTENDED clean-SHIP behavior; it is NOT relaxed to match a broken
+    path."""
+    clone = _git_init_clone(tmp_path)
+    items = [
+        {
+            "id": "AI-1",
+            "touches": ["scripts/foo.py"],
+            "reads": [],
+            "depends_on": [],
+            "wave": 1,
+            "owner": "backend-engineer-1",
+        },
+        {
+            "id": "AI-2",
+            "touches": ["scripts/bar.py"],
+            "reads": [],
+            "depends_on": [],
+            "wave": 1,
+            "owner": "backend-engineer-1",
+        },
+    ]
+    runner = _PhaseAwareHostFakeRunner(
+        impl_writes={"AI-1": ["scripts/foo.py"], "AI-2": ["scripts/bar.py"]},
+        # Round-1: reviewer 0 (R1-0) files a blocker on foo.py; reviewer 1 (R1-1)
+        # is clean.
+        notes_by_task={
+            "R1-0": "[blocker] scripts/foo.py:1 — needs a guard",
+            "R1-1": "NO ISSUES",
+            # Mesh round 1: reviewer 1 CONFIRMs reviewer 0's blocker (id R1-0-1);
+            # reviewer 0 re-affirms its own (a CONFIRM of its own id keeps it).
+            "M1-0": "CONFIRM R1-0-1",
+            "M1-1": "CONFIRM R1-0-1",
+            # Round-2 (after the fix): everyone clean → clean exit.
+            "R2-0": "NO ISSUES",
+            "R2-1": "NO ISSUES",
+        },
+        fix_writes={"FIX1-0": ["scripts/foo.py"]},
+    )
+
+    # Snapshot clone state at the moment the FIRST review task runs so we can
+    # assert the merged impl files were present (C1: reviewers see the merge).
+    seen_at_review: dict[str, bool] = {}
+
+    def _snapshot(argv, cwd):
+        tid, _ = runner._tid_attempt(argv)
+        if tid.startswith("R") and "review-clone-snapshot" not in seen_at_review:
+            seen_at_review["foo"] = (clone / "scripts" / "foo.py").exists()
+            seen_at_review["bar"] = (clone / "scripts" / "bar.py").exists()
+            seen_at_review["cwd_is_clone"] = Path(cwd).resolve() == clone.resolve()
+            seen_at_review["review-clone-snapshot"] = True
+
+    runner.pre_call_hook = _snapshot
+
+    out = host_cycle_executor(
+        action_items=items,
+        existing_files=frozenset({"seed.txt"}),
+        clone_dir=clone,
+        # disjoint reviewer pool: implementers are backend-engineer-1; the two
+        # extra roster roles are the disjoint reviewers.
+        roster=["backend-engineer-1", "security-engineer-1", "software-architect-1"],
+        subject="clean ship",
+        runner=runner,
+        journal_path=tmp_path / "journal.json",
+        review=True,
+    )
+
+    assert out["status"] == "success", f"expected clean SHIP, got {out!r}"
+    assert out["subject"] == "clean ship"
+    # C1: at first reviewer dispatch the merged impl files were in the BASE clone,
+    # and the reviewer ran in the clone (NOT an isolated worktree).
+    assert seen_at_review.get("foo") is True
+    assert seen_at_review.get("bar") is True
+    assert seen_at_review.get("cwd_is_clone") is True
+    # Every review/mesh task ran in the base clone (no worktree carved).
+    review_cwds = [
+        c["cwd"]
+        for c in runner.calls
+        if runner._tid_attempt(c["argv"])[0].startswith(("R", "M", "PM"))
+    ]
+    assert review_cwds, "no review/mesh/PM tasks were dispatched"
+    for cwd in review_cwds:
+        assert Path(cwd).resolve() == clone.resolve()
+
+
+@_SKIP_ENGINE
+def test_host_cycle_executor_e2e_review_unrecoverable(tmp_path):
+    """e2e review_unrecoverable through the REAL engine: a PERSISTENT blocker that
+    the fix never clears, with the PM REJECTing every round, exhausts
+    MAX_ITERATIONS → `review_unrecoverable` abandonment with all FOUR review fields
+    populated and folded into the outcome. Mut: any break in the round sequence, or
+    a failure to fold the abandonment fields, would not produce this dict.
+
+    NOTE: drives the production loop end-to-end; surfaces the same defect as #17 —
+    the test asserts the INTENDED unrecoverable outcome, not a broken path."""
+    clone = _git_init_clone(tmp_path)
+    items = [
+        {
+            "id": "AI-1",
+            "touches": ["scripts/foo.py"],
+            "reads": [],
+            "depends_on": [],
+            "wave": 1,
+            "owner": "backend-engineer-1",
+        },
+    ]
+    runner = _PhaseAwareHostFakeRunner(
+        impl_writes={"AI-1": ["scripts/foo.py"]},
+        # EVERY round-1 review (any iteration) re-files the same blocker; the mesh
+        # always CONFIRMs it; the fix "succeeds" (writes) but the next round still
+        # finds the blocker → persistent. The PM REJECTs every round (default).
+        notes_by_prefix={
+            "R1": "[blocker] scripts/foo.py:1 — persistent issue",
+            "R2": "[blocker] scripts/foo.py:1 — persistent issue",
+            "R3": "[blocker] scripts/foo.py:1 — persistent issue",
+            "R4": "[blocker] scripts/foo.py:1 — persistent issue",
+            "R5": "[blocker] scripts/foo.py:1 — persistent issue",
+            "M1": "CONFIRM R1-0-1",
+            "M2": "CONFIRM R2-0-1",
+            "M3": "CONFIRM R3-0-1",
+            "M4": "CONFIRM R4-0-1",
+            "M5": "CONFIRM R5-0-1",
+        },
+        fix_writes={f"FIX{i}-0": ["scripts/foo.py"] for i in range(1, 6)},
+        pm_default="REJECT — this must be fixed",
+    )
+
+    out = host_cycle_executor(
+        action_items=items,
+        existing_files=frozenset({"seed.txt"}),
+        clone_dir=clone,
+        roster=["backend-engineer-1", "security-engineer-1", "software-architect-1"],
+        subject="persistent blocker",
+        runner=runner,
+        journal_path=tmp_path / "journal.json",
+        review=True,
+    )
+
+    assert out["status"] == "abandoned", f"expected review_unrecoverable, got {out!r}"
+    assert out["reason"] == "review_unrecoverable"
+    assert out["phase_reached"] == "review"
+    # All FOUR review-outcome fields populated (folded from build_abandonment_outcome).
+    assert out["review_iteration_count"] is not None
+    assert out["review_iteration_count"] >= 1
+    assert out["unresolved_findings"]  # non-empty list of dicts
+    assert isinstance(out["unresolved_findings"], list)
+    assert isinstance(out["unresolved_findings"][0], dict)
+    assert out["convergence_summary"]  # non-empty human summary
+    assert out["reviewer_attribution"]  # finding_id -> reviewer map, non-empty

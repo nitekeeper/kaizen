@@ -852,6 +852,61 @@ def phase_5b_prime_reviewer(
     return _inject_terse_before_trailer(rendered)
 
 
+def phase_5b_prime_reviewer_mesh(
+    *,
+    iter_n: int,
+    action_items: list[dict],
+    peer_findings: list[Finding],
+) -> str:
+    """Renders templates/phase_5_review_mesh.md (M8a-2b — host Star->Mesh->Star).
+
+    Round-2 cross-confirmation brief: shows ONE reviewer the OTHER reviewers'
+    round-1 findings (``peer_findings`` — the caller passes the round-1 set MINUS
+    the addressed reviewer's own findings) and asks for a CONFIRM / RETRACT /
+    ESCALATE verdict per peer finding plus any net-new finding. The orchestrator
+    consolidates the verdicts (Star-2, pure) — that weeding is NOT in this prompt.
+
+    AI-5 Layer B — sanitize teammate-authored finding prose. Each ``f.finding``
+    string flows from a reviewer agent (LLM) AND describes target-repo files, so
+    it is doubly untrusted; multi-line findings are blockquoted via
+    ``textwrap.indent(..., '> ')`` so embedded directives render as visibly-quoted
+    Markdown blockquote prose, neutering recency-position priority. This mirrors
+    the exact Layer-B logic in :func:`phase_5b_prime_reviewer` so both reviewer
+    paths apply the same sanitization. Layer B blockquotes MULTI-LINE strings
+    only; single-line content passes through unchanged (the canonical
+    untrusted-input boundary clause in the .md body is the single-line backstop).
+    """
+    _require("iter_n", iter_n, int)
+    _require("action_items", action_items, list)
+    _require("peer_findings", peer_findings, list)
+    action_items_ids = [item["id"] for item in action_items]
+    # AI-5 Layer B — sanitize each peer finding's prose; blockquote multi-line.
+    # Byte-identical bullet shape to phase_5b_prime_reviewer's prior-findings
+    # block so the reviewer reads a consistent finding rendering across rounds.
+    finding_bullets = []
+    for f in peer_findings:
+        text = f.finding
+        if "\n" in text:
+            quoted = textwrap.indent(text, "> ")
+            first, _, rest = quoted.partition("\n")
+            first_unquoted = first[2:] if first.startswith("> ") else first
+            rendered = f"{first_unquoted}\n{rest}" if rest else first_unquoted
+        else:
+            rendered = text
+        finding_bullets.append(
+            f"  - {f.finding_id} [{f.severity}] {f.reviewer} @ {f.file_line}: {rendered}"
+        )
+    peer_findings_as_bullets = "\n".join(finding_bullets)
+    rendered = _render(
+        "phase_5_review_mesh.md",
+        iter_n=iter_n,
+        action_items_ids=action_items_ids,
+        peer_findings_as_bullets=peer_findings_as_bullets,
+    )
+    # B1 — always-on terse-output guidance, inserted before the F7 trailer.
+    return _inject_terse_before_trailer(rendered)
+
+
 def phase_5b_prime_fix(*, finding: Finding) -> str:
     """Renders templates/phase_5b_reviewer_fix.md; see that file for the kwargs contract."""
     _require("finding", finding, Finding)

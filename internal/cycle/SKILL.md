@@ -115,6 +115,8 @@ Return a dict:
 }
 ```
 
+**Host path (`KAIZEN_TRANSPORT=host`).** The outcome dict comes straight from `scripts.host_cycle_entry` stdout — same success shape (`status/subject/commit_sha/minutes_memex_slug/participants`) and same abandoned shape. A `review_unrecoverable` abandonment from the host engine's review→fix loop additionally carries the four review-outcome keys (`review_iteration_count`, `unresolved_findings`, `convergence_summary`, `reviewer_attribution`), exactly as the bridge/team path. **`peer_unconfirmed`** reviewer findings (blocker/major issues that survived without peer cross-confirmation — M8a-2c LOW-1) are surfaced **inside `convergence_summary`**: the host loop folds them into that text when it builds the abandonment. So when you render the abandonment report / cycle minutes (Phase 5d), the `convergence_summary` already names the peer-unconfirmed findings — surface it verbatim. On a clean success no findings survived, so there is nothing peer-unconfirmed to surface and the success dict stays the 5-key shape (no extra fields) — keep the PR-body / minutes render byte-identical to the bridge success path.
+
 ## Procedure
 
 ### Phase 1 — PM agenda
@@ -181,6 +183,68 @@ Otherwise continue with the Action Items DAG produced by the meeting. Phase 4 wi
 
 The synthesis meeting (Phase 3) handed off a DAG of Action Items with `depends_on` set per task. Phase 4 consumes that DAG via the Agent Teams shared task list — execution is driven by the dependency graph, not an explicit wave loop.
 
+#### Transport fork — `KAIZEN_TRANSPORT=host` (M8)
+
+**Check the transport FIRST.** When the environment carries `KAIZEN_TRANSPORT=host`, Phase 4 (and the review→fix loop + commit) is delegated to atelier's in-process host engine via `scripts/host_cycle_entry.py` instead of being run by prose. The Phase 1-3 meeting stays exactly as-is — it produced the Action-Items DAG; the host path just hands that DAG to the engine.
+
+When `KAIZEN_TRANSPORT` is unset, empty, or `bridge` (the DEFAULT), run the prose Phase-4 / 5a / 5b / 5b' / 5c procedure below VERBATIM. A typo'd value fails loud (`UnknownTransportError`) — do not guess.
+
+**Host-path procedure:**
+
+1. **Serialize the Action-Items DAG to JSON.** Write the kaizen-NATIVE DAG the meeting produced (one object per Action Item) to a gitignored file in the clone — use `.ai/host_action_items.json` (the `.ai/` directory is gitignored, so it never lands in the target's PR diff). Each item carries the kaizen-native keys ONLY:
+   - Required kaizen-native keys: `id` (str), `touches` (list[str]), `reads` (list[str]), `depends_on` (list[str]), `wave` (int), plus optional `owner` (str).
+   - **Extra meeting keys are fine.** The synthesis meeting also emits `description` (and may carry other keys) — pass the meeting's items through unchanged. `validate_dag` tolerates extra keys and `build_engine_tasks` ignores them; you do NOT have to strip anything.
+   - Do **NOT** emit engine-OUTPUT keys (`task_id`, `parallel_group`, `writes`, `assigned_persona`, `phase`) — those are the OUTPUT of `build_engine_tasks`. The entry FAILS FAST (clean stderr line + exit 2, `ActionItemsShapeError`) if it sees them, naming the offending key, so you fix the serialization rather than getting an opaque error deeper in. (A native-looking-but-malformed DAG — e.g. a missing required key or a wrong-typed `touches` — also exits 2 cleanly.)
+
+   **Worked example** (`.ai/host_action_items.json`):
+   ```json
+   [
+     {
+       "id": "AI-1",
+       "description": "Add a guard to foo()",
+       "touches": ["scripts/foo.py"],
+       "reads": [],
+       "depends_on": [],
+       "wave": 1,
+       "owner": "backend-engineer-1"
+     },
+     {
+       "id": "AI-2",
+       "description": "Cover foo()'s guard with a test",
+       "touches": ["tests/test_foo.py"],
+       "reads": ["scripts/foo.py"],
+       "depends_on": ["AI-1"],
+       "wave": 2,
+       "owner": "sdet-1"
+     }
+   ]
+   ```
+
+2. **Invoke the host entry** from the kaizen root:
+   ```
+   PYTHONPATH=. KAIZEN_TRANSPORT=host python3 -m scripts.host_cycle_entry \
+       --action-items-file <clone_dir>/.ai/host_action_items.json \
+       --clone-dir <clone_dir> \
+       --subject "<run_row['subject'] or omit>" \
+       --roster <resolved role id 1> <resolved role id 2> ... \
+       --pm <pm role id> \
+       --cycle-n <cycle_n> [--run-id <run_id>] \
+       --test-command '<project["test_command"]>'
+   ```
+   - `--roster` is the resolved participant role ids from Phase 1; `--pm` defaults to `roster[0]` if omitted.
+   - **The roster MUST include at least one role NOT used as an Action-Item `owner`.** The host engine runs the Phase 5b' review with reviewers DISJOINT from the implementers (an agent cannot review its own work); if every roster role is an owner, no disjoint reviewer pool exists and the cycle abandons at the review phase (`reason="other"`, roster-too-small). Pass a roster that is strictly larger than the set of owners.
+   - `--test-command` MUST mirror the target repo's CI test command (F2) — the host engine's post-Phase-4 CI gate runs it.
+
+3. **The returned JSON IS the cycle outcome.** stdout carries the outcome dict (same shape as "Outcome (return)" below). The host engine runs the WHOLE remainder of the cycle internally:
+   - Phase 4 implementation waves (engine-scheduled from `depends_on`),
+   - the Phase 5b' independent-reviewer review→fix loop (Star→Mesh→Star), AND
+   - the post-Phase-4 CI-mirror gate, AND
+   - the cycle COMMIT (`commit_cycle_and_sha`, internal — F3 holds with no extra commit).
+
+   On the host path you therefore **DO NOT** run prose Phase 5a/5b/5b'/5c and you **DO NOT** call `commit_cycle` by hand — doing so would double-review and double-commit. Read the outcome JSON, set the Memex slug for Phase 5d minutes capture (the slug is in `minutes_memex_slug`), then go straight to Phase 5d. A non-zero exit (a DAG-shape error from `ActionItemsShapeError` or `validate_dag`, or the transport guard) is an operator/serialization bug to fix, not a cycle abandonment — the entry prints a clear `host_cycle_entry: <msg>` line on stderr; fix the input and re-invoke.
+
+The rest of this Phase-4 section (and Phases 5a–5c) is the DEFAULT (bridge/subagent) prose path.
+
 #### Procedure
 
 1. **Lead posts the DAG to the shared task list.** Each Action Item becomes a task with the columns from Phase 3 (`Touches`, `Reads`, `Owner`, `Depends on`). Tasks start in `pending` state.
@@ -218,6 +282,8 @@ The synthesis meeting (Phase 3) handed off a DAG of Action Items with `depends_o
 
 ### Phase 5a — Destructive check
 
+> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, Phases 5a–5c are subsumed by `scripts.host_cycle_entry` (see the Phase 4 transport fork) — do NOT run them by prose. This section is the DEFAULT (bridge/subagent) path only.
+
 ```
 python <kaizen-root>/scripts/destructive_check.py <clone_dir>
 ```
@@ -243,6 +309,8 @@ If, after all rejections, the working tree is clean (no remaining changes), aban
 ```
 
 ### Phase 5b — Tests (with in-cycle fix iteration)
+
+> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, the host engine ALREADY ran the post-Phase-4 CI-mirror gate in-process (see the Phase 4 transport fork) — do NOT run Phase 5b by prose. This section is the DEFAULT (bridge/subagent) path only.
 
 ```
 PYTHONPATH=. python3 -c "
@@ -296,6 +364,8 @@ Each check returns ``{"status": "pass" | "fail" | "skip", "output": <stdout+stde
   When abandoning at this phase, also revert the working tree (`git reset --hard HEAD`) so the next cycle starts clean.
 
 ### Phase 5b' — Independent Reviewers (parallel reviews + meeting + fix loop)
+
+> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, the host engine ALREADY ran this review→fix loop in-process (see the Phase 4 transport fork) — do NOT run Phase 5b' by prose, or you double-review. This section is the DEFAULT (bridge/subagent) path only.
 
 After Phase 5b's tests pass, the cycle does not yet commit. A new independent-reviewer phase runs to surface bugs, design issues, and false positives the implementers may have missed. Same shape as Phase 2 → Phase 3 but scoped to review.
 
@@ -392,6 +462,8 @@ The abandonment report MUST include:
 When abandoning, also revert the working tree (`git reset --hard HEAD`) so the next cycle starts clean.
 
 ### Phase 5c — Commit
+
+> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, the host engine ALREADY committed the merged work internally (`commit_cycle_and_sha`) and returned the real `commit_sha` in the outcome dict — do NOT call `commit_cycle` again, or you double-commit (F3). This section is the DEFAULT (bridge/subagent) path only.
 
 Compile the decisions and participants into the inputs the commit helper expects, then:
 

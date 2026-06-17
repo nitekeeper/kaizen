@@ -16,8 +16,10 @@ The PR rests on these proofs:
      reentrant.
   5. Capability + version guard — a fake atelier root below the min version, or
      one missing the host-pipeline capability, raises ``EngineUnavailableError``.
-  6. Transport flag — default → bridge; ``host`` → recognized-but-not-wired
-     (NotImplementedError); unknown → UnknownTransportError.
+  6. Transport flag — default → bridge; ``host`` → resolves; the scoped wired
+     guard (``require_wired_transport``) allows host only for the host_cycle_entry
+     contract (``allow_host=True``) and still raises ``NotImplementedError`` for the
+     run.py cycle-executor slot (default); unknown → UnknownTransportError.
 
 The atelier-touching tests skip cleanly when atelier is not installed (the
 ``_atelier_root`` fixture), so CI without an atelier cache still passes; the
@@ -286,11 +288,21 @@ def test_require_wired_default_bridge_ok():
 
 
 def test_require_wired_host_not_implemented():
-    """The TOP-LEVEL orchestrator guard still raises for host: the Phase-4 host
-    executor is wired (M8a-2a) but the meeting->executor integration is a
-    follow-up — must NOT fall back to bridge, must NOT silently run half-wired."""
-    with pytest.raises(NotImplementedError, match="top-level kaizen:improve"):
+    """The run.py Python-cycle-executor contract (allow_host defaults False) STILL
+    raises for host: that slot has no host branch + no DAG source (M8c / Option-B
+    territory). The relaxation is scoped to scripts.host_cycle_entry, not global
+    (M8 glue, RISK-4) — must NOT fall back to bridge, must NOT silently run
+    half-wired."""
+    with pytest.raises(NotImplementedError, match="host_cycle_entry"):
         transport.require_wired_transport({"KAIZEN_TRANSPORT": "host"})
+
+
+def test_require_wired_host_allowed_for_entry():
+    """The scripts.host_cycle_entry contract (allow_host=True) resolves host cleanly
+    — the wired host entrypoint (M8 glue)."""
+    assert (
+        transport.require_wired_transport({"KAIZEN_TRANSPORT": "host"}, allow_host=True) == "host"
+    )
 
 
 def test_require_wired_unknown_still_raises():

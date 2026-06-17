@@ -6,16 +6,17 @@ transport is resolved, so the wiring lands behind one flag:
 
   * ``bridge`` (DEFAULT, unset/empty/whitespace) — the existing SQLite
     queue-bridge dispatch. Byte-for-byte unchanged.
-  * ``host`` — the in-process atelier host engine. As of M8a-2a the Phase-4
-    implementation-wave executor (:func:`scripts.host_executor.host_cycle_executor`)
-    IS wired and e2e-tested as a unit, BUT the top-level ``kaizen:improve``
-    meeting→executor integration (Phases 1-3 glue in ``run.py`` / the SKILL) is a
-    LATER PR (M8a-2 follow-up). So selecting ``host`` resolves cleanly and the
-    Phase-4 executor is fully reachable directly, but
-    :func:`require_wired_transport` — the TOP-LEVEL orchestrator guard — still
-    raises :class:`NotImplementedError` so a half-wired top-level command cannot be
-    silently invoked in a broken state. It deliberately does NOT silently fall back
-    to ``bridge`` — that would mask the flag.
+  * ``host`` — the in-process atelier host engine. The Phase-4 implementation-wave
+    executor (:func:`scripts.host_executor.host_cycle_executor`) is wired +
+    e2e-tested, and M8's glue PR connects it to the top-level ``kaizen:improve``
+    flow at the SUBAGENT-SKILL layer: the Phase 1-3 meeting produces the
+    Action-Items DAG in-prose, then :mod:`scripts.host_cycle_entry` hands that DAG
+    to the executor. :func:`require_wired_transport` is therefore a SCOPED guard
+    (``allow_host``): it resolves ``host`` cleanly for the wired
+    ``scripts.host_cycle_entry`` path, but still raises :class:`NotImplementedError`
+    for the run.py Python ``cycle_executor`` slot, which has no host branch + no
+    DAG source (M8c / Option-B territory). It deliberately does NOT silently fall
+    back to ``bridge`` — that would mask the flag.
 
 Any other value raises :class:`UnknownTransportError` (fail-loud, mirroring
 atelier's ``scripts.dispatch.resolve_transport``): a typo or a stale value in
@@ -74,29 +75,43 @@ def resolve_transport(env: Mapping[str, str] | None = None) -> str:
     return raw
 
 
-def require_wired_transport(env: Mapping[str, str] | None = None) -> str:
-    """Resolve the transport AND enforce that the TOP-LEVEL path is wired.
+def require_wired_transport(
+    env: Mapping[str, str] | None = None,
+    *,
+    allow_host: bool = False,
+) -> str:
+    """Resolve the transport AND enforce that the caller's path is wired for it.
 
-    M8a-2a wired the Phase-4 executor (:func:`scripts.host_executor.host_cycle_executor`),
-    but NOT the top-level ``kaizen:improve`` meeting→executor integration (Phases
-    1-3 glue is a follow-up PR). This is the TOP-LEVEL orchestrator guard: it still
-    raises a clear :class:`NotImplementedError` for ``host`` rather than letting
-    ``kaizen:improve`` invoke a half-wired command in a broken state. ``bridge``
-    returns normally. Unknown values still raise :class:`UnknownTransportError`
-    (via :func:`resolve_transport`).
+    M8 wires ``host`` at the SUBAGENT-SKILL layer: the Phase 1-3 meeting produces
+    the Action-Items DAG in-prose, then :mod:`scripts.host_cycle_entry` hands that
+    DAG to :func:`scripts.host_executor.host_cycle_executor`. That is the ONE wired
+    host entrypoint. The run.py Python ``cycle_executor`` slot (mode=team / default)
+    has NO host branch and NO orchestrator-side DAG source — selecting ``host``
+    THERE would silently route into a path that cannot produce ``action_items``
+    (the M8c / Option-B territory the glue PR deliberately defers).
 
-    The Phase-4 executor is independently reachable + e2e-tested as a unit; this
-    guard only protects the orchestrator entrypoint until the meeting glue lands.
-    Drop the ``host`` branch here when that follow-up PR wires the integration.
+    So the guard is SCOPED, not global (RISK-4):
+
+      * ``allow_host=False`` (DEFAULT) — the run.py Python-cycle-executor contract:
+        ``host`` raises :class:`NotImplementedError`. Any FUTURE run.py caller that
+        forgets the M8c factoring fails loud instead of half-wiring a broken run.
+      * ``allow_host=True`` — the :mod:`scripts.host_cycle_entry` contract: ``host``
+        resolves cleanly (the DAG was produced upstream and is handed in).
+
+    ``bridge`` returns normally in both cases. Unknown values still raise
+    :class:`UnknownTransportError` (via :func:`resolve_transport`). Centralizing the
+    env semantics here keeps :data:`TRANSPORT_ENV_VAR` resolution in ONE place.
     """
     transport = resolve_transport(env)
-    if transport == TRANSPORT_HOST:
+    if transport == TRANSPORT_HOST and not allow_host:
         raise NotImplementedError(
-            f"{TRANSPORT_ENV_VAR}={TRANSPORT_HOST}: the Phase-4 host executor "
-            f"(scripts.host_executor.host_cycle_executor) is wired + e2e-tested, "
-            f"but the top-level kaizen:improve meeting->executor integration is a "
-            f"M8a-2 follow-up and is NOT yet connected. The orchestrator must not "
-            f"invoke a half-wired command. Use the default {TRANSPORT_BRIDGE!r} "
-            f"transport, or call host_cycle_executor directly."
+            f"{TRANSPORT_ENV_VAR}={TRANSPORT_HOST}: the host engine is wired at the "
+            f"subagent-SKILL layer via scripts.host_cycle_entry (which produces the "
+            f"Action-Items DAG orchestrator-side and hands it to "
+            f"host_cycle_executor). The run.py Python cycle-executor slot "
+            f"(mode=team/default) has NO host branch and NO DAG source — routing "
+            f"{TRANSPORT_HOST!r} there is M8c (Option-B) territory and is NOT yet "
+            f"connected. Use the default {TRANSPORT_BRIDGE!r} transport here, or "
+            f"invoke scripts.host_cycle_entry (which passes allow_host=True)."
         )
     return transport

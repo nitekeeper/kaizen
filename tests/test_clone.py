@@ -81,6 +81,96 @@ class TestCloneRepo:
         with pytest.raises(ValueError, match="branch must be a non-empty string"):
             clone_repo("https://example.com/x.git", tmp_path / "clone", "")
 
+    def test_clone_yields_deterministic_lf_working_copy_under_autocrlf(self, tmp_path):
+        """M8b finding: clone must produce LF working copies even when the host's
+        GLOBAL git config sets core.autocrlf=true.
+
+        Root cause: on a WSL/Windows host with global core.autocrlf=true a full
+        `git clone` checks out CRLF working copies against LF-committed blobs.
+        A later git op running under a DIFFERENT autocrlf (e.g.
+        GIT_CONFIG_GLOBAL=/dev/null, or a target .gitattributes) then reads the
+        base tree as DIRTY — which makes atelier's engine `git merge --no-ff` of a
+        worktree that MODIFIES an existing file refuse and crash the host cycle.
+
+        The fix clones with --no-checkout, sets local core.autocrlf=false, then
+        checks out — yielding deterministic LF working copies that match the LF
+        blobs and read CLEAN under any later autocrlf.
+
+        Host-INDEPENDENT: we force autocrlf=true via a temp GLOBAL gitconfig
+        (GIT_CONFIG_GLOBAL) for the clone, so the bug reproduces on any host
+        regardless of the developer's own global config. The PRIMARY signal is the
+        actual working-copy BYTES (LF vs CRLF) — `git status` alone can be masked
+        by the racy-git stat cache — backed by a /dev/null-global status check.
+        """
+        from scripts.clone import clone_repo
+
+        # ── Build a SOURCE repo whose committed blob is LF (committed with
+        #    autocrlf OFF so the blob bytes are exactly LF). ──────────────────
+        source = tmp_path / "source"
+        source.mkdir()
+        src_env = {
+            **os.environ,
+            "GIT_CONFIG_GLOBAL": os.devnull,  # neutral global for the seed commit
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@t",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@t",
+        }
+
+        def _src_git(*args):
+            subprocess.run(["git", *args], cwd=source, env=src_env, check=True, capture_output=True)
+
+        _src_git("init", "-q", "-b", "main")
+        _src_git("config", "core.autocrlf", "false")
+        # Multi-line LF content — written with explicit LF bytes (newline="") so
+        # the committed blob is unambiguously LF on every platform.
+        lf_text = "line one\nline two\nline three\n"
+        (source / "existing.txt").write_text(lf_text, newline="")
+        _src_git("add", "-A")
+        _src_git("commit", "-qm", "seed LF file")
+
+        # ── Clone via clone_repo with a GLOBAL autocrlf=true (the host bug
+        #    trigger). The fix must neutralize it locally. ────────────────────
+        autocrlf_global = tmp_path / "autocrlf_true.gitconfig"
+        autocrlf_global.write_text("[core]\n\tautocrlf = true\n")
+
+        dest = tmp_path / "clone"
+        prev_global = os.environ.get("GIT_CONFIG_GLOBAL")
+        os.environ["GIT_CONFIG_GLOBAL"] = str(autocrlf_global)
+        try:
+            clone_repo(str(source), dest, "main")
+        finally:
+            if prev_global is None:
+                os.environ.pop("GIT_CONFIG_GLOBAL", None)
+            else:
+                os.environ["GIT_CONFIG_GLOBAL"] = prev_global
+
+        # ── (a) PRIMARY signal: the working-copy bytes are LF, not CRLF. ─────
+        raw = (dest / "existing.txt").read_bytes()
+        assert b"\r\n" not in raw, (
+            "cloned working copy has CRLF line endings — a full clone under "
+            "global autocrlf=true re-encoded the LF blob to CRLF on checkout"
+        )
+        assert raw == lf_text.encode("utf-8"), (
+            f"cloned working copy bytes != committed LF bytes: {raw!r}"
+        )
+
+        # ── (b) status is CLEAN even under GIT_CONFIG_GLOBAL=/dev/null (the
+        #    autocrlf a later git op might run under). A CRLF working copy
+        #    against an LF blob reads DIRTY here. ──────────────────────────────
+        status = subprocess.run(
+            ["git", "-C", str(dest), "status", "--porcelain"],
+            env={**os.environ, "GIT_CONFIG_GLOBAL": os.devnull},
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert status.stdout.strip() == "", (
+            "cloned base tree reads DIRTY under GIT_CONFIG_GLOBAL=/dev/null: "
+            f"{status.stdout!r} — engine `git merge --no-ff` would refuse on a "
+            "file-modifying worktree"
+        )
+
 
 # ── get_remote_url ─────────────────────────────────────────────────────────
 

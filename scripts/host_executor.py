@@ -465,32 +465,37 @@ def build_mesh_tasks(
     reviewers: Sequence[str],
     action_items: Sequence[Mapping[str, Any]],
     r1_findings_by_reviewer: Mapping[str, Sequence[Finding]],
+    impl_tasks: Sequence[Mapping[str, Any]],
     *,
     iter_n: int,
     parallel_group: int = 0,
 ) -> list[dict[str, Any]]:
     """Round-2 (Mesh) cross-confirmation tasks — one per reviewer.
 
-    Same READ-ONLY shape as :func:`build_review_tasks`, but ``task_id`` is
+    Same READ-ONLY shape as :func:`build_review_tasks`, INCLUDING ``reads``:
+    every mesh task reads the SORTED UNION of all impl WRITES (the actual merged
+    change set), in parity with round 1. ``task_id`` is
     ``M{iter_n}-{reviewer_idx}``. The PEER findings each reviewer cross-checks
     ride via the BRIEFING CLOSURE (``_make_mesh_briefing_for``), NOT in the task
     dict — the dict carries only routing/identity fields the engine consumes. The
     closure looks up ``M{iter_n}-{idx}`` → that reviewer's peer-finding set.
 
-    ``r1_findings_by_reviewer`` is informational here (the closure owns the peer
-    map); it is accepted so the builder signature documents the round-2 input and
-    a future builder could derive ``reads`` from the findings' files. ``reads`` is
-    kept as the full union (parity with round 1 — the reviewer re-inspects the
-    same merged change set). No ``reviews`` key.
+    ``reads`` MUST come from ``impl_tasks`` writes, NOT from the round-1 findings'
+    file-references: a reviewer may flag a SUGGESTED file that does not yet exist
+    (e.g. a missing test), and feeding such a ref into ``reads`` makes the mesh
+    DAG declare an unsatisfiable read → the engine's reads-satisfiable gate
+    (``validate_dag`` gate 3) rejects the whole DAG. The impl writes ARE
+    satisfiable because the mesh dispatch passes the augmented ``review_existing``
+    (base set plus impl writes; see ``_review_dispatch_round`` / ``round_existing``).
+
+    ``r1_findings_by_reviewer`` documents the round-2 input contract (the per-task
+    peer map is owned by the briefing closure); it does NOT feed ``reads``. No
+    ``reviews`` key.
     """
-    # `reads` parity with round 1: the reviewer re-inspects the same merged set.
-    union_reads = sorted(
-        {
-            f.file_line.split(":", 1)[0]
-            for findings in r1_findings_by_reviewer.values()
-            for f in findings
-        }
-    )
+    # `reads` parity with round 1: the reviewer re-inspects the same merged set —
+    # i.e. the impl WRITES. NOT the findings' file-refs (a flagged suggested file
+    # may not exist → would trip the engine's reads-satisfiable gate).
+    union_reads = sorted({w for t in impl_tasks for w in (t.get("writes") or [])})
     tasks: list[dict[str, Any]] = []
     for idx, reviewer in enumerate(reviewers):
         tasks.append(
@@ -1091,6 +1096,7 @@ def _run_review_fix_loop(
                     reviewers,
                     action_items,
                     {reviewers[i]: findings_by_reviewer_idx.get(i, []) for i in range(n_reviewers)},
+                    impl_tasks,
                     iter_n=iter_n,
                 )
                 mesh_tasks = [all_mesh_tasks[idx] for idx in dispatch_idxs]
@@ -1495,6 +1501,17 @@ def host_cycle_executor(
         _log.warning("host CI baseline run failed: %s — proceeding without diff", baseline_exc)
         ci_baseline = None
 
+    # Set on the engine-worktree-failure path (the in-window try/except below):
+    # an engine WorktreeError is converted to a graceful abandon dict rather than
+    # propagating as an uncaught traceback (M8b finding). Resolved OUTSIDE the
+    # window with the SAME (highest) precedence as a review/Phase-4 abandon.
+    worktree_abandon: dict[str, Any] | None = None
+    # Bound inside the window (the dispatch + interpret + review loop run there);
+    # initialized here so the post-window resolution can reference them even on the
+    # WorktreeError short-circuit path (where the dispatch never assigned them).
+    phase4_outcome: dict[str, Any] | None = None
+    review_outcome: dict[str, Any] | None = None
+
     # ── The engine window. EVERYTHING atelier — BudgetPool, ResultJournal,
     #    sandbox, worktree factory, neutral run_mode, the runner default, AND
     #    the whole asyncio.run — happens here. ─────────────────────────────────
@@ -1503,6 +1520,12 @@ def host_cycle_executor(
         budget_pool_mod = importlib.import_module("scripts.budget_pool")
         result_journal_mod = importlib.import_module("scripts.result_journal")
         run_mode_mod = importlib.import_module("scripts.run_mode")
+
+        # FOOTGUN (swap window): WorktreeError is an ATELIER class. INSIDE this
+        # window `scripts.host_scheduler` resolves to ATELIER, so bind the class
+        # HERE via importlib — a module-top `from scripts.host_scheduler import
+        # WorktreeError` would resolve to KAIZEN, where the class does not exist.
+        _WorktreeError = importlib.import_module("scripts.host_scheduler").WorktreeError
 
         budget = budget_pool_mod.BudgetPool(total_tokens=budget_total_tokens)
         journal = result_journal_mod.ResultJournal(journal_file)
@@ -1558,119 +1581,149 @@ def host_cycle_executor(
                 )
             )
 
-        results = _dispatch_round(tasks, briefing_for)
         is_failed_attempt = cli_dispatch.is_failed_attempt
 
-        # Phase-4 outcome (pure interpret, IN-window so the review loop can run in
-        # the SAME window on success).
-        phase4_outcome = _interpret_engine_results(
-            results,
-            tasks,
-            participants=participants,
-            subject=subject,
-            is_failed_attempt=is_failed_attempt,
-        )
+        # NARROW catch around ALL engine dispatch in this window — the Phase-4
+        # wave AND every Phase-5b' review/mesh/PM/fix round (each runs through
+        # `_dispatch_round`, and the engine's EAGER worktree merge can fail from
+        # ANY round). An engine WorktreeError (a worktree create/merge failure —
+        # e.g. a CRLF-dirty base tree refusing `git merge --no-ff`, the M8b
+        # finding) becomes a graceful kaizen abandon dict instead of an uncaught
+        # traceback. The catch is ONLY `_WorktreeError` (bound in-window above):
+        # kaizen's deliberate fail-loud ValueErrors (model_for / _severity_rank /
+        # Finding) MUST still crash loudly — barred over-catch class (PR #110).
+        try:
+            results = _dispatch_round(tasks, briefing_for)
 
-        # ── Phase 5b' — independent review + fix loop (re-homed Star→Mesh→Star).
-        #    Only on a clean Phase-4 success; mirrors team mode's ordering. ──────
-        review_outcome: dict[str, Any] | None = None
-        if review and phase4_outcome.get("status") == "success":
-            # Reviewer selection (§2.4) — VERBATIM parity with team_executor: the
-            # disjoint pool excludes every implementer persona; <1 disjoint role →
-            # abandon at the review phase.
-            implementers = [str(item["owner"]) for item in action_items if item.get("owner")]
-            disjoint_pool_size = len([r for r in roster if r not in set(implementers)])
-            n_reviewers = min(3, disjoint_pool_size) if disjoint_pool_size > 0 else 0
-            if n_reviewers < 1:
-                review_outcome = _review_roster_abandon(
-                    subject,
-                    participants,
-                    "Cannot select any disjoint reviewer — roster too small "
-                    f"({len(roster)} role(s), {len(set(implementers))} implementer(s)).",
-                )
-            else:
-                try:
-                    reviewers = select_reviewers(
-                        list(roster),
-                        implementers,
-                        n=n_reviewers,
-                        preferred_lenses=list(_REVIEWER_LENSES),
-                    )
-                except InsufficientRosterError as exc:
+            # Phase-4 outcome (pure interpret, IN-window so the review loop can run
+            # in the SAME window on success).
+            phase4_outcome = _interpret_engine_results(
+                results,
+                tasks,
+                participants=participants,
+                subject=subject,
+                is_failed_attempt=is_failed_attempt,
+            )
+
+            # ── Phase 5b' — independent review + fix loop (re-homed Star→Mesh→Star).
+            #    Only on a clean Phase-4 success; mirrors team mode's ordering. ──
+            if review and phase4_outcome.get("status") == "success":
+                # Reviewer selection (§2.4) — VERBATIM parity with team_executor:
+                # the disjoint pool excludes every implementer persona; <1 disjoint
+                # role → abandon at the review phase.
+                implementers = [str(item["owner"]) for item in action_items if item.get("owner")]
+                disjoint_pool_size = len([r for r in roster if r not in set(implementers)])
+                n_reviewers = min(3, disjoint_pool_size) if disjoint_pool_size > 0 else 0
+                if n_reviewers < 1:
                     review_outcome = _review_roster_abandon(
-                        subject, participants, f"Cannot select disjoint reviewers: {exc}"
+                        subject,
+                        participants,
+                        "Cannot select any disjoint reviewer — roster too small "
+                        f"({len(roster)} role(s), {len(set(implementers))} implementer(s)).",
                     )
                 else:
-                    # file → Phase-4 owner, for fix-task routing via the reused
-                    # _find_owner_for_finding. Built OUTSIDE the engine call.
-                    file_to_owner = {
-                        path: str(item["owner"])
-                        for item in action_items
-                        if item.get("owner")
-                        for path in (item.get("touches") or [])
-                    }
+                    try:
+                        reviewers = select_reviewers(
+                            list(roster),
+                            implementers,
+                            n=n_reviewers,
+                            preferred_lenses=list(_REVIEWER_LENSES),
+                        )
+                    except InsufficientRosterError as exc:
+                        review_outcome = _review_roster_abandon(
+                            subject, participants, f"Cannot select disjoint reviewers: {exc}"
+                        )
+                    else:
+                        # file → Phase-4 owner, for fix-task routing via the reused
+                        # _find_owner_for_finding. Built OUTSIDE the engine call.
+                        file_to_owner = {
+                            path: str(item["owner"])
+                            for item in action_items
+                            if item.get("owner")
+                            for path in (item.get("touches") or [])
+                        }
 
-                    # Briefing-closure FACTORIES — closed over the module-level
-                    # kaizen template fns (imported before the window) + the
-                    # immutable items/action_items. The loop calls each per round
-                    # with that round's data; no scripts.* import at call time.
-                    def _review_fac(prior):
-                        return _make_review_briefing_for(
-                            items_by_id,
-                            action_items,
-                            phase_5b_prime_reviewer,
-                            prior,
-                            TEAMMATE_REPLY_RULE,
+                        # Briefing-closure FACTORIES — closed over the module-level
+                        # kaizen template fns (imported before the window) + the
+                        # immutable items/action_items. The loop calls each per
+                        # round with that round's data; no scripts.* import at call
+                        # time.
+                        def _review_fac(prior):
+                            return _make_review_briefing_for(
+                                items_by_id,
+                                action_items,
+                                phase_5b_prime_reviewer,
+                                prior,
+                                TEAMMATE_REPLY_RULE,
+                            )
+
+                        def _mesh_fac(peer_map):
+                            return _make_mesh_briefing_for(
+                                items_by_id,
+                                action_items,
+                                peer_map,
+                                phase_5b_prime_reviewer_mesh,
+                                TEAMMATE_REPLY_RULE,
+                            )
+
+                        def _pm_fac(bmap, peer_unconfirmed_ids=None):
+                            return _make_pm_briefing_for(
+                                bmap,
+                                phase_5b_prime_pm_acceptance,
+                                TEAMMATE_REPLY_RULE,
+                                peer_unconfirmed_ids=peer_unconfirmed_ids,
+                            )
+
+                        def _fix_fac(fmap):
+                            return _make_fix_briefing_for(
+                                fmap, phase_5b_prime_fix, TEAMMATE_REPLY_RULE
+                            )
+
+                        # Post-merge existing-file set: every Phase-4 impl write now
+                        # lives in the shared clone. The review loop dispatches each
+                        # round with THIS set so broadcast reviewer `reads` (the impl
+                        # writes) satisfy the engine's reads-satisfiable gate.
+                        review_existing = sorted(
+                            set(existing) | {w for t in tasks for w in (t.get("writes") or [])}
                         )
 
-                    def _mesh_fac(peer_map):
-                        return _make_mesh_briefing_for(
-                            items_by_id,
-                            action_items,
-                            peer_map,
-                            phase_5b_prime_reviewer_mesh,
-                            TEAMMATE_REPLY_RULE,
+                        def _review_dispatch_round(round_tasks, round_briefing):
+                            return _dispatch_round(
+                                round_tasks, round_briefing, round_existing=review_existing
+                            )
+
+                        review_outcome = _run_review_fix_loop(
+                            reviewers=reviewers,
+                            action_items=action_items,
+                            impl_tasks=tasks,
+                            file_to_owner=file_to_owner,
+                            pm=pm,
+                            subject=subject,
+                            participants=participants,
+                            dispatch_round=_review_dispatch_round,
+                            review_briefing_factory=_review_fac,
+                            mesh_briefing_factory=_mesh_fac,
+                            pm_briefing_factory=_pm_fac,
+                            fix_briefing_factory=_fix_fac,
+                            is_failed_attempt=is_failed_attempt,
                         )
-
-                    def _pm_fac(bmap, peer_unconfirmed_ids=None):
-                        return _make_pm_briefing_for(
-                            bmap,
-                            phase_5b_prime_pm_acceptance,
-                            TEAMMATE_REPLY_RULE,
-                            peer_unconfirmed_ids=peer_unconfirmed_ids,
-                        )
-
-                    def _fix_fac(fmap):
-                        return _make_fix_briefing_for(fmap, phase_5b_prime_fix, TEAMMATE_REPLY_RULE)
-
-                    # Post-merge existing-file set: every Phase-4 impl write now
-                    # lives in the shared clone. The review loop dispatches each
-                    # round with THIS set so broadcast reviewer `reads` (the impl
-                    # writes) satisfy the engine's reads-satisfiable gate.
-                    review_existing = sorted(
-                        set(existing) | {w for t in tasks for w in (t.get("writes") or [])}
-                    )
-
-                    def _review_dispatch_round(round_tasks, round_briefing):
-                        return _dispatch_round(
-                            round_tasks, round_briefing, round_existing=review_existing
-                        )
-
-                    review_outcome = _run_review_fix_loop(
-                        reviewers=reviewers,
-                        action_items=action_items,
-                        impl_tasks=tasks,
-                        file_to_owner=file_to_owner,
-                        pm=pm,
-                        subject=subject,
-                        participants=participants,
-                        dispatch_round=_review_dispatch_round,
-                        review_briefing_factory=_review_fac,
-                        mesh_briefing_factory=_mesh_fac,
-                        pm_briefing_factory=_pm_fac,
-                        fix_briefing_factory=_fix_fac,
-                        is_failed_attempt=is_failed_attempt,
-                    )
+        except _WorktreeError as exc:
+            # Engine worktree create/merge failure → graceful abandon (phase
+            # 'implementation', reason 'other' — an infra/engine failure, NOT a
+            # semantic no_consensus or a CI break). Carry the engine message in
+            # detail; shape matches the other implementation-phase abandons.
+            _log.warning("host engine WorktreeError → graceful abandon: %s", exc)
+            worktree_abandon = {
+                "status": "abandoned",
+                "subject": subject,
+                "participants": list(participants),
+                "phase_reached": "implementation",
+                "reason": "other",
+                "detail": (
+                    f"host engine worktree merge/create failed (atelier WorktreeError): {exc}"
+                ),
+                "artifacts": [],
+            }
 
     # ── OUTSIDE the window — self-contained finalization (M8a-2c §1/§2). ────────
     # The engine window is closed; `scripts` is kaizen again, so the CI helpers,
@@ -1680,15 +1733,23 @@ def host_cycle_executor(
     # NOT move it to run.py.
     #
     # Resolution order (only ONE path commits):
+    #   0. an engine WorktreeError abandon (worktree create/merge failure from ANY
+    #      dispatch round) SUPERSEDES everything → return it, NO commit. On this
+    #      path phase4_outcome/review_outcome may be None (the dispatch raised
+    #      before assigning them), so it MUST be checked first.
     #   1. a review abandonment (roster-too-small or fix-loop exhaustion)
     #      SUPERSEDES Phase-4 success → return it, NO commit;
     #   2. Phase-4 itself abandoned (skipped review) → return it, NO commit;
     #   3. clean Phase-4 success → run the CI-mirror gate; a cycle-introduced
     #      break abandons → return that, NO commit;
     #   4. else commit the merged work, stamp the real commit_sha + Memex slug.
+    if worktree_abandon is not None:
+        return worktree_abandon
     if review_outcome is not None:
         return review_outcome
-    if phase4_outcome.get("status") != "success":
+    # phase4_outcome is always assigned by the time we reach here on a non-
+    # WorktreeError path (the try body assigns it before any review dispatch).
+    if phase4_outcome is None or phase4_outcome.get("status") != "success":
         return phase4_outcome
 
     # Clean success → CI-mirror gate (§2). Reviewer-driven fixes are NOT re-CI'd

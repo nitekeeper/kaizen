@@ -159,16 +159,20 @@ def _timeout_output(exc: subprocess.TimeoutExpired) -> str:
 def parse_pytest_pass_count(output: str) -> int:
     """Parse the number of passed tests from captured pytest output.
 
-    Matches pytest's summary separator line (e.g. ``=== 5 passed in 0.12s ===``
-    or ``=== 7 passed, 1 warning in 0.34s ===``) via ``r"={3,}\\s+(\\d+) passed"``
-    and returns the first match; returns 0 when no match is found.
+    Matches pytest's summary line in BOTH forms: the decorated default
+    (``=== 5 passed in 0.12s ===``, ``=== 7 passed, 1 warning in 0.34s ===``)
+    AND the bare ``-q``/``--quiet`` form (``5 passed in 0.01s``, no ``===``
+    decoration) via ``r"(\\d+) passed(?:,| in )"``. The ``(?:,| in )`` suffix
+    anchors to pytest's summary grammar (count then ``, <more>`` or `` in <time>s``)
+    so a non-pytest runner line (e.g. cargo's ``12 passed; 0 failed``) does NOT
+    match. Returns the first match; 0 when none.
 
     NOTE: pytest-specific. Other test runners (npm, cargo, go test) produce
     different output and will yield 0 even when passing. When kaizen supports
     non-pytest runners, add per-runner parsers here.
     """
     for line in output.splitlines():
-        m = re.search(r"={3,}\s+(\d+) passed", line)
+        m = re.search(r"(\d+) passed(?:,| in )", line)
         if m:
             return int(m.group(1))
     return 0

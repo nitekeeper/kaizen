@@ -29,11 +29,21 @@ def clone_repo(remote_url: str, dest: Path, branch: str) -> None:
     if not branch:
         raise ValueError("branch must be a non-empty string")
     dest.parent.mkdir(parents=True, exist_ok=True)
+    # Clone with --no-checkout so we can pin a deterministic line-ending policy
+    # BEFORE any working copy is materialized. On a WSL/Windows host with global
+    # core.autocrlf=true, a normal checkout re-encodes LF-committed blobs to CRLF;
+    # a later git op running under a DIFFERENT autocrlf (e.g.
+    # GIT_CONFIG_GLOBAL=/dev/null, or a target .gitattributes) then reads the base
+    # tree as DIRTY, which makes atelier's engine `git merge --no-ff` of a
+    # file-MODIFYING worktree refuse and crash the host cycle. Setting local
+    # `core.autocrlf false` before checkout yields LF working copies matching the
+    # LF blobs, clean under any later autocrlf. (See M8b live-e2e finding.)
+    #
     # Raw call (no cwd — dest does not exist yet) with the same enrichment as
     # git_utils.git(): clone failures (auth/bad URL/network) are the worst
     # offender for opaque str(exc) on the run.py critical path.
     result = subprocess.run(
-        ["git", "clone", "-b", branch, remote_url, str(dest)],
+        ["git", "clone", "--no-checkout", "-b", branch, remote_url, str(dest)],
         check=False,
         capture_output=True,
         text=True,
@@ -47,8 +57,13 @@ def clone_repo(remote_url: str, dest: Path, branch: str) -> None:
             output=result.stdout,
             stderr=result.stderr,
         )
+    # Pin a deterministic line-ending policy BEFORE materializing the working tree
+    # so the checkout writes LF (matching the committed blobs), not CRLF.
+    _git(["config", "core.autocrlf", "false"], dest)
     _git(["config", "user.email", "kaizen@kaizen.local"], dest)
     _git(["config", "user.name", "Kaizen"], dest)
+    # Materialize the working tree now that autocrlf is pinned local-false.
+    _git(["checkout", branch], dest)
 
 
 def cleanup_experiment(experiment_dir: Path) -> None:

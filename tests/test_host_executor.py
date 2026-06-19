@@ -28,6 +28,7 @@ from pathlib import Path
 
 import pytest
 
+from scripts.abandonment import VALID_REASONS
 from scripts.ci_runner import run_ci_checks
 from scripts.dispatch_templates import (
     TEAMMATE_REPLY_RULE,
@@ -749,6 +750,97 @@ def test_build_review_tasks_broadcast_reads_union_and_readonly():
     assert len({t["task_id"] for t in tasks}) == 2
 
 
+# ── #1b — build_mesh_tasks: round-2 reads = impl WRITES, never finding refs ──
+
+
+def test_build_mesh_tasks_reads_are_impl_writes_not_finding_refs():
+    """REGRESSION (M8b live e2e crash): round-2 (Mesh) `reads` MUST be the SORTED
+    UNION of impl WRITES — parity with round-1 `build_review_tasks` — NOT derived
+    from round-1 reviewers' FINDING file-references.
+
+    A reviewer can flag a NON-EXISTENT file (e.g. a SUGGESTED test file). If that
+    finding's file-ref fed the mesh task's `reads`, the engine's reads-satisfiable
+    gate (validate_dag gate 3) rejects the DAG with UnsatisfiableReadsError → an
+    uncaught crash. The impl writes (the actual merged change set) ARE satisfiable
+    because the mesh dispatch passes the augmented `review_existing` (base set plus
+    impl writes). The peer findings each mesh reviewer cross-checks ride via the BRIEFING
+    CLOSURE, NOT via `reads`.
+
+    Mut (the shipped bug): deriving `reads` from finding file-refs would put the
+    non-existent 'tests/test_divide.py' into `reads` and OMIT the impl writes."""
+    impl_tasks = [
+        {"task_id": "AI-1", "writes": ["mathlib/divide.py", "mathlib/__init__.py"]},
+    ]
+    # A round-1 reviewer referenced a NON-EXISTENT suggested test file.
+    r1_findings_by_reviewer = {
+        "security-engineer-1": [
+            _finding("R1-0-1", "blocker", "security-engineer-1", "tests/test_divide.py:1"),
+        ],
+        "software-architect-1": [
+            _finding("R1-1-1", "major", "software-architect-1", "mathlib/divide.py:42"),
+        ],
+    }
+    reviewers = ["security-engineer-1", "software-architect-1"]
+    tasks = build_mesh_tasks(reviewers, [], r1_findings_by_reviewer, impl_tasks, iter_n=1)
+
+    expected_reads = ["mathlib/__init__.py", "mathlib/divide.py"]  # SORTED impl writes
+    assert len(tasks) == 2
+    for t in tasks:
+        assert t["reads"] == expected_reads, (
+            f"mesh reads must be the sorted impl writes, got {t['reads']!r}"
+        )
+        # The non-existent suggested test file MUST NOT appear in reads (the bug).
+        assert "tests/test_divide.py" not in t["reads"]
+        # mathlib/divide.py:42's file is an impl write, so it IS in reads — but
+        # only because it is an impl WRITE, not because a finding referenced it.
+        assert t["writes"] == []
+        assert t["phase"] == "review"
+        assert "reviews" not in t
+    assert [t["task_id"] for t in tasks] == ["M1-0", "M1-1"]
+
+
+def test_build_mesh_tasks_mesh_dag_passes_validate_dag_with_augmented_existing():
+    """REGRESSION (focused): the DAG built from `build_mesh_tasks` for a scenario
+    where a round-1 reviewer flagged a NON-EXISTENT file PASSES the engine's
+    `validate_dag` reads-satisfiable gate when validated against the AUGMENTED
+    existing-file set (base set plus impl writes) — exactly the set the mesh dispatch
+    passes as `round_existing=review_existing`. Before the fix the mesh `reads`
+    held 'tests/test_divide.py' (not in existing, not produced) → gate 3 fails."""
+    from scripts.dag import UnsatisfiableReadsError, validate_dag
+
+    base_existing = {"seed.txt"}
+    impl_writes = ["mathlib/divide.py", "mathlib/__init__.py"]
+    impl_tasks = [{"task_id": "AI-1", "writes": impl_writes}]
+    r1_findings_by_reviewer = {
+        "security-engineer-1": [
+            _finding("R1-0-1", "blocker", "security-engineer-1", "tests/test_divide.py:1"),
+        ],
+        "software-architect-1": [
+            _finding("R1-1-1", "major", "software-architect-1", "mathlib/divide.py:42"),
+        ],
+    }
+    reviewers = ["security-engineer-1", "software-architect-1"]
+    mesh_tasks = build_mesh_tasks(reviewers, [], r1_findings_by_reviewer, impl_tasks, iter_n=1)
+
+    # Augmented existing set the mesh dispatch uses (host_executor.py:1680).
+    review_existing = frozenset(set(base_existing) | set(impl_writes))
+    # Convert the engine-task dicts to validate_dag item shape (single wave —
+    # read-only mesh tasks have no inter-edges).
+    items = [
+        {
+            "id": t["task_id"],
+            "touches": list(t["writes"]),
+            "reads": list(t["reads"]),
+            "depends_on": list(t["depends_on"]),
+            "wave": 1,
+        }
+        for t in mesh_tasks
+    ]
+    v = validate_dag(items, existing_files=review_existing)
+    assert v.ok, f"mesh DAG must pass validate_dag, errors={v.errors!r}"
+    assert not any(isinstance(e, UnsatisfiableReadsError) for e in v.errors)
+
+
 # ── #2 — no `reviews` field ⇒ engine stays single-dispatch (pure proxy) ─────
 
 
@@ -760,7 +852,9 @@ def test_no_reviews_field_keeps_pipeline_single_dispatch():
     Mut: a `reviews` key on any builder would make the engine double-dispatch."""
     impl_tasks = [{"task_id": "AI-1", "writes": ["scripts/foo.py"]}]
     r = build_review_tasks(["security-engineer-1"], [], impl_tasks, iter_n=1)
-    m = build_mesh_tasks(["security-engineer-1"], [], {"security-engineer-1": []}, iter_n=1)
+    m = build_mesh_tasks(
+        ["security-engineer-1"], [], {"security-engineer-1": []}, impl_tasks, iter_n=1
+    )
     f = build_fix_tasks(
         {"scripts/foo.py": [_finding("R1-0-1", "blocker", "security-engineer-1")]},
         {"scripts/foo.py": "backend-engineer-1"},
@@ -1468,6 +1562,73 @@ def test_host_cycle_executor_e2e_review_clean_exit(tmp_path):
 
 
 @_SKIP_ENGINE
+def test_host_cycle_executor_e2e_review_finding_on_nonexistent_file(tmp_path):
+    """REGRESSION (M8b live crash, production caller): drive the REAL engine through
+    Phase-4 success → round-1 review where a reviewer files a blocker referencing a
+    NON-EXISTENT suggested test file ('tests/test_divide.py') → the MESH round.
+
+    Before the fix `build_mesh_tasks` derived the mesh task `reads` from the
+    finding file-refs, so the mesh DAG declared an unsatisfiable read of the
+    non-existent file → the engine's reads-satisfiable gate raised an UNCAUGHT
+    UnsatisfiableReadsError (exit 1, empty stdout). After the fix the mesh `reads`
+    are the impl WRITES (satisfiable via the augmented review_existing), so the
+    loop runs to a well-formed outcome. Mut: the old finding-ref reads path raises
+    UnsatisfiableReadsError before any outcome dict is produced."""
+    clone = _git_init_clone(tmp_path)
+    items = [
+        {
+            "id": "AI-1",
+            "touches": ["mathlib/divide.py"],
+            "reads": [],
+            "depends_on": [],
+            "wave": 1,
+            "owner": "backend-engineer-1",
+        },
+    ]
+    runner = _PhaseAwareHostFakeRunner(
+        impl_writes={"AI-1": ["mathlib/divide.py"]},
+        notes_by_task={
+            # Round-1: reviewer 0 files a blocker on a NON-EXISTENT suggested test
+            # file; reviewer 1 is clean. This is the exact live shape that crashed
+            # the mesh round.
+            "R1-0": "[blocker] tests/test_divide.py:1 — add a divide-by-zero test",
+            "R1-1": "NO ISSUES",
+            # Mesh: reviewer 1 CONFIRMs reviewer 0's blocker (id R1-0-1).
+            "M1-0": "CONFIRM R1-0-1",
+            "M1-1": "CONFIRM R1-0-1",
+            # Round-2 (after the fix writes the test file): clean → clean exit.
+            "R2-0": "NO ISSUES",
+            "R2-1": "NO ISSUES",
+        },
+        # The fix-round writer creates the suggested test file (the blocker's file).
+        fix_writes={"FIX1-0": ["tests/test_divide.py"]},
+    )
+
+    out = host_cycle_executor(
+        action_items=items,
+        existing_files=frozenset({"seed.txt"}),
+        clone_dir=clone,
+        roster=["backend-engineer-1", "security-engineer-1", "software-architect-1"],
+        subject="finding on nonexistent file",
+        runner=runner,
+        journal_path=tmp_path / "journal.json",
+        review=True,
+        test_command="true",  # no-op CI gate — this is a review-loop test
+    )
+
+    # The crux: the production caller did NOT raise UnsatisfiableReadsError; it
+    # returned a well-formed outcome dict. (Mesh ran — assert it was dispatched.)
+    assert isinstance(out, dict)
+    assert out.get("status") in {"success", "abandoned"}, f"unexpected outcome: {out!r}"
+    assert out["status"] == "success", f"expected clean SHIP after fix, got {out!r}"
+    assert out["subject"] == "finding on nonexistent file"
+    # The MESH round actually ran (M*-* tasks dispatched) — proves we exercised the
+    # build_mesh_tasks path that previously crashed.
+    mesh_dispatched = [c for c in runner.calls if runner._tid_attempt(c["argv"])[0].startswith("M")]
+    assert mesh_dispatched, "mesh round was never dispatched — regression not exercised"
+
+
+@_SKIP_ENGINE
 def test_host_cycle_executor_e2e_review_unrecoverable(tmp_path):
     """e2e review_unrecoverable through the REAL engine: a PERSISTENT blocker that
     the fix never clears, with the PM REJECTing every round, exhausts
@@ -1983,3 +2144,99 @@ def test_host_cycle_executor_live_review_cycle(tmp_path):
                 "reviewer_attribution",
             ):
                 assert k in out, f"missing {k} on review_unrecoverable outcome"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# M8b — engine WorktreeError → graceful abandon (not an uncaught traceback).
+#
+# atelier's engine raises `scripts.host_scheduler.WorktreeError` when a worktree
+# merge fails (the M8b live-e2e finding: a CRLF-dirty base tree makes the engine's
+# `git merge --no-ff` of a file-MODIFYING worktree refuse). host_cycle_executor
+# must CATCH that engine class IN-WINDOW and convert it to a clean kaizen abandon
+# dict — NOT let it propagate as an exit-1 traceback with empty stdout.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+@_SKIP_ENGINE
+def test_host_cycle_executor_engine_worktree_error_abandons_gracefully(tmp_path, monkeypatch):
+    """A WorktreeError raised by the engine's in-window merge MUST be converted to
+    a clean abandon dict — host_cycle_executor must NOT re-raise.
+
+    We force the failure at the seam the engine actually calls: atelier's
+    in-window `scripts.host_scheduler._merge_worktree`. Because the engine swap
+    window RE-IMPORTS atelier's `scripts.*` fresh on every entry (and purges it on
+    exit — see scripts.atelier_engine), a patch applied in a transient window does
+    not survive into the executor's own window. So we wrap the `atelier_engine`
+    context manager the executor imports and patch `_merge_worktree` on the
+    FRESHLY-yielded host_scheduler module, AND bind `WorktreeError` from that same
+    in-window module (it is an ATELIER class — `from scripts.host_scheduler import
+    WorktreeError` at the kaizen module top would resolve to kaizen, where the
+    class does not exist).
+
+    AI-1 is a single wave-1 writer with a real declared write, so it reaches the
+    eager-merge step; the patched `_merge_worktree` raises there. Pre-fix:
+    host_cycle_executor does NOT catch WorktreeError → it propagates (uncaught) and
+    this test RAISES. Post-fix: a graceful abandon dict is RETURNED.
+    """
+    import contextlib
+
+    from scripts import atelier_engine as _ae_mod
+    from scripts import host_executor as _host_mod
+
+    clone = _git_init_clone(tmp_path)
+    items = [
+        {
+            "id": "AI-1",
+            "touches": ["scripts/foo.py"],
+            "reads": [],
+            "depends_on": [],
+            "wave": 1,
+            "owner": "backend-engineer-1",
+        },
+    ]
+    runner = _HonestHostFakeRunner({"AI-1": ["scripts/foo.py"]})
+
+    real_atelier_engine = _ae_mod.atelier_engine
+
+    @contextlib.contextmanager
+    def _patching_engine(atelier_root=None):
+        # Delegate to the real swap; patch the FRESH in-window host_scheduler so
+        # its merge step raises the in-window WorktreeError class.
+        with real_atelier_engine(atelier_root) as host_scheduler:
+            worktree_error = host_scheduler.WorktreeError
+
+            def _boom(_wt):
+                raise worktree_error(
+                    "INVARIANT VIOLATION: merging worktree conflicted (simulated "
+                    "CRLF-dirty base tree) — local changes would be overwritten"
+                )
+
+            monkeypatch.setattr(host_scheduler, "_merge_worktree", _boom)
+            yield host_scheduler
+
+    # host_executor calls `atelier_engine(...)` via its module-level import, so
+    # patch the name in the host_executor namespace.
+    monkeypatch.setattr(_host_mod, "atelier_engine", _patching_engine)
+
+    out = host_cycle_executor(
+        action_items=items,
+        existing_files=frozenset({"seed.txt"}),
+        clone_dir=clone,
+        roster=["backend-engineer-1", "sdet-1"],
+        subject="worktree boom",
+        runner=runner,
+        journal_path=tmp_path / "journal.json",
+        review=False,
+        test_command="true",
+    )
+
+    # ── graceful abandon (NOT a raised traceback) ───────────────────────────
+    assert isinstance(out, dict), f"expected a dict outcome, got {type(out)!r}"
+    assert out["status"] == "abandoned", f"expected abandoned, got {out!r}"
+    assert out["phase_reached"] == "implementation", out
+    assert out["reason"] in VALID_REASONS, f"reason {out['reason']!r} not a valid taxonomy slot"
+    # The engine message rides through into `detail`.
+    assert "worktree" in out["detail"].lower(), out["detail"]
+    assert out["subject"] == "worktree boom"
+    assert out["participants"] == ["backend-engineer-1", "sdet-1"]
+    assert "artifacts" in out

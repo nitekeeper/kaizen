@@ -775,6 +775,25 @@ def test_parse_pytest_pass_count_no_match_returns_zero():
     assert ci_runner.parse_pytest_pass_count("") == 0
 
 
+def test_parse_pytest_pass_count_quiet_output():
+    # `pytest -q` emits a BARE summary line (no `===` decoration). M8b live run:
+    # the F2 gate ran `pytest -q`, tests genuinely passed, but the commit message
+    # showed "Tests: 0 passed" because the old `={3,}`-anchored regex required the
+    # decorated form. The `-q` form must parse to the real count.
+    assert ci_runner.parse_pytest_pass_count("5 passed in 0.01s\n") == 5
+    assert (
+        ci_runner.parse_pytest_pass_count(
+            ".....                                              [100%]\n5 passed in 0.01s\n"
+        )
+        == 5
+    )
+    # the `, <more>` variant in bare form too
+    assert ci_runner.parse_pytest_pass_count("7 passed, 1 warning in 0.34s\n") == 7
+    # non-vacuity guard: cargo's `; 0 failed` grammar must STILL return 0 (the
+    # `(?:,| in )` suffix is what keeps non-pytest runners out).
+    assert ci_runner.parse_pytest_pass_count("cargo test: ok. 12 passed; 0 failed\n") == 0
+
+
 # ── anti-resurrection guard (Finding 2 — test_runner.py deleted) ──────────
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

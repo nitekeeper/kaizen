@@ -22,6 +22,7 @@ comparing `runs.cycles_requested` against `cycles_succeeded + cycles_abandoned`.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from pathlib import Path
 
 from scripts.db import get_connection
 
@@ -123,6 +124,45 @@ def list_cycles(db_path: str, run_id: int) -> list[dict]:
         return [_row_to_dict(r, cols) for r in rows]
     finally:
         conn.close()
+
+
+# ── Working-tree helpers ────────────────────────────────────────────────────
+
+
+def _collect_existing_files(clone_dir: Path) -> frozenset[str]:
+    """Return the set of repo-relative file paths currently on disk in clone_dir.
+
+    Used by `validate_dag` gate 3 (reads satisfiable). Walks the working
+    tree, skipping the usual transient/VCS directories.
+
+    F4 (audit cleanup): previously, an OSError during rglob silently
+    returned an empty frozenset — which then made the DAG validator
+    surface every action item's `reads` as "unsatisfiable" because the
+    file set was empty. The abandonment then misattributed the cause to
+    "unsatisfiable reads" when the real problem was a permissions/IO
+    error walking the clone. Now an OSError is re-raised with a clearer
+    message naming the path and the original error so triage isn't
+    misdirected. The "clone doesn't exist yet" case is still tolerated by
+    the explicit `exists()` check above.
+    """
+    if not clone_dir or not Path(clone_dir).exists():
+        return frozenset()
+    skip = {".git", ".ai", "__pycache__", ".pytest_cache", ".ruff_cache", "node_modules"}
+    out: set[str] = set()
+    root = Path(clone_dir)
+    try:
+        for p in root.rglob("*"):
+            if not p.is_file():
+                continue
+            # Skip if any path part is in the skip set
+            if any(part in skip for part in p.relative_to(root).parts):
+                continue
+            out.add(str(p.relative_to(root)))
+    except OSError as exc:
+        # F4: re-raise with a clearer message so the abandonment caller can
+        # surface "the walk itself failed" instead of "reads unsatisfiable."
+        raise OSError(f"rglob failed on {root}: {exc}") from exc
+    return frozenset(out)
 
 
 # ── Stub executor (Wave 7 fills this in via SKILL prose) ────────────────────

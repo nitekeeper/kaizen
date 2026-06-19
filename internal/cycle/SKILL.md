@@ -183,11 +183,11 @@ Otherwise continue with the Action Items DAG produced by the meeting. Phase 4 wi
 
 The synthesis meeting (Phase 3) handed off a DAG of Action Items with `depends_on` set per task. Phase 4 consumes that DAG via the Agent Teams shared task list — execution is driven by the dependency graph, not an explicit wave loop.
 
-#### Transport fork — `KAIZEN_TRANSPORT=host` (M8)
+#### Transport fork — `KAIZEN_TRANSPORT=host` is the DEFAULT (M8c)
 
-**Check the transport FIRST.** When the environment carries `KAIZEN_TRANSPORT=host`, Phase 4 (and the review→fix loop + commit) is delegated to atelier's in-process host engine via `scripts/host_cycle_entry.py` instead of being run by prose. The Phase 1-3 meeting stays exactly as-is — it produced the Action-Items DAG; the host path just hands that DAG to the engine.
+**Check the transport FIRST.** When `KAIZEN_TRANSPORT` is unset, empty, or `host` (the DEFAULT as of M8c), Phase 4 (and the review→fix loop + commit) is delegated to atelier's in-process host engine via `scripts/host_cycle_entry.py` instead of being run by prose. The Phase 1-3 meeting stays exactly as-is — it produced the Action-Items DAG; the host path just hands that DAG to the engine.
 
-When `KAIZEN_TRANSPORT` is unset, empty, or `bridge` (the DEFAULT), run the prose Phase-4 / 5a / 5b / 5b' / 5c procedure below VERBATIM. A typo'd value fails loud (`UnknownTransportError`) — do not guess.
+Only when `KAIZEN_TRANSPORT=bridge` is set EXPLICITLY (the legacy opt-out, slated for removal in M8c-2) do you run the prose Phase-4 / 5a / 5b / 5b' / 5c procedure below VERBATIM. A typo'd value fails loud (`UnknownTransportError`) — do not guess.
 
 **Host-path procedure:**
 
@@ -243,7 +243,7 @@ When `KAIZEN_TRANSPORT` is unset, empty, or `bridge` (the DEFAULT), run the pros
 
    On the host path you therefore **DO NOT** run prose Phase 5a/5b/5b'/5c and you **DO NOT** call `commit_cycle` by hand — doing so would double-review and double-commit. Read the outcome JSON, set the Memex slug for Phase 5d minutes capture (the slug is in `minutes_memex_slug`), then go straight to Phase 5d. A non-zero exit (a DAG-shape error from `ActionItemsShapeError` or `validate_dag`, or the transport guard) is an operator/serialization bug to fix, not a cycle abandonment — the entry prints a clear `host_cycle_entry: <msg>` line on stderr; fix the input and re-invoke.
 
-The rest of this Phase-4 section (and Phases 5a–5c) is the DEFAULT (bridge/subagent) prose path.
+The rest of this Phase-4 section (and Phases 5a–5c) is the explicit `KAIZEN_TRANSPORT=bridge` opt-out prose path (no longer the default — see the transport fork above).
 
 #### Procedure
 
@@ -282,7 +282,7 @@ The rest of this Phase-4 section (and Phases 5a–5c) is the DEFAULT (bridge/sub
 
 ### Phase 5a — Destructive check
 
-> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, Phases 5a–5c are subsumed by `scripts.host_cycle_entry` (see the Phase 4 transport fork) — do NOT run them by prose. This section is the DEFAULT (bridge/subagent) path only.
+> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, Phases 5a–5c are subsumed by `scripts.host_cycle_entry` (see the Phase 4 transport fork) — do NOT run them by prose. This section is the explicit `KAIZEN_TRANSPORT=bridge` opt-out path only (no longer the default).
 
 ```
 python <kaizen-root>/scripts/destructive_check.py <clone_dir>
@@ -310,7 +310,7 @@ If, after all rejections, the working tree is clean (no remaining changes), aban
 
 ### Phase 5b — Tests (with in-cycle fix iteration)
 
-> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, the host engine ALREADY ran the post-Phase-4 CI-mirror gate in-process (see the Phase 4 transport fork) — do NOT run Phase 5b by prose. This section is the DEFAULT (bridge/subagent) path only.
+> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, the host engine ALREADY ran the post-Phase-4 CI-mirror gate in-process (see the Phase 4 transport fork) — do NOT run Phase 5b by prose. This section is the explicit `KAIZEN_TRANSPORT=bridge` opt-out path only (no longer the default).
 
 ```
 PYTHONPATH=. python3 -c "
@@ -365,7 +365,7 @@ Each check returns ``{"status": "pass" | "fail" | "skip", "output": <stdout+stde
 
 ### Phase 5b' — Independent Reviewers (parallel reviews + meeting + fix loop)
 
-> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, the host engine ALREADY ran this review→fix loop in-process (see the Phase 4 transport fork) — do NOT run Phase 5b' by prose, or you double-review. This section is the DEFAULT (bridge/subagent) path only.
+> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, the host engine ALREADY ran this review→fix loop in-process (see the Phase 4 transport fork) — do NOT run Phase 5b' by prose, or you double-review. This section is the explicit `KAIZEN_TRANSPORT=bridge` opt-out path only (no longer the default).
 
 After Phase 5b's tests pass, the cycle does not yet commit. A new independent-reviewer phase runs to surface bugs, design issues, and false positives the implementers may have missed. Same shape as Phase 2 → Phase 3 but scoped to review.
 
@@ -463,7 +463,7 @@ When abandoning, also revert the working tree (`git reset --hard HEAD`) so the n
 
 ### Phase 5c — Commit
 
-> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, the host engine ALREADY committed the merged work internally (`commit_cycle_and_sha`) and returned the real `commit_sha` in the outcome dict — do NOT call `commit_cycle` again, or you double-commit (F3). This section is the DEFAULT (bridge/subagent) path only.
+> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, the host engine ALREADY committed the merged work internally (`commit_cycle_and_sha`) and returned the real `commit_sha` in the outcome dict — do NOT call `commit_cycle` again, or you double-commit (F3). This section is the explicit `KAIZEN_TRANSPORT=bridge` opt-out path only (no longer the default).
 
 Compile the decisions and participants into the inputs the commit helper expects, then:
 

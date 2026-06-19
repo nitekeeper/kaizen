@@ -6,8 +6,10 @@ drive the PRODUCTION caller — ``scripts.host_cycle_entry.run_host_cycle`` (and
 ``main`` argv path) — end-to-end, not just helper internals.
 
 Coverage:
-  * transport guard REJECTS when ``KAIZEN_TRANSPORT`` != ``host`` (bridge / unset /
-    unknown), BEFORE any executor call — no engine needed.
+  * transport guard REJECTS when ``KAIZEN_TRANSPORT`` resolves to something other
+    than ``host`` (explicit ``bridge`` / unknown), BEFORE any executor call — no
+    engine needed. NB (M8c): unset now DEFAULTS to host, so an unset env RUNS the
+    host entry rather than rejecting (see the e2e default-unset test).
   * an engine-shaped / malformed DAG FAILS FAST with ``ActionItemsShapeError``
     (the architect's RISK-1 — must not silently become ``no_consensus``).
   * a clean kaizen-native DAG → success outcome with a POPULATED 40-hex
@@ -100,10 +102,16 @@ def test_require_wired_transport_entry_contract_allows_host():
     assert require_wired_transport({"KAIZEN_TRANSPORT": "host"}, allow_host=True) == "host"
 
 
-def test_require_wired_transport_bridge_unchanged_both_ways():
-    """bridge resolves normally regardless of allow_host (default path untouched)."""
+def test_require_wired_transport_bridge_explicit_both_ways():
+    """The explicit bridge opt-out resolves normally regardless of allow_host."""
     assert require_wired_transport({"KAIZEN_TRANSPORT": "bridge"}) == "bridge"
-    assert require_wired_transport({}, allow_host=True) == "bridge"
+    assert require_wired_transport({"KAIZEN_TRANSPORT": "bridge"}, allow_host=True) == "bridge"
+
+
+def test_require_wired_transport_default_allowed_resolves_host():
+    """M8c: unset now defaults to host. allow_host=True (the host_cycle_entry
+    contract) resolves the default cleanly to host."""
+    assert require_wired_transport({}, allow_host=True) == "host"
 
 
 # ── transport guard (no engine needed — fails before any executor call) ──────
@@ -126,21 +134,11 @@ def test_entry_rejects_bridge_transport(tmp_path):
         )
 
 
-def test_entry_rejects_unset_transport(tmp_path):
-    """Unset KAIZEN_TRANSPORT (defaults to bridge) must NOT run the host entry."""
-    dag = _write_dag(tmp_path, _native_dag())
-    with pytest.raises(NotImplementedError):
-        run_host_cycle(
-            action_items_file=dag,
-            clone_dir=tmp_path,
-            subject="x",
-            roster=["backend-engineer-1"],
-            pm=None,
-            cycle_n=1,
-            run_id=None,
-            test_command="true",
-            env={},
-        )
+# NOTE (M8c): unset KAIZEN_TRANSPORT now DEFAULTS to host, so the entry no longer
+# rejects an unset env — see `test_entry_e2e_default_unset_routes_to_host` in the
+# e2e section below, which drives the unset-env default end-to-end through the
+# engine. The transport-guard contract for the unset default is also covered by
+# `test_require_wired_transport_default_allowed_resolves_host` above.
 
 
 def test_entry_rejects_unknown_transport(tmp_path):
@@ -302,6 +300,41 @@ def test_entry_e2e_success_commits_and_passes_dag_through(tmp_path):
 
 
 @_SKIP_ENGINE
+def test_entry_e2e_default_unset_routes_to_host(tmp_path):
+    """M8c: an UNSET KAIZEN_TRANSPORT now defaults to host, so the entry runs the
+    host cycle end-to-end (it no longer rejects with NotImplementedError). Same
+    success shape as the explicit-host path."""
+    clone = _git_init_clone(tmp_path)
+    items = _native_dag()
+    dag = _write_dag(tmp_path, items)
+    runner = _PhaseAwareHostFakeRunner(
+        impl_writes={
+            "AI-1": ["scripts/foo.py"],
+            "AI-2": ["scripts/bar.py"],
+            "AI-3": ["tests/test_foo.py"],
+        },
+        notes_by_prefix=_CLEAN_REVIEW_NOTES,
+    )
+
+    out = run_host_cycle(
+        action_items_file=dag,
+        clone_dir=clone,
+        subject="default subject",
+        roster=_E2E_ROSTER,
+        pm=None,
+        cycle_n=1,
+        run_id=None,
+        test_command="true",
+        env={},  # UNSET → host (the M8c default)
+        runner=runner,
+    )
+
+    assert out["status"] == "success", out
+    assert re.match(r"^[0-9a-f]{40}$", out["commit_sha"]), f"not a real sha: {out['commit_sha']!r}"
+    assert out["participants"] == _E2E_ROSTER
+
+
+@_SKIP_ENGINE
 def test_entry_e2e_run_id_slug(tmp_path):
     """With --run-id, the Memex slug is kaizen:cycle:<run_id>-<cycle_n>."""
     clone = _git_init_clone(tmp_path)
@@ -342,9 +375,12 @@ def test_entry_e2e_run_id_slug(tmp_path):
 
 def test_main_guard_rejection_exits_2(tmp_path, capsys, monkeypatch):
     """main() returns 2 + a stderr message when the transport guard rejects
-    (KAIZEN_TRANSPORT unset → bridge → NotImplementedError), and prints NOTHING on
-    stdout (so a caller never mistakes a guard error for an outcome dict)."""
-    monkeypatch.delenv("KAIZEN_TRANSPORT", raising=False)
+    (explicit KAIZEN_TRANSPORT=bridge → NotImplementedError), and prints NOTHING on
+    stdout (so a caller never mistakes a guard error for an outcome dict).
+
+    M8c: unset now defaults to host, so we set bridge EXPLICITLY to exercise the
+    guard-rejection-exits-2 path."""
+    monkeypatch.setenv("KAIZEN_TRANSPORT", "bridge")
     dag = _write_dag(tmp_path, _native_dag())
     rc = main(
         [

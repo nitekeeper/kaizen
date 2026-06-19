@@ -38,7 +38,7 @@ from scripts.dispatch_templates import (
     phase_5b_prime_reviewer,
     phase_5b_prime_reviewer_mesh,
 )
-from scripts.fix_loop import Finding
+from scripts.fix_loop import _CHECK_TO_REASON, Finding
 from scripts.host_executor import (
     _REVIEW_TERMINAL_RULE,
     _collect_review_findings,
@@ -61,7 +61,6 @@ from scripts.host_executor import (
     build_review_tasks,
     host_cycle_executor,
 )
-from scripts.team_executor import _CHECK_TO_REASON
 
 # ── engine availability gate (skip cleanly on a fresh box) ──────────────────
 
@@ -2011,11 +2010,11 @@ def test_host_ci_abandon_reason_parity_exact(tmp_path):
         "pip_audit": "sca_failed",
         "tests": "tests_unrecoverable",
     }
-    # Anchor the expectation against team mode's canonical map (not a hand-copy):
+    # Anchor the expectation against the canonical map (not a hand-copy):
     # any divergence between this test's table and _CHECK_TO_REASON is a bug in one
     # of them, so assert they agree first.
     assert cases == _CHECK_TO_REASON, (
-        f"parity table drifted from team_executor._CHECK_TO_REASON: {cases} != {_CHECK_TO_REASON}"
+        f"parity table drifted from fix_loop._CHECK_TO_REASON: {cases} != {_CHECK_TO_REASON}"
     )
     clone = tmp_path / "c"
     clone.mkdir()

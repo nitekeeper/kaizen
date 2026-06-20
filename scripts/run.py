@@ -70,45 +70,6 @@ def create_run(
     return get_run(db_path, new_id)
 
 
-def update_run_branch(
-    db_path: str,
-    run_id: int,
-    branch: str | None,
-) -> None:
-    """Update `runs.branch` for `run_id`.
-
-    Used by the run_id (create-run-only) entry path:
-
-      * After `create_branch(...)` succeeds in `orchestrate_run`, this
-        is called with the real branch name to transition from the
-        `'<pending>'` placeholder seeded by `create-run-only`.
-      * In the run-loop's outer `except Exception` block, this is
-        called with `branch=None`. The schema column is `TEXT NOT NULL`
-        (migration 001 line 18), so passing `None` cannot land as SQL
-        NULL — instead the sentinel string `'<failed>'` is persisted
-        (MAJOR-NEW-BRANCH-NOT-NULL). `scripts.pr.render_pr_body`
-        refuses to render against either placeholder.
-
-    Raises ValueError if `run_id` does not exist.
-    """
-    # The schema declares `branch TEXT NOT NULL` (migrations/001 line 18),
-    # which is exactly the constraint the `'<failed>'` sentinel
-    # accommodates. Do NOT modify the migration — the sentinel IS the
-    # fix.
-    persisted = "<failed>" if branch is None else branch
-    conn = get_connection(db_path)
-    try:
-        cur = conn.execute(
-            "UPDATE runs SET branch = ? WHERE id = ?",
-            (persisted, run_id),
-        )
-        if cur.rowcount == 0:
-            raise ValueError(f"run_id={run_id} not found")
-        conn.commit()
-    finally:
-        conn.close()
-
-
 def finalize_run(
     db_path: str,
     run_id: int,
@@ -185,7 +146,7 @@ def parse_owner_repo(git_url: str) -> tuple[str, str]:
 # Defence in depth — the SKILL prose now single-quotes every <placeholder>,
 # but if a user ever pastes a malicious URL into a context that strips
 # the quotes (e.g. an integration that builds the command via `subprocess`
-# with `shell=True`), `_cmd_create_run_only` will reject it here BEFORE
+# with `shell=True`), `validate_git_url` will reject it here BEFORE
 # touching the projects table.
 #
 # Characters explicitly forbidden in git URLs we accept:
@@ -255,8 +216,6 @@ def orchestrate_run(
     subject: str | None = None,
     cycle_executor=None,
     mode: str = "subagent",
-    *,
-    run_id: int | None = None,
 ) -> dict:
     """Full multi-cycle orchestration. See module docstring for the flow.
 
@@ -299,21 +258,6 @@ def orchestrate_run(
             f"No project registered for {git_url!r}. Register it first:\n"
             f"  python3 scripts/project.py register {git_url}"
         )
-
-    # M1 (review round 1): Bridge entry path's `run_id` existence guard
-    # MUST fire BEFORE any clone/seed/branch side effect. A bad run_id
-    # used to escape past clone_repo + seed_all + create_branch, leaving
-    # a populated `experiment/` directory on disk.
-    #
-    # m-DEAD (review round 2): we deliberately discard the fetched row
-    # here. The row is re-fetched inside the outer-try block AFTER
-    # `update_run_branch(...)` has transitioned `branch` from
-    # `'<pending>'` to the real name — at THAT point downstream code
-    # needs the updated row, not the stale pre-update snapshot. Holding
-    # the prefetched row and using it later would let agents observe
-    # the stale `branch='<pending>'` value. Existence-check only.
-    if run_id is not None and get_run(db_path, run_id) is None:
-        raise ValueError(f"run_id={run_id} not found in {db_path}")
 
     # 2. Clone target
     experiment_dir = experiment_dir_for(kaizen_root(), git_url)
@@ -366,28 +310,14 @@ def orchestrate_run(
         # 4. Branch
         branch = create_branch(experiment_dir, subject)
 
-        # 5. Run row.
-        #
-        # Bridge entry path: when `run_id` is supplied, the row was already
-        # created by `scripts/run.py create-run-only` with the placeholder
-        # `branch='<pending>'`. Transition the branch column to the real
-        # name we just created. The placeholder is observable for at most
-        # the time between `create-run-only` returning and this line;
-        # `scripts/pr.py::render_pr_body` refuses to render against
-        # `'<pending>'`, `'<failed>'`, `None`, or `''`.
-        if run_id is None:
-            run_row = create_run(
-                db_path=db_path,
-                project_id=project["id"],
-                branch=branch,
-                cycles_requested=cycles_requested,
-                subject=subject,
-            )
-        else:
-            # Persist the real branch immediately; refresh the local row
-            # so downstream code sees the updated value.
-            update_run_branch(db_path, run_id, branch)
-            run_row = get_run(db_path, run_id)
+        # 5. Run row. Always self-created here with the real branch name.
+        run_row = create_run(
+            db_path=db_path,
+            project_id=project["id"],
+            branch=branch,
+            cycles_requested=cycles_requested,
+            subject=subject,
+        )
 
         # H3: finalize the run as failed so the row never sticks at status='running'.
         for cycle_n in range(1, cycles_requested + 1):
@@ -469,43 +399,20 @@ def orchestrate_run(
                     f"cycle_executor for cycle {cycle_n} returned unrecognised status: {outcome!r}"
                 )
     except Exception:
-        # Bridge entry path (M2/M3 fix): blank out the branch column so
-        # a later manual `pr.py` invocation cannot accidentally try to
-        # render a PR against this aborted run.
-        # `update_run_branch(branch=None)` writes the `'<failed>'`
-        # sentinel (the schema NOT NULL constraint forbids a literal
-        # NULL). Best-effort — never mask the original cycle exception.
-        #
-        # This block now covers ALL pre-push failures (clone, seed,
-        # branch, cycle loop) — M2 fix.
+        # Finalize the run as 'failed' so the row never sticks at
+        # status='running'. Best-effort — never mask the original cycle
+        # exception. This block covers ALL pre-push failures (clone,
+        # seed, branch, cycle loop) — M2 fix.
         import contextlib
 
-        if run_id is not None:
-            with contextlib.suppress(Exception):
-                update_run_branch(db_path, run_id, None)
         # `run_row` may be None if the failure happened in clone/seed/
-        # branch — those run BEFORE the run row is established. In
-        # that case finalize_run has nothing to update (no row to
-        # finalize for the legacy entry path; the bridge entry path
-        # already has its row, which run_id covers).
+        # branch — those run BEFORE the run row is established. In that
+        # case there is no row to finalize.
         if run_row is not None:
             with contextlib.suppress(Exception):
                 finalize_run(
                     db_path=db_path,
                     run_id=run_row["id"],
-                    cycles_succeeded=cycles_succeeded,
-                    cycles_abandoned=cycles_abandoned,
-                    pr_url=None,
-                    status="failed",
-                )
-        elif run_id is not None:
-            # Bridge entry path: the run row exists (created by
-            # create-run-only) even when our local run_row is None
-            # because the failure happened before we re-fetched it.
-            with contextlib.suppress(Exception):
-                finalize_run(
-                    db_path=db_path,
-                    run_id=run_id,
                     cycles_succeeded=cycles_succeeded,
                     cycles_abandoned=cycles_abandoned,
                     pr_url=None,
@@ -517,16 +424,8 @@ def orchestrate_run(
     try:
         push_branch(experiment_dir, branch)
     except Exception as push_exc:
-        # M3 (review round 1): bridge entry path must blank the branch
-        # column too — a later manual `pr.py` invocation against this
-        # run would otherwise try to render against a branch name that
-        # may not exist on the remote. The `<failed>` sentinel makes
-        # render_pr_body refuse before it calls `gh`.
-        if run_id is not None:
-            import contextlib
-
-            with contextlib.suppress(Exception):
-                update_run_branch(db_path, run_id, None)
+        # Push failed — finalize the run as 'failed'. The clone is left
+        # in place so the caller can recover manually.
         finalized = finalize_run(
             db_path=db_path,
             run_id=run_row["id"],
@@ -583,75 +482,10 @@ def orchestrate_run(
 # ── CLI (dev-test only; real entry is `kaizen:improve` in Wave 7) ──────────
 
 
-def _cmd_create_run_only(argv: list[str], db_path: str = ".ai/memex.db") -> int:
-    """`create-run-only <git_url> <cycles> <subject>` — pre-create a `runs` row.
-
-    Looks up the project by URL — **fails loudly** with a registration
-    hint when no project matches (Decision D3: fail loudly, do NOT
-    auto-register) — then creates a `runs` row with the placeholder
-    `branch='<pending>'`.
-
-    On success: prints ONLY the new run_id on stdout (no other text),
-    exits 0, so a caller can read the single line into a shell variable.
-    (Historically the bridge entry point used this; the bridge is gone,
-    so this subcommand is retained only as a dev-test convenience.)
-    """
-    from scripts.project import get_project_by_url
-
-    ap = argparse.ArgumentParser(prog="run.py create-run-only", add_help=False)
-    ap.add_argument("git_url")
-    ap.add_argument("cycles", type=int)
-    ap.add_argument("subject", nargs="?", default=None)
-    args = ap.parse_args(argv)
-    git_url = args.git_url
-    cycles = args.cycles
-    subject = args.subject
-
-    # B-INJ-1 (review round 2): refuse URLs with shell metacharacters
-    # BEFORE any DB lookup. Defence in depth — the SKILL prose
-    # single-quotes substitutions, but a misconfigured caller (e.g.
-    # subprocess with shell=True) could still feed us a malicious URL.
-    try:
-        validate_git_url(git_url)
-    except ValueError as e:
-        print(f"create-run-only: invalid git_url: {e}", file=sys.stderr)
-        return 1
-
-    project = get_project_by_url(db_path, git_url)
-    if project is None:
-        # MINOR-CREATE-RUN-ONLY-AUTOREGISTER → Decision D3: fail loudly.
-        # Auto-registration would mask URL typos (a misspelled URL would
-        # silently create a phantom projects row, clone the wrong
-        # target, and abandon-loop forever).
-        print(
-            f"No project registered for {git_url!r}.\n"
-            f"  Register it first: python3 scripts/project.py register {git_url}",
-            file=sys.stderr,
-        )
-        return 1
-
-    run_row = create_run(
-        db_path=db_path,
-        project_id=project["id"],
-        branch="<pending>",
-        cycles_requested=cycles,
-        subject=subject,
-    )
-    # stdout MUST contain only the run_id on a single line — the
-    # detached spawner uses `RUN_ID=$(... create-run-only ...)`.
-    print(run_row["id"])
-    return 0
-
-
 def main(argv: list[str]) -> int:
-    if argv and argv[0] == "create-run-only":
-        return _cmd_create_run_only(argv[1:])
-
     if not argv or argv[0] != "orchestrate":
         print(
-            "Usage:\n"
-            '  run.py orchestrate <git-url> [--cycles N] [--subject "..."]\n'
-            "  run.py create-run-only <git-url> <cycles> [<subject>]",
+            'Usage:\n  run.py orchestrate <git-url> [--cycles N] [--subject "..."]',
             file=sys.stderr,
         )
         return 1

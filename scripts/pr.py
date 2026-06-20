@@ -134,9 +134,10 @@ def render_pr_body(
 
     Refusal categories:
 
-      * Sentinel placeholders set by the bridge entry path:
-        `'<pending>'` (from `create-run-only`) and `'<failed>'` (from
-        `update_run_branch(None)`).
+      * Legacy sentinel placeholders `'<pending>'` and `'<failed>'`
+        (defence-in-depth: the live orchestrator self-creates the run
+        row with the real branch name, so these are no longer written,
+        but the guard still refuses them if ever present).
       * Empty / None / whitespace-only branch names.
       * Branch names containing whitespace (space / tab / newline) —
         `gh` would split them as separate flags.

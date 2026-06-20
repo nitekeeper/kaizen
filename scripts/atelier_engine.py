@@ -69,7 +69,7 @@ from scripts.seed_atelier_in_clone import find_atelier_root
 
 # Minimum atelier version carrying the deterministic-host pipeline
 # (``run_host_pipeline_for_project``). Below this the host engine does not
-# exist and the bridge transport must be used instead.
+# exist and the prose transport must be used instead.
 MIN_ATELIER_VERSION: tuple[int, int, int] = (1, 10, 0)
 
 # The capability symbol the host pipeline exposes. Presence is required in

@@ -1,9 +1,10 @@
 """Host transport (M8a-2a) — Phase-4 implementation waves via atelier's engine.
 
 This is the ``KAIZEN_TRANSPORT=host`` execution path for Phase 4 (the
-implementation waves) of a kaizen cycle. Where the explicit ``bridge`` transport
-dispatches Phase-4 implementers through CC Agent-Teams + the SQLite queue, the
-host transport translates the SAME validated Action-Items DAG into atelier
+implementation waves) of a kaizen cycle. Where the explicit ``prose`` transport
+runs the cycle in-prose (the hand-orchestrated Phase-4 implementation prose in
+``internal/cycle/SKILL.md``), the host transport translates the SAME validated
+Action-Items DAG into atelier
 v1.10.0's deterministic-host engine task dicts and drives
 ``host_scheduler.run_host_pipeline_for_project`` in-process (no subprocess hop)
 via :func:`scripts.atelier_engine.atelier_engine`.

@@ -85,7 +85,7 @@ Return a dict:
 }
 ```
 
-**Host path (`KAIZEN_TRANSPORT=host`).** The outcome dict comes straight from `scripts.host_cycle_entry` stdout — same success shape (`status/subject/commit_sha/minutes_memex_slug/participants`) and same abandoned shape. A `review_unrecoverable` abandonment from the host engine's review→fix loop additionally carries the four review-outcome keys (`review_iteration_count`, `unresolved_findings`, `convergence_summary`, `reviewer_attribution`), exactly as the bridge prose path. **`peer_unconfirmed`** reviewer findings (blocker/major issues that survived without peer cross-confirmation — M8a-2c LOW-1) are surfaced **inside `convergence_summary`**: the host loop folds them into that text when it builds the abandonment. So when you render the abandonment report / cycle minutes (Phase 5d), the `convergence_summary` already names the peer-unconfirmed findings — surface it verbatim. On a clean success no findings survived, so there is nothing peer-unconfirmed to surface and the success dict stays the 5-key shape (no extra fields) — keep the PR-body / minutes render byte-identical to the bridge success path.
+**Host path (`KAIZEN_TRANSPORT=host`).** The outcome dict comes straight from `scripts.host_cycle_entry` stdout — same success shape (`status/subject/commit_sha/minutes_memex_slug/participants`) and same abandoned shape. A `review_unrecoverable` abandonment from the host engine's review→fix loop additionally carries the four review-outcome keys (`review_iteration_count`, `unresolved_findings`, `convergence_summary`, `reviewer_attribution`), exactly as the prose path. **`peer_unconfirmed`** reviewer findings (blocker/major issues that survived without peer cross-confirmation — M8a-2c LOW-1) are surfaced **inside `convergence_summary`**: the host loop folds them into that text when it builds the abandonment. So when you render the abandonment report / cycle minutes (Phase 5d), the `convergence_summary` already names the peer-unconfirmed findings — surface it verbatim. On a clean success no findings survived, so there is nothing peer-unconfirmed to surface and the success dict stays the 5-key shape (no extra fields) — keep the PR-body / minutes render byte-identical to the prose success path.
 
 ## Procedure
 
@@ -157,7 +157,7 @@ The synthesis meeting (Phase 3) handed off a DAG of Action Items with `depends_o
 
 **Check the transport FIRST.** When `KAIZEN_TRANSPORT` is unset, empty, or `host` (the DEFAULT as of M8c), Phase 4 (and the review→fix loop + commit) is delegated to atelier's in-process host engine via `scripts/host_cycle_entry.py` instead of being run by prose. The Phase 1-3 meeting stays exactly as-is — it produced the Action-Items DAG; the host path just hands that DAG to the engine.
 
-Only when `KAIZEN_TRANSPORT=bridge` is set EXPLICITLY (the legacy opt-out, slated for removal in M8c-2) do you run the prose Phase-4 / 5a / 5b / 5b' / 5c procedure below VERBATIM. A typo'd value fails loud (`UnknownTransportError`) — do not guess.
+Only when `KAIZEN_TRANSPORT=prose` is set EXPLICITLY (the opt-out from the default host engine) do you run the prose Phase-4 / 5a / 5b / 5b' / 5c procedure below VERBATIM. A typo'd value fails loud (`UnknownTransportError`) — do not guess.
 
 **Host-path procedure:**
 
@@ -213,7 +213,7 @@ Only when `KAIZEN_TRANSPORT=bridge` is set EXPLICITLY (the legacy opt-out, slate
 
    On the host path you therefore **DO NOT** run prose Phase 5a/5b/5b'/5c and you **DO NOT** call `commit_cycle` by hand — doing so would double-review and double-commit. Read the outcome JSON, set the Memex slug for Phase 5d minutes capture (the slug is in `minutes_memex_slug`), then go straight to Phase 5d. A non-zero exit (a DAG-shape error from `ActionItemsShapeError` or `validate_dag`, or the transport guard) is an operator/serialization bug to fix, not a cycle abandonment — the entry prints a clear `host_cycle_entry: <msg>` line on stderr; fix the input and re-invoke.
 
-The rest of this Phase-4 section (and Phases 5a–5c) is the explicit `KAIZEN_TRANSPORT=bridge` opt-out prose path (no longer the default — see the transport fork above).
+The rest of this Phase-4 section (and Phases 5a–5c) is the explicit `KAIZEN_TRANSPORT=prose` opt-out path (no longer the default — see the transport fork above).
 
 #### Procedure
 
@@ -252,7 +252,7 @@ The rest of this Phase-4 section (and Phases 5a–5c) is the explicit `KAIZEN_TR
 
 ### Phase 5a — Destructive check
 
-> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, Phases 5a–5c are subsumed by `scripts.host_cycle_entry` (see the Phase 4 transport fork) — do NOT run them by prose. This section is the explicit `KAIZEN_TRANSPORT=bridge` opt-out path only (no longer the default).
+> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, Phases 5a–5c are subsumed by `scripts.host_cycle_entry` (see the Phase 4 transport fork) — do NOT run them by prose. This section is the explicit `KAIZEN_TRANSPORT=prose` opt-out path only (no longer the default).
 
 ```
 python <kaizen-root>/scripts/destructive_check.py <clone_dir>
@@ -280,7 +280,7 @@ If, after all rejections, the working tree is clean (no remaining changes), aban
 
 ### Phase 5b — Tests (with in-cycle fix iteration)
 
-> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, the host engine ALREADY ran the post-Phase-4 CI-mirror gate in-process (see the Phase 4 transport fork) — do NOT run Phase 5b by prose. This section is the explicit `KAIZEN_TRANSPORT=bridge` opt-out path only (no longer the default).
+> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, the host engine ALREADY ran the post-Phase-4 CI-mirror gate in-process (see the Phase 4 transport fork) — do NOT run Phase 5b by prose. This section is the explicit `KAIZEN_TRANSPORT=prose` opt-out path only (no longer the default).
 
 ```
 PYTHONPATH=. python3 -c "
@@ -335,7 +335,7 @@ Each check returns ``{"status": "pass" | "fail" | "skip", "output": <stdout+stde
 
 ### Phase 5b' — Independent Reviewers (parallel reviews + meeting + fix loop)
 
-> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, the host engine ALREADY ran this review→fix loop in-process (see the Phase 4 transport fork) — do NOT run Phase 5b' by prose, or you double-review. This section is the explicit `KAIZEN_TRANSPORT=bridge` opt-out path only (no longer the default).
+> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, the host engine ALREADY ran this review→fix loop in-process (see the Phase 4 transport fork) — do NOT run Phase 5b' by prose, or you double-review. This section is the explicit `KAIZEN_TRANSPORT=prose` opt-out path only (no longer the default).
 
 After Phase 5b's tests pass, the cycle does not yet commit. A new independent-reviewer phase runs to surface bugs, design issues, and false positives the implementers may have missed. Same shape as Phase 2 → Phase 3 but scoped to review.
 
@@ -433,7 +433,7 @@ When abandoning, also revert the working tree (`git reset --hard HEAD`) so the n
 
 ### Phase 5c — Commit
 
-> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, the host engine ALREADY committed the merged work internally (`commit_cycle_and_sha`) and returned the real `commit_sha` in the outcome dict — do NOT call `commit_cycle` again, or you double-commit (F3). This section is the explicit `KAIZEN_TRANSPORT=bridge` opt-out path only (no longer the default).
+> **Skip on the host path.** When `KAIZEN_TRANSPORT=host`, the host engine ALREADY committed the merged work internally (`commit_cycle_and_sha`) and returned the real `commit_sha` in the outcome dict — do NOT call `commit_cycle` again, or you double-commit (F3). This section is the explicit `KAIZEN_TRANSPORT=prose` opt-out path only (no longer the default).
 
 Compile the decisions and participants into the inputs the commit helper expects, then:
 

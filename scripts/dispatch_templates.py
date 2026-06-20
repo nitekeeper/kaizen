@@ -760,6 +760,7 @@ def phase_4_implementer(*, item: dict, wave_n: int) -> str:
         wave_n=wave_n,
         **{
             "item.id": item["id"],
+            "item.description": item.get("description"),
             "item.touches": item.get("touches"),
             "item.reads": item.get("reads"),
         },

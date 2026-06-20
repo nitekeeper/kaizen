@@ -182,7 +182,12 @@ def test_phase_3_close_golden():
 
 
 def test_phase_4_implementer_golden():
-    item = {"id": "AI-1", "touches": ["foo.py"], "reads": ["bar.py"]}
+    item = {
+        "id": "AI-1",
+        "description": "Add a guard to foo().",
+        "touches": ["foo.py"],
+        "reads": ["bar.py"],
+    }
     out = phase_4_implementer(item=item, wave_n=1)
     # AI-4 (kaizen#62 Wave-1) — terminal-trailer reorder. The OK/BLOCKED
     # block now precedes TEAMMATE_REPLY_RULE so the body ends with the
@@ -193,7 +198,9 @@ def test_phase_4_implementer_golden():
     # the same deterministic transform the wrapper applies).
     assert out == _inject_terse_before_trailer(
         "Phase 4 wave 1 — implement Action Item AI-1. "
-        "You own this item. Touches: ['foo.py']; "
+        "You own this item.\n\n"
+        "The change to make (AI-1): Add a guard to foo().\n\n"
+        "Touches: ['foo.py']; "
         "reads: ['bar.py']. Apply the change to disk in the "
         "clone and reply with a one-line summary of what you did. "
         "Prefix 'ABANDON:' if the change cannot be applied. "

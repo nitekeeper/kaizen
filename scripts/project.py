@@ -250,9 +250,8 @@ def _register_cli(git_url: str, db_path: str) -> int:
     from scripts.detect_config import detect_all
 
     # Function-local import: scripts.run already imports scripts.project
-    # (function-locally, in _cmd_create_run_only and the orchestrator) — keep
-    # this pair cycle-proof even if those imports are ever promoted to
-    # module level.
+    # (function-locally, in the orchestrator) — keep this pair cycle-proof
+    # even if those imports are ever promoted to module level.
     from scripts.run import validate_git_url
 
     # Gate the URL up front: a URL the run layer can never parse would

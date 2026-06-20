@@ -309,7 +309,7 @@ def test_reviewer_parser_receives_uncompressed_input(monkeypatch):
     the feature gate is ON (the gate must NOT sit between the wire and the
     parser).
     """
-    from scripts.team_executor import _parse_reviewer_response
+    from scripts.fix_loop import _parse_reviewer_response
 
     # A reviewer reply laden with strippable filler/articles AND a real
     # finding line in the byte-sensitive grammar.
@@ -338,7 +338,7 @@ def test_compressing_a_reviewer_reply_would_change_finding_text():
     text WOULD differ. This is what makes the parser-untouched proof
     meaningful (the two paths are genuinely distinguishable).
     """
-    from scripts.team_executor import _parse_reviewer_response
+    from scripts.fix_loop import _parse_reviewer_response
 
     raw_line = "[major] scripts/team_executor.py:42 - the really obvious off-by-one bug"
 

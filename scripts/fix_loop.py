@@ -14,10 +14,14 @@ dataclass; no DB, no I/O.
 
 from __future__ import annotations
 
+import logging
+import re
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 
 from scripts.abandonment import VALID_PHASES, VALID_REASONS
+
+_log = logging.getLogger(__name__)
 
 MAX_ITERATIONS: int = 5
 
@@ -221,3 +225,152 @@ def build_abandonment_outcome(
         "convergence_summary": convergence_summary,
         "reviewer_attribution": reviewer_attribution,
     }
+
+
+# ── Reviewer-response parsing (relocated from team_executor, M8c-1) ──────────
+
+# Accept ASCII hyphen, em-dash (U+2014), and en-dash (U+2013) as the optional
+# separator between "file:line" and the finding text - real reviewers use any.
+# Unicode escapes here so ruff's RUF001 ambiguous-char check stays quiet.
+_FINDING_LINE_RE = re.compile(
+    "^\\s*\\[(?P<severity>blocker|major|minor|nit)\\]\\s+"
+    "(?P<file_line>\\S+)\\s+"
+    "(?:[-\u2014\u2013]\\s*)?(?P<text>.+?)\\s*$"
+)
+
+
+def _parse_reviewer_response(
+    response: str,
+    reviewer: str,
+    prefix: str,
+) -> list[Finding]:
+    """Parse a reviewer's response into `Finding` objects.
+
+    Finding lines are parsed FIRST: each line matching
+    ``[severity] file:line — text`` becomes a `Finding`. Lines that don't
+    match are silently skipped — reviewers may include prose before/after
+    their finding list. The wire-protocol §4 contract is preserved: a pure
+    ``NO ISSUES`` reply contains no finding lines, so it still parses to
+    ``[]``. Crucially, a MIXED reply ("...no issues..., but\\n[blocker]
+    ...") yields its findings — a 'no issues' substring must never
+    short-circuit past explicit finding lines (P2/F9: the review loop must
+    not collapse). `prefix` is used to build stable per-iteration finding
+    ids (e.g. ``R1-1``, ``R1-2``).
+    """
+    if not response:
+        return []
+    findings: list[Finding] = []
+    seq = 0
+    for line in response.splitlines():
+        m = _FINDING_LINE_RE.match(line)
+        if m is None:
+            continue
+        seq += 1
+        findings.append(
+            Finding(
+                finding_id=f"{prefix}-{seq}",
+                reviewer=reviewer,
+                severity=m.group("severity"),
+                finding=m.group("text"),
+                file_line=m.group("file_line"),
+            )
+        )
+    return findings
+
+
+def _find_owner_for_finding(
+    finding: Finding,
+    file_to_owner: dict[str, str],
+    pm: str,
+) -> str:
+    """Map a `Finding` to the implementer who should fix it.
+
+    Per internal/cycle/SKILL.md Phase 5b' the IMPLEMENTER (the Action Item
+    owner from Phase 3) fixes findings — never the reviewer who flagged
+    them. We extract the file from `finding.file_line` ("file:line") and
+    look it up in the file→owner index built at Phase 4 dispatch time.
+    When the file isn't owned by any Action Item (e.g. a reviewer surfaced
+    a cross-cutting issue) we fall back to the PM, who can re-route.
+    """
+    raw = finding.file_line or ""
+    file = raw.split(":", 1)[0] if ":" in raw else raw
+    owner = file_to_owner.get(file)
+    if owner is None:
+        _log.warning(
+            "Phase 5b' finding from reviewer %s on unowned file %s — routing fix to PM %s",
+            finding.reviewer,
+            file,
+            pm,
+        )
+        return pm
+    return owner
+
+
+# F12 (audit cleanup): map a CI-mirror check name to the abandonment-reason
+# enum value that best describes its failure category. The reasons enum
+# is documented in scripts/abandonment.VALID_REASONS and migrations/005.
+#
+# Ordering matters for the multi-category case — see `_pick_highest_reason`.
+_CHECK_TO_REASON = {
+    "ruff_check": "lint_failed",
+    "ruff_format": "lint_failed",
+    "bandit": "security_failed",
+    "pip_audit": "sca_failed",
+    "tests": "tests_unrecoverable",
+}
+
+# Highest-severity first: when multiple checks fail in the same wave, we
+# pick the most severe category so the abandonment is taxonomically right
+# (a test break shadows a lint break, a security break shadows an SCA
+# break, etc.). The order is fixed deterministically:
+#   tests_unrecoverable > security_failed > sca_failed > lint_failed
+_REASON_SEVERITY_ORDER = (
+    "tests_unrecoverable",
+    "security_failed",
+    "sca_failed",
+    "lint_failed",
+)
+
+
+def _pick_highest_reason(failed_checks: list[str]) -> str:
+    """Map ``failed_checks`` → the single highest-severity abandonment reason.
+
+    Unrecognised check names fall back to ``tests_unrecoverable`` so a
+    mystery break still surfaces with a plausible category (and the detail
+    string carries the raw check names so triage can see the truth).
+    """
+    reasons = {_CHECK_TO_REASON.get(name, "tests_unrecoverable") for name in failed_checks}
+    for r in _REASON_SEVERITY_ORDER:
+        if r in reasons:
+            return r
+    return "tests_unrecoverable"
+
+
+def _diff_ci_results(
+    baseline: dict[str, dict] | None,
+    current: dict[str, dict],
+) -> tuple[list[str], list[str]]:
+    """Split current-wave failures into cycle-introduced vs. pre-existing.
+
+    F10 (audit cleanup): a CI mirror runs at every Phase 4 wave boundary.
+    Without a baseline, ANY ``status == "fail"`` aborts the cycle — which
+    means a host with a pre-existing ruff lint debt (or a stale pip-audit
+    CVE) causes every kaizen run to abandon, regardless of whether the
+    cycle's edits introduced the breakage.
+
+    Returns a 2-tuple ``(cycle_introduced, pre_existing)`` keyed by check
+    name. A check fails as "cycle-introduced" iff its current status is
+    ``fail`` AND its baseline status (when baseline is non-None) was NOT
+    ``fail``. When ``baseline`` is None every fail is treated as
+    cycle-introduced — there is no baseline to diff against.
+    """
+    cycle_introduced: list[str] = []
+    pre_existing: list[str] = []
+    for name, result in current.items():
+        if result.get("status") != "fail":
+            continue
+        if baseline is not None and baseline.get(name, {}).get("status") == "fail":
+            pre_existing.append(name)
+        else:
+            cycle_introduced.append(name)
+    return cycle_introduced, pre_existing

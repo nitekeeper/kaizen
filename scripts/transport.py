@@ -1,22 +1,25 @@
-"""``KAIZEN_TRANSPORT`` selector — bridge (default) vs host (M8 strangler-fig).
+"""``KAIZEN_TRANSPORT`` selector — host (default) vs bridge (M8 strangler-fig).
 
 M8 replaces kaizen's SQLite queue-bridge with atelier v1.10.0's deterministic
 host engine via a strangler-fig migration. This module is the SINGLE place the
 transport is resolved, so the wiring lands behind one flag:
 
-  * ``bridge`` (DEFAULT, unset/empty/whitespace) — the existing SQLite
-    queue-bridge dispatch. Byte-for-byte unchanged.
-  * ``host`` — the in-process atelier host engine. The Phase-4 implementation-wave
-    executor (:func:`scripts.host_executor.host_cycle_executor`) is wired +
-    e2e-tested, and M8's glue PR connects it to the top-level ``kaizen:improve``
-    flow at the SUBAGENT-SKILL layer: the Phase 1-3 meeting produces the
-    Action-Items DAG in-prose, then :mod:`scripts.host_cycle_entry` hands that DAG
-    to the executor. :func:`require_wired_transport` is therefore a SCOPED guard
-    (``allow_host``): it resolves ``host`` cleanly for the wired
-    ``scripts.host_cycle_entry`` path, but still raises :class:`NotImplementedError`
-    for the run.py Python ``cycle_executor`` slot, which has no host branch + no
-    DAG source (M8c / Option-B territory). It deliberately does NOT silently fall
-    back to ``bridge`` — that would mask the flag.
+  * ``host`` (DEFAULT, unset/empty/whitespace) — the in-process atelier host
+    engine, live-validated in M8b and now the default dispatch path. The Phase-4
+    implementation-wave executor
+    (:func:`scripts.host_executor.host_cycle_executor`) is wired + e2e-tested,
+    and M8's glue PR connects it to the top-level ``kaizen:improve`` flow at the
+    SUBAGENT-SKILL layer: the Phase 1-3 meeting produces the Action-Items DAG
+    in-prose, then :mod:`scripts.host_cycle_entry` hands that DAG to the executor.
+    :func:`require_wired_transport` is therefore a SCOPED guard (``allow_host``):
+    it resolves ``host`` cleanly for the wired ``scripts.host_cycle_entry`` path,
+    but still raises :class:`NotImplementedError` for the run.py Python
+    ``cycle_executor`` slot, which has no host branch + no DAG source (M8c /
+    Option-B territory). It deliberately does NOT silently fall back to
+    ``bridge`` — that would mask the flag.
+  * ``bridge`` — the legacy SQLite queue-bridge dispatch. This is now the
+    EXPLICIT opt-out (set ``KAIZEN_TRANSPORT=bridge``); still reachable +
+    byte-for-byte unchanged, and slated for removal in M8c-2.
 
 Any other value raises :class:`UnknownTransportError` (fail-loud, mirroring
 atelier's ``scripts.dispatch.resolve_transport``): a typo or a stale value in
@@ -51,7 +54,7 @@ class UnknownTransportError(RuntimeError):
         valid = ", ".join(sorted(VALID_TRANSPORTS))
         super().__init__(
             f"{TRANSPORT_ENV_VAR}={transport!r} is not a recognized transport; "
-            f"valid values: {valid} (unset/empty defaults to {TRANSPORT_BRIDGE!r})"
+            f"valid values: {valid} (unset/empty defaults to {TRANSPORT_HOST!r})"
         )
         self.transport = transport
 
@@ -59,9 +62,9 @@ class UnknownTransportError(RuntimeError):
 def resolve_transport(env: Mapping[str, str] | None = None) -> str:
     """Resolve the dispatch transport from ``KAIZEN_TRANSPORT``.
 
-    Returns ``"bridge"`` when the var is unset / empty / whitespace. Returns
-    ``"host"`` when explicitly set to ``host``. Any other value raises
-    :class:`UnknownTransportError`.
+    Returns ``"host"`` when the var is unset / empty / whitespace (the M8c
+    DEFAULT). Returns ``"bridge"`` when explicitly set to ``bridge`` (the
+    legacy opt-out). Any other value raises :class:`UnknownTransportError`.
 
     ``env`` defaults to ``os.environ``; pass an explicit mapping in tests.
     """
@@ -69,7 +72,7 @@ def resolve_transport(env: Mapping[str, str] | None = None) -> str:
         env = os.environ
     raw = (env.get(TRANSPORT_ENV_VAR) or "").strip()
     if not raw:
-        return TRANSPORT_BRIDGE
+        return TRANSPORT_HOST
     if raw not in VALID_TRANSPORTS:
         raise UnknownTransportError(raw)
     return raw
@@ -85,7 +88,7 @@ def require_wired_transport(
     M8 wires ``host`` at the SUBAGENT-SKILL layer: the Phase 1-3 meeting produces
     the Action-Items DAG in-prose, then :mod:`scripts.host_cycle_entry` hands that
     DAG to :func:`scripts.host_executor.host_cycle_executor`. That is the ONE wired
-    host entrypoint. The run.py Python ``cycle_executor`` slot (mode=team / default)
+    host entrypoint. The run.py Python ``cycle_executor`` slot (mode=team)
     has NO host branch and NO orchestrator-side DAG source — selecting ``host``
     THERE would silently route into a path that cannot produce ``action_items``
     (the M8c / Option-B territory the glue PR deliberately defers).
@@ -109,9 +112,9 @@ def require_wired_transport(
             f"subagent-SKILL layer via scripts.host_cycle_entry (which produces the "
             f"Action-Items DAG orchestrator-side and hands it to "
             f"host_cycle_executor). The run.py Python cycle-executor slot "
-            f"(mode=team/default) has NO host branch and NO DAG source — routing "
+            f"(mode=team) has NO host branch and NO DAG source — routing "
             f"{TRANSPORT_HOST!r} there is M8c (Option-B) territory and is NOT yet "
-            f"connected. Use the default {TRANSPORT_BRIDGE!r} transport here, or "
+            f"connected. Use the explicit {TRANSPORT_BRIDGE!r} transport here, or "
             f"invoke scripts.host_cycle_entry (which passes allow_host=True)."
         )
     return transport

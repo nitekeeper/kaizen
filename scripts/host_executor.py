@@ -1,7 +1,7 @@
 """Host transport (M8a-2a) — Phase-4 implementation waves via atelier's engine.
 
 This is the ``KAIZEN_TRANSPORT=host`` execution path for Phase 4 (the
-implementation waves) of a kaizen cycle. Where the default ``bridge`` transport
+implementation waves) of a kaizen cycle. Where the explicit ``bridge`` transport
 dispatches Phase-4 implementers through CC Agent-Teams + the SQLite queue, the
 host transport translates the SAME validated Action-Items DAG into atelier
 v1.10.0's deterministic-host engine task dicts and drives
@@ -62,40 +62,40 @@ from typing import Any
 from scripts.atelier_engine import assert_engine_available, atelier_engine
 from scripts.ci_runner import parse_pytest_pass_count, run_ci_checks
 from scripts.cycle_git import commit_cycle_and_sha
+
+# REUSE VERBATIM (no edits — per the M8a-2b spec): the byte-sensitive reviewer
+# finding-line parser (`_parse_reviewer_response`) and the finding->implementer
+# owner router (`_find_owner_for_finding`). Both are pure kaizen helpers that
+# live in `scripts.fix_loop` (relocated there from team_executor in M8c-1);
+# importing them (rather than re-implementing) keeps host and team modes parsing
+# the IDENTICAL `[severity] file:line — text` grammar and routing fixes to the
+# SAME owner index. fix_loop does not import host_executor, so there is no
+# import cycle.
+#
+# M8a-2c: the CI-mirror gate + abandonment-reason mapping reuse team mode's
+# byte-identical baseline-diff + reason helpers. `run_ci_checks` /
+# `parse_pytest_pass_count` (ci_runner) and `_diff_ci_results` /
+# `_pick_highest_reason` (fix_loop) are imported HERE, at module top,
+# OUTSIDE any `atelier_engine()` window — the CI gate + commit run at the
+# OUTSIDE-window return seam by construction, so these are never reached while
+# `scripts` resolves to atelier. (`_pick_highest_reason` encapsulates
+# fix_loop's `_CHECK_TO_REASON` map, so host and team modes emit the
+# IDENTICAL per-check → abandonment-reason taxonomy — the §7 #7 parity test
+# anchors that against `_CHECK_TO_REASON` directly.)
 from scripts.fix_loop import (
     _BLOCKING_SEVERITIES,
     Finding,
     FixLoopState,
+    _diff_ci_results,
+    _find_owner_for_finding,
+    _parse_reviewer_response,
+    _pick_highest_reason,
     build_abandonment_outcome,
     record_findings,
     should_continue,
     start_iteration,
 )
 from scripts.reviewers import InsufficientRosterError, select_reviewers
-
-# REUSE VERBATIM (no edits — per the M8a-2b spec): the byte-sensitive reviewer
-# finding-line parser and the finding->implementer owner router. Both are pure
-# kaizen helpers in team_executor; importing them (rather than re-implementing)
-# keeps host and team modes parsing the IDENTICAL `[severity] file:line — text`
-# grammar and routing fixes to the SAME owner index. team_executor does not
-# import host_executor, so there is no import cycle.
-#
-# M8a-2c: the CI-mirror gate + abandonment-reason mapping reuse team mode's
-# byte-identical baseline-diff + reason helpers. `run_ci_checks` /
-# `parse_pytest_pass_count` (ci_runner) and `_diff_ci_results` /
-# `_pick_highest_reason` (team_executor) are imported HERE, at module top,
-# OUTSIDE any `atelier_engine()` window — the CI gate + commit run at the
-# OUTSIDE-window return seam by construction, so these are never reached while
-# `scripts` resolves to atelier. (`_pick_highest_reason` encapsulates
-# team_executor's `_CHECK_TO_REASON` map, so host and team modes emit the
-# IDENTICAL per-check → abandonment-reason taxonomy — the §7 #7 parity test
-# anchors that against `_CHECK_TO_REASON` directly.)
-from scripts.team_executor import (
-    _diff_ci_results,
-    _find_owner_for_finding,
-    _parse_reviewer_response,
-    _pick_highest_reason,
-)
 
 _log = logging.getLogger("kaizen.host_executor")
 

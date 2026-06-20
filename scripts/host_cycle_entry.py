@@ -36,7 +36,7 @@ Flow (Option A — wire host at the SKILL layer, NOT run.py):
           different thing entirely: it fires only for the semantic DAG gates on a
           WELL-shaped DAG, never for a shape error.)
        c. computes ``existing_files`` from the clone (REUSE
-          ``scripts.team_executor._collect_existing_files`` — the same source the
+          ``scripts.cycle._collect_existing_files`` — the same source the
           team path feeds to ``validate_dag`` gate 3).
        d. calls :func:`scripts.host_executor.host_cycle_executor` (which runs Phase
           4 + the Phase 5b' review→fix loop + the CI-mirror gate AND commits
@@ -159,15 +159,17 @@ def run_host_cycle(
     production it defaults to ``None`` → atelier's ``real_cli_runner`` in-window.
     """
     # (a) Transport guard — host is wired ONLY for this entrypoint (RISK-4).
-    # Rejects KAIZEN_TRANSPORT=bridge/unset (this script must not run them) and
-    # surfaces UnknownTransportError for a typo.
+    # Unset/empty now resolves to host (the default), which this entry runs;
+    # explicit KAIZEN_TRANSPORT=bridge is rejected here (the bridge path runs
+    # the cycle in-prose, not via this script) and a typo surfaces
+    # UnknownTransportError.
     transport = require_wired_transport(env, allow_host=True)
     if transport != "host":
         raise NotImplementedError(
-            f"scripts.host_cycle_entry runs ONLY under KAIZEN_TRANSPORT=host; "
-            f"resolved transport={transport!r}. The bridge/default path runs the "
-            f"cycle in-prose (see internal/cycle/SKILL.md) — do not invoke this "
-            f"entry for it."
+            f"scripts.host_cycle_entry runs ONLY under KAIZEN_TRANSPORT=host "
+            f"(now the default); resolved transport={transport!r}. The bridge "
+            f"path runs the cycle in-prose (see internal/cycle/SKILL.md) — do "
+            f"not invoke this entry for it."
         )
 
     # (b) Load + fail-fast shape check on the kaizen-native DAG.
@@ -182,7 +184,7 @@ def run_host_cycle(
 
     # (c) Compute existing_files from the clone — REUSE the team path's source so
     # validate_dag gate 3 (reads satisfiable) sees the SAME file set.
-    from scripts.team_executor import _collect_existing_files
+    from scripts.cycle import _collect_existing_files
 
     existing_files = _collect_existing_files(Path(clone_dir))
 

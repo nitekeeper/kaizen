@@ -109,7 +109,11 @@ def should_continue(state: FixLoopState, pm_accepts_remaining: bool = False) -> 
     return bool(blocking)
 
 
-def _summarise_convergence(state: FixLoopState, peer_unconfirmed: set[str] | None = None) -> str:
+def _summarise_convergence(
+    state: FixLoopState,
+    peer_unconfirmed: set[str] | None = None,
+    non_routable: set[str] | None = None,
+) -> str:
     """Build a human-readable convergence summary from the history.
 
     ``peer_unconfirmed`` (M8a-2c LOW-1) is the set of blocker/major finding_ids
@@ -117,6 +121,12 @@ def _summarise_convergence(state: FixLoopState, peer_unconfirmed: set[str] | Non
     disclosure clause is appended; when None or empty NOTHING is appended (so the
     summary shape is unchanged for the common path). Disclosure is neutral — it
     does not editorialize on whether the findings are real.
+
+    ``non_routable`` (M8b Bug#4) is the set of blocker/major finding_ids whose
+    target was a directory / non-file and so could NOT be dispatched to a
+    file-owner writer. When NON-EMPTY a disclosure clause naming them is appended;
+    these are the findings that GUARANTEED non-convergence (no writer could ever
+    fix them), so the exhaustion is explained rather than mysterious.
     """
     iterations = state.iteration
     latest = state.history[-1] if state.history else []
@@ -144,6 +154,9 @@ def _summarise_convergence(state: FixLoopState, peer_unconfirmed: set[str] | Non
     if peer_unconfirmed:
         ids = ", ".join(sorted(peer_unconfirmed))
         summary += f" Not peer-confirmed (single-reviewer): {ids}."
+    if non_routable:
+        ids = ", ".join(sorted(non_routable))
+        summary += f" Non-routable (directory/non-file target, no file-owner writer): {ids}."
     return summary
 
 
@@ -152,6 +165,7 @@ def build_abandonment_outcome(
     subject: str | None,
     participants: list[str],
     peer_unconfirmed: set[str] | None = None,
+    non_routable: set[str] | None = None,
 ) -> dict:
     """Construct the cycle's abandonment-outcome dict for the orchestrator.
 
@@ -206,7 +220,7 @@ def build_abandonment_outcome(
     latest = state.history[-1] if state.history else []
     unresolved_findings = [asdict(f) for f in latest]
     reviewer_attribution = {f.finding_id: f.reviewer for f in latest}
-    convergence_summary = _summarise_convergence(state, peer_unconfirmed)
+    convergence_summary = _summarise_convergence(state, peer_unconfirmed, non_routable)
     detail = (
         f"Phase 5b' fix loop exhausted after {state.iteration} iteration(s) "
         f"with {len(latest)} unresolved finding(s). {convergence_summary}"

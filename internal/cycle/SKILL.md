@@ -11,47 +11,17 @@ A single Kaizen improvement cycle. Mirrors atelier's `internal/self-improve/SKIL
 
 The clone already exists when this skill is invoked — `internal/clone-target/SKILL.md` set it up. The run branch is already checked out — `internal/run/SKILL.md` created it. This skill operates inside that environment.
 
-## Execution modes
+## Execution
 
-Kaizen supports two agent coordination modes, selected via `--mode` on `kaizen:improve`:
+Cycles run in **subagent mode**: each Phase 2 participant is a separate fire-and-forget `Agent` tool call (one-shot dispatch, no shared state between agents); Phase 3 synthesis happens in the orchestrating agent's context. The mode does not change the cycle's logical structure (Phase 1–5).
 
-| Mode | Mechanism | Env requirement |
-|---|---|---|
-| `subagent` (default) | Fire-and-forget `Agent` tool calls — one-shot dispatch, no shared state between agents | None |
-| `team` | Persistent named team via `TeamCreate` / `SendMessage` / `TeamDelete` — agents carry context across multiple messages within the same cycle | `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` |
-
-The mode does not change the cycle's logical structure (Phase 1–5). It only changes how agents are dispatched in Phase 2 (pre-analysis) and Phase 3 (synthesis meeting):
-
-- **subagent mode:** each Phase 2 participant is a separate `Agent` call; Phase 3 synthesis happens in the orchestrating agent's context.
-- **team mode:** `TeamCreate` opens a named team at cycle start; `SendMessage` briefs each participant; debate happens via `SendMessage` exchanges; `TeamDelete` closes the team at cycle end.
-
-When `mode='team'` and `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` is absent, `scripts/team_executor.py::team_cycle_executor` raises `TeamToolsUnavailableError` before any clone work begins.
-
-For the production wrapper — `scripts.cc_tool_bridge.QueueBridgeWrapper` and the SQLite-queue protocol the orchestrating session implements — see the "Team mode bridge protocol" section in `skills/improve/SKILL.md`.
-
-For `mode='team'`, the orchestrating agent provides a `TeamTools` wrapper
-by subclassing `scripts.team_tools_wrapper.AgentTeamsWrapper` and
-overriding `team_create` / `send_message` / `team_delete` to invoke the
-real CC tools. Tests inject `RecordingWrapper` for harness coverage.
-
-The dispatch templates the wrapper sends are exported from
-`scripts.dispatch_templates` — each is a pure function with explicit
-required-kwarg validation. Templates correspond 1:1 with the Phase 1-5c
-dispatch points in `scripts.team_executor`.
-
-The reference subclass `examples.agent_teams_wrapper_example.CallbackWrapper`
-shows the production wiring pattern: 3 callbacks passed via constructor,
-each invoking the corresponding CC tool from the orchestrating session's
-context. The end-to-end integration test
-`tests/test_end_to_end_team_mode.py` exercises the full Phase 1-5c flow
-through `orchestrate_run` with mocked callbacks — proving the Python side
-is complete.
+The dispatch templates are exported from `scripts.dispatch_templates` — each is a pure function with explicit required-kwarg validation, corresponding 1:1 with the Phase 1-5c dispatch points.
 
 ## Loom comms — MANDATORY when available (F16)
 
-When the Loom agent-chat server is available, inter-agent communication over loom-agent-chat is REQUIRED in BOTH modes (CLAUDE.md rule F16; `KAIZEN_LOOM_COMMS=0` is the only opt-out). Loom failures must never block or abort a cycle — on any loom error, note it and continue.
+When the Loom agent-chat server is available, inter-agent communication over loom-agent-chat is REQUIRED (CLAUDE.md rule F16; `KAIZEN_LOOM_COMMS=0` is the only opt-out). Loom failures must never block or abort a cycle — on any loom error, note it and continue.
 
-**Mode scope.** In **team mode** this entire section is handled automatically by `scripts/team_executor.py`: it detects loom, registers the team-lead, creates the channel, injects the loom block into every dispatch at the `_TrackedTools` choke point, and deregisters the team-lead at cycle teardown. Do NOT also perform the numbered steps below by hand in team mode — a manual register would double-register the team-lead. The steps below are **subagent-mode orchestrator duties only**.
+**Scope.** These are the subagent-mode orchestrator's loom duties.
 
 **At cycle start** the subagent-mode orchestrator runs (from the kaizen root):
 
@@ -62,7 +32,7 @@ PYTHONPATH=. python3 scripts/loom_comms.py detect
 - `{"available": false, ...}` (exit 3) → note "loom: unavailable" once and proceed exactly as before. Skip the rest of this section.
 - `{"available": true, "client": "<path>", ...}` (exit 0) → loom comms are mandatory for this cycle:
 
-1. **Obtain the canonical channel name** (single naming authority — the exact name team mode derives; never compose one by hand):
+1. **Obtain the canonical channel name** (single naming authority — the exact name `scripts/loom_comms.py` derives; never compose one by hand):
 
    ```
    PYTHONPATH=. python3 scripts/loom_comms.py channel --run-id <run_id> --cycle <cycle_n>
@@ -79,7 +49,7 @@ PYTHONPATH=. python3 scripts/loom_comms.py detect
 3. **Orchestrator reads the channel between phases** (`python3 <client> read <chan> --as "<assigned>"`, then `mark-read` what it processed) so cross-agent chatter informs synthesis/review decisions.
 4. **Everyone deregisters at run end** — agents per their block; the orchestrator via `python3 <client> deregister --as "<assigned>"`.
 
-F7 is unchanged in team mode: the `SendMessage(to="team-lead", ...)` completion reply remains the ONLY completion signal — loom carries everything else.
+Subagent completion signalling is unchanged by loom: the dispatched `Agent`'s returned final message remains the completion signal — loom carries cross-agent chatter, not completion.
 
 ## Inputs
 
@@ -115,7 +85,7 @@ Return a dict:
 }
 ```
 
-**Host path (`KAIZEN_TRANSPORT=host`).** The outcome dict comes straight from `scripts.host_cycle_entry` stdout — same success shape (`status/subject/commit_sha/minutes_memex_slug/participants`) and same abandoned shape. A `review_unrecoverable` abandonment from the host engine's review→fix loop additionally carries the four review-outcome keys (`review_iteration_count`, `unresolved_findings`, `convergence_summary`, `reviewer_attribution`), exactly as the bridge/team path. **`peer_unconfirmed`** reviewer findings (blocker/major issues that survived without peer cross-confirmation — M8a-2c LOW-1) are surfaced **inside `convergence_summary`**: the host loop folds them into that text when it builds the abandonment. So when you render the abandonment report / cycle minutes (Phase 5d), the `convergence_summary` already names the peer-unconfirmed findings — surface it verbatim. On a clean success no findings survived, so there is nothing peer-unconfirmed to surface and the success dict stays the 5-key shape (no extra fields) — keep the PR-body / minutes render byte-identical to the bridge success path.
+**Host path (`KAIZEN_TRANSPORT=host`).** The outcome dict comes straight from `scripts.host_cycle_entry` stdout — same success shape (`status/subject/commit_sha/minutes_memex_slug/participants`) and same abandoned shape. A `review_unrecoverable` abandonment from the host engine's review→fix loop additionally carries the four review-outcome keys (`review_iteration_count`, `unresolved_findings`, `convergence_summary`, `reviewer_attribution`), exactly as the bridge prose path. **`peer_unconfirmed`** reviewer findings (blocker/major issues that survived without peer cross-confirmation — M8a-2c LOW-1) are surfaced **inside `convergence_summary`**: the host loop folds them into that text when it builds the abandonment. So when you render the abandonment report / cycle minutes (Phase 5d), the `convergence_summary` already names the peer-unconfirmed findings — surface it verbatim. On a clean success no findings survived, so there is nothing peer-unconfirmed to surface and the success dict stays the 5-key shape (no extra fields) — keep the PR-body / minutes render byte-identical to the bridge success path.
 
 ## Procedure
 

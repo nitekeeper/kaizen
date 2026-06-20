@@ -185,49 +185,6 @@ def _evaluate_check(check: dict, repo_root: Path) -> str | None:
     return f"[{check_id}] unsupported check type {check_type!r}"
 
 
-def test_skill_step_3b_invokes_sweep():
-    """SKILL.md Step 3b.3 must invoke the orphan-team sweep.
-
-    Guards GAP-6 resolution (docs/kaizen/2026-05-24-bridge-smoke-3.md):
-    the sweep utility exists but was not wired in until Step 3b.3 was
-    added between the create-run-only step (3b.2) and the detached-spawn
-    step (3b.4). Removing the invocation re-introduces the leak: an
-    orphan team from a prior crashed cycle has no recovery path.
-    """
-    skill_path = REPO_ROOT / "skills" / "improve" / "SKILL.md"
-    text = skill_path.read_text(encoding="utf-8")
-    needle = "python3 -m scripts.sweep_leaked_teams --run-id"
-    assert needle in text, (
-        f"Expected SKILL.md to invoke the leaked-team sweep via the "
-        f"literal '{needle}'. If a refactor moved the invocation or "
-        f"renamed the flag, update this test AND the matching cross-"
-        f"reference in scripts/sweep_leaked_teams.py + "
-        f"docs/design/python-cc-tool-bridge-design.md."
-    )
-
-
-def test_sweep_top_of_file_comment_names_call_site():
-    """scripts/sweep_leaked_teams.py must name its SKILL.md call-site.
-
-    Guards documentation-reality drift (the exact failure mode the
-    safety reviewer caught in run-24 Phase 2: the architect's draft
-    comment claimed Step 1 invoked the sweep when in fact zero call-
-    sites existed). The literal 'Step 3b.3' (the actual canonical call-
-    site under the post-renumber SKILL.md) must appear in the first
-    10 lines so a future grep keeps surfacing the true call-site.
-    """
-    sweep_path = REPO_ROOT / "scripts" / "sweep_leaked_teams.py"
-    with sweep_path.open(encoding="utf-8") as f:
-        head = "".join(next(f) for _ in range(10))
-    needle = "Step 3b.3"
-    assert needle in head, (
-        f"Expected '{needle}' in the first 10 lines of "
-        f"{sweep_path.relative_to(REPO_ROOT)}. The top-of-file comment "
-        f"must name the canonical call-site so doc + code stay in sync. "
-        f"Found instead:\n{head}"
-    )
-
-
 def test_claude_md_invariants_from_fixture():
     """Evaluate every check declared in `tests/fixtures/claude_md_invariants.json`.
 
@@ -323,15 +280,11 @@ def test_documented_python3_commands_carry_pythonpath():
     imports kaizen's `scripts.*` package must set `PYTHONPATH=.` — without it
     the command fails with ModuleNotFoundError when run as documented.
 
-    Whitelist: stdlib-only helpers (`bridge_write.py`), the stdlib-only
-    sqlite3 snippet in expert-roster, and `nohup python3 -m scripts.run_bridged`
-    (covered by the `export PYTHONPATH=.` line above it in Step 3b).
+    Whitelist: the stdlib-only sqlite3 snippet in expert-roster.
     """
     offenders = []
     for path, lineno, line in _doc_command_lines():
         rel = path.relative_to(REPO_ROOT).as_posix()
-        if "python3 scripts/bridge_write.py" in line:
-            continue  # stdlib-only by design (see its module docstring)
         if rel == "internal/expert-roster/SKILL.md" and line.strip().startswith("python3 -c"):
             continue  # this snippet imports json+sqlite3 only (stdlib)
         if "PYTHONPATH=." in line:
@@ -348,53 +301,6 @@ def test_setup_command_documented_with_pythonpath():
     assert "PYTHONPATH=. python3 scripts/setup.py" in text, (
         "Step 1 must document `PYTHONPATH=. python3 scripts/setup.py` — "
         "setup.py imports scripts._tmux_config and fails without it."
-    )
-
-
-def test_bridge_writeback_uses_write_tool_not_shell_interpolation():
-    """The team-mode write-back recipe must route agent-authored prose through
-    a Write-tool temp file, never through shell interpolation (a single
-    apostrophe in teammate prose breaks out of `printf '%s' '<prose>'`)."""
-    text = _IMPROVE_SKILL.read_text(encoding="utf-8")
-    assert "printf '%s'" not in text, (
-        "The printf-single-quote write-back recipe reintroduces shell "
-        "interpolation of untrusted agent prose."
-    )
-    assert "bridge_response_<row.id>.json" in text
-    assert "Write tool" in text
-    # The helper invocation must read the payload from the temp file on stdin.
-    assert "--status ready \\\n     < .ai/bridge_response_<row.id>.json" in text
-    assert "--status error \\\n     < .ai/bridge_response_<row.id>.txt" in text
-
-
-def test_bridge_write_docstring_matches_skill_recipe():
-    """scripts/bridge_write.py's documented invocation must match the SKILL's
-    Write-tool temp-file recipe (doc drift guard)."""
-    head = (REPO_ROOT / "scripts" / "bridge_write.py").read_text(encoding="utf-8")
-    assert "printf" not in head.split('"""')[1], (
-        "bridge_write.py docstring still documents the retired printf pipe."
-    )
-    assert "bridge_response_<row_id>.json" in head
-    assert "Write tool" in head
-
-
-def test_poll_loop_select_includes_created_at():
-    text = _IMPROVE_SKILL.read_text(encoding="utf-8")
-    assert "SELECT id, kind, args_json, created_at FROM bridge_requests" in text, (
-        "Step 1's documented SELECT must return created_at — step 3's "
-        "stale-row handling reads row.created_at."
-    )
-
-
-def test_poll_loop_has_dead_run_exit():
-    """Step 6 (empty queue) must check python_heartbeat and exit the loop
-    when the detached Python process is dead — otherwise S1 spins forever."""
-    text = _IMPROVE_SKILL.read_text(encoding="utf-8")
-    assert "the detached Python process is dead. **Exit the poll loop.**" in text
-    # The dead-run check must reuse the python_heartbeat age query.
-    assert text.count("FROM python_heartbeat WHERE run_id = <RUN_ID>") >= 2, (
-        "Expected the python_heartbeat age query in BOTH step 3 (stale row) "
-        "and step 6 (empty-queue dead-run exit)."
     )
 
 

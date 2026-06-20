@@ -2,10 +2,9 @@
 phase_6_commit_push.md — Phase 6 commit-and-push brief.
 
 NEW template (no current `dispatch_templates.py` function counterpart).
-Phase 5c in `scripts/team_executor.py` currently calls `commit_cycle()`
-directly without a teammate dispatch; this template defines the
-teammate-facing version that AI-4 (wave 2) will wire when commit/push
-becomes a delegated step rather than an inline orchestrator call.
+The cycle commit step calls `commit_cycle()` per the F3 fire-order
+contract below; this template defines the subagent-facing brief for that
+delegated commit/push step.
 
 Required template variables (frontmatter contract — render-shape names):
   - {{ cycle_n }}        — int

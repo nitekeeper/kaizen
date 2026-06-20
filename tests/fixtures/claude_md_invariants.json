@@ -89,14 +89,6 @@
       "any_of_keywords": ["canonical", "verbatim"]
     },
     {
-      "id": "F7-async-pattern",
-      "rationale": "Team-mode teammates communicate via SendMessage; spawn-prompt output is not auto-relayed; teammates MUST NOT just go idle (run 20 smoke / PR#31).",
-      "file": "CLAUDE.md",
-      "type": "all_keywords_in_section",
-      "section": "## Claude operational rules",
-      "keywords": ["SendMessage", "do not just go idle"]
-    },
-    {
       "id": "P2-review-fix",
       "rationale": "Independent reviewer subagent + review→fix→review loop must not be collapsed (kaizen#22 cycle 2 caught 3 silent-data-loss blockers).",
       "file": "CLAUDE.md",

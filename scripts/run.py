@@ -77,7 +77,7 @@ def update_run_branch(
 ) -> None:
     """Update `runs.branch` for `run_id`.
 
-    Used by the team-mode bridge entry path:
+    Used by the run_id (create-run-only) entry path:
 
       * After `create_branch(...)` succeeds in `orchestrate_run`, this
         is called with the real branch name to transition from the
@@ -248,78 +248,6 @@ def cleanup_after_pr(experiment_dir: Path) -> None:
 # ── Orchestrator ───────────────────────────────────────────────────────────
 
 
-def _bridge_timeout_to_abandoned_outcome(exc, *, subject, branch) -> dict:
-    """kaizen#91 — convert a bridge timeout/stall into a cycle-abandoned outcome.
-
-    Reads the read-first snapshot attached to the exception (``exc.snapshot`` —
-    ``None`` for the single-row ``_request`` path) and builds the structured
-    ``status='abandoned'`` dict the cycle loop already records + skip-and-
-    continues on. Also emits a structured stderr line so the capture reaches a
-    human via the run_bridged log even if the later DB write fails.
-
-    Capture-only: it never resumes, commits, or pushes the survived work — the
-    branch name is a manual-recovery POINTER. ``reason='bridge_timeout'`` (the
-    dedicated enum value added by migration 006_bridge_timeout_reason.sql,
-    kaizen#93) makes these incidents filterable
-    (``SELECT * FROM abandonments WHERE reason='bridge_timeout'``) instead of
-    bucketed in ``'other'``; the greppable detail prefix is retained as
-    belt-and-braces so any pre-migration rows (which recorded ``'other'``) stay
-    discoverable by grep. The phase is a best-effort ``'implementation'``
-    default (the bridge layer does not carry the cycle phase — a future
-    refinement could thread the real phase).
-    """
-    snapshot = getattr(exc, "snapshot", None)
-    exc_name = type(exc).__name__
-    if snapshot is not None:
-        classification = snapshot.classification
-        recipients = (
-            ", ".join(snapshot.pending_recipients) if snapshot.pending_recipients else "(none)"
-        )
-        surviving_summary = (
-            f"{snapshot.completed_count} of {snapshot.total} bridge rows completed "
-            f"before the {exc_name}; {snapshot.pending_count} pending "
-            f"(recipients: {recipients})"
-            + (
-                f"; {snapshot.soft_dropped_count} soft-dropped"
-                if snapshot.soft_dropped_count
-                else ""
-            )
-        )
-        participants = list(snapshot.pending_recipients)
-    else:
-        classification = "true_stall"
-        surviving_summary = f"single-row bridge call raised {exc_name}; no batch progress snapshot"
-        participants = []
-
-    # The recoverable branch name leads the detail string so it survives the
-    # 200-char truncation in scripts/pr.py and reaches the DB `detail` column +
-    # the bundled PR body — not just the stderr line below (kaizen#91 review).
-    detail = (
-        f"bridge {exc_name} ({classification}); recoverable branch: {branch}; "
-        f"{surviving_summary}. ({exc})"
-    )
-
-    # Always-available capture surface: the run_bridged subprocess log that the
-    # orchestrator session tails. Fires even if the DB write below fails.
-    print(
-        f"[kaizen#91] bridge abandonment captured — {classification}; "
-        f"recoverable branch: {branch}; {surviving_summary}",
-        file=sys.stderr,
-    )
-
-    return {
-        "status": "abandoned",
-        "phase_reached": "implementation",
-        "reason": "bridge_timeout",
-        "detail": detail,
-        "participants": participants,
-        "artifacts": [branch] if branch else [],
-        "recoverable_artifact": branch,
-        "progress_classification": classification,
-        "surviving_summary": surviving_summary,
-    }
-
-
 def orchestrate_run(
     db_path: str,
     git_url: str,
@@ -328,30 +256,18 @@ def orchestrate_run(
     cycle_executor=None,
     mode: str = "subagent",
     *,
-    tools_provider=None,
     run_id: int | None = None,
 ) -> dict:
     """Full multi-cycle orchestration. See module docstring for the flow.
 
     `cycle_executor(clone_dir, project, run_row, cycle_n) -> dict` is the
-    per-cycle callback. When None, the executor is selected based on `mode`:
-      - mode='subagent' (default): uses `scripts.cycle.execute_cycle` (Wave 4
-        stub — tests must inject a real executor).
-      - mode='team': uses `scripts.team_executor.team_cycle_executor`, which
-        requires CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 in the environment.
+    per-cycle callback. When None, the executor defaults to
+    `scripts.cycle.execute_cycle` (a Wave 4 stub — the real subagent cycle
+    runs via SKILL prose → host_cycle_entry; tests inject their own
+    executor). Passing an explicit `cycle_executor` overrides the default.
 
-    Passing an explicit `cycle_executor` overrides `mode` selection — useful
-    for testing.
-
-    `tools_provider` is a `Callable[[Path, dict, dict, int], TeamTools] | None`
-    invoked once per cycle to build the `TeamTools` wrapper passed as the
-    `tools=` keyword arg into `team_cycle_executor`. It is REQUIRED when
-    `mode='team'` (the team executor cannot construct CC session-tool
-    wrappers itself — Python cannot directly call Claude Code session
-    tools). When `mode='subagent'` `tools_provider` is silently IGNORED for
-    minimum surprise. When `mode='team'` and `tools_provider` is None, the
-    orchestrator raises `ValueError` BEFORE any clone / seed / branch / run
-    row side effect so the failure leaves no garbage on disk or in the DB.
+    `mode` is retained as a single-valued ("subagent") parameter for result-
+    shape stability; it is echoed back in the result dict.
 
     Returns a dict with the state Wave 5 needs to render and open the PR:
       run_id, project_id, branch, clone_dir, experiment_dir,
@@ -360,7 +276,6 @@ def orchestrate_run(
     """
     # Local imports keep cycle.py / clone.py / etc. optional at import time.
     from scripts.abandonment import VALID_PHASES, VALID_REASONS, process_abandonment
-    from scripts.cc_tool_bridge import BridgeStallError, BridgeTimeoutError
     from scripts.clone import cleanup_experiment, clone_repo
     from scripts.cycle import (
         execute_cycle as default_executor,
@@ -374,18 +289,8 @@ def orchestrate_run(
     from scripts.project import get_project_by_url
     from scripts.seed_atelier_in_clone import seed_all
 
-    # Did the caller supply their own executor? Used by the bridge guard
-    # below — explicit-executor callers (tests injecting stubs) bypass the
-    # tools_provider requirement because they are wiring the cycle work
-    # themselves and may not need the real team_cycle_executor at all.
-    executor_was_injected = cycle_executor is not None
     if cycle_executor is None:
-        if mode == "team":
-            from scripts.team_executor import team_cycle_executor
-
-            cycle_executor = team_cycle_executor
-        else:
-            cycle_executor = default_executor
+        cycle_executor = default_executor
 
     # 1. Resolve project
     project = get_project_by_url(db_path, git_url)
@@ -393,27 +298,6 @@ def orchestrate_run(
         raise RuntimeError(
             f"No project registered for {git_url!r}. Register it first:\n"
             f"  python3 scripts/project.py register {git_url}"
-        )
-
-    # 1b. Bridge guard — team mode without a tools_provider would crash deep
-    # inside `team_cycle_executor`'s preflight (tools is None →
-    # TeamToolsUnavailableError) AFTER cloning, seeding atelier, branching,
-    # and creating a run row. Fire here so the failure leaves NO side
-    # effects on disk or in the DB.
-    #
-    # The guard ONLY fires when the caller did NOT inject their own
-    # `cycle_executor`. Explicit-executor callers (tests, custom drivers)
-    # are wiring the cycle themselves; for them the tools_provider is
-    # optional and the existing 4-positional-arg signature still works.
-    # This preserves backward compatibility with every existing call site
-    # that injects a stub executor for `mode='team'` to test mode plumbing.
-    if mode == "team" and tools_provider is None and not executor_was_injected:
-        raise ValueError(
-            "mode='team' requires a tools_provider callable to construct the "
-            "TeamTools wrapper for each cycle. Without it, team_cycle_executor "
-            "crashes deep inside the cycle. Pass "
-            "tools_provider=lambda clone_dir, project, run_row, cycle_n: ... "
-            "or use mode='subagent' instead."
         )
 
     # M1 (review round 1): Bridge entry path's `run_id` existence guard
@@ -508,36 +392,7 @@ def orchestrate_run(
         # H3: finalize the run as failed so the row never sticks at status='running'.
         for cycle_n in range(1, cycles_requested + 1):
             cycle_started = _now()
-            # Team mode threads a per-cycle TeamTools wrapper into the
-            # executor via the `tools=` kwarg. Subagent mode preserves the
-            # 4-positional-arg call signature for backward compatibility
-            # with any existing executor callable (including the default
-            # `scripts.cycle.execute_cycle`).
-            #
-            # kaizen#91 — read-first capture. A bridge per-call timeout /
-            # cycle wall-clock / heartbeat stall raises BridgeTimeoutError or
-            # BridgeStallError from deep inside the executor's bridge dispatch.
-            # Without this guard it propagates to the blanket `except Exception`
-            # below, which blanks the branch to '<failed>', finalizes
-            # status='failed', and re-raises — crashing the whole run and
-            # discarding the teammate work that DID complete before the trip
-            # (the run-53 failure mode). Convert it into a proper cycle
-            # abandonment instead: the in-flight work is captured into the
-            # report (e.snapshot), the next cycle still runs (working-rule 3),
-            # and the run finalizes with a PR referencing the report rather
-            # than a bare crash. team_cycle_executor's `finally` has already
-            # torn down the team before the exception reached us, so no
-            # teammate leaks across into the next cycle.
-            try:
-                if mode == "team" and tools_provider is not None:
-                    tools = tools_provider(experiment_dir, project, run_row, cycle_n)
-                    outcome = cycle_executor(experiment_dir, project, run_row, cycle_n, tools=tools)
-                else:
-                    outcome = cycle_executor(experiment_dir, project, run_row, cycle_n)
-            except (BridgeTimeoutError, BridgeStallError) as bridge_exc:
-                outcome = _bridge_timeout_to_abandoned_outcome(
-                    bridge_exc, subject=subject, branch=branch
-                )
+            outcome = cycle_executor(experiment_dir, project, run_row, cycle_n)
 
             if outcome.get("status") == "success":
                 record_cycle_success(
@@ -729,17 +584,17 @@ def orchestrate_run(
 
 
 def _cmd_create_run_only(argv: list[str], db_path: str = ".ai/memex.db") -> int:
-    """`create-run-only <git_url> <cycles> <subject>` — bridge entry helper.
+    """`create-run-only <git_url> <cycles> <subject>` — pre-create a `runs` row.
 
-    The orchestrating Claude session calls this BEFORE spawning the
-    detached Python (`scripts/run_bridged.py`). It looks up the project
-    by URL — **fails loudly** with a registration hint when no project
-    matches (Decision D3: fail loudly, do NOT auto-register) — then
-    creates a `runs` row with the placeholder `branch='<pending>'`.
+    Looks up the project by URL — **fails loudly** with a registration
+    hint when no project matches (Decision D3: fail loudly, do NOT
+    auto-register) — then creates a `runs` row with the placeholder
+    `branch='<pending>'`.
 
     On success: prints ONLY the new run_id on stdout (no other text),
-    exits 0. `scripts/run_bridged.py` reads this single line into a
-    shell variable.
+    exits 0, so a caller can read the single line into a shell variable.
+    (Historically the bridge entry point used this; the bridge is gone,
+    so this subcommand is retained only as a dev-test convenience.)
     """
     from scripts.project import get_project_by_url
 
@@ -795,7 +650,7 @@ def main(argv: list[str]) -> int:
     if not argv or argv[0] != "orchestrate":
         print(
             "Usage:\n"
-            '  run.py orchestrate <git-url> [--cycles N] [--subject "..."] [--mode subagent|team]\n'
+            '  run.py orchestrate <git-url> [--cycles N] [--subject "..."]\n'
             "  run.py create-run-only <git-url> <cycles> [<subject>]",
             file=sys.stderr,
         )
@@ -805,7 +660,6 @@ def main(argv: list[str]) -> int:
     parser.add_argument("git_url")
     parser.add_argument("--cycles", type=int, default=1)
     parser.add_argument("--subject", default=None)
-    parser.add_argument("--mode", choices=("subagent", "team"), default="subagent")
     ns = parser.parse_args(argv[1:])
 
     db_path = ".ai/memex.db"
@@ -816,7 +670,6 @@ def main(argv: list[str]) -> int:
         git_url=ns.git_url,
         cycles_requested=ns.cycles,
         subject=ns.subject,
-        mode=ns.mode,
     )
     # Path objects aren't JSON serialisable
     result = {k: (str(v) if isinstance(v, Path) else v) for k, v in result.items()}

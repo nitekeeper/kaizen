@@ -104,20 +104,6 @@ The fix is trivial — use the variable, not the typed string — but the bug cl
 
 **See also.** F3 (the sibling fire-order rule — together they account for the two most common hand-orchestration failure modes).
 
-### F7 — Team-mode async pattern
-
-**Rule.** Every teammate-spawn prompt issued via `Agent({ team_name: ... })` MUST end with an explicit instruction telling the teammate to call `SendMessage(to="team-lead", ...)` on completion, and explicitly NOT to "just go idle." Apply this to every teammate, every phase, every wave — no exceptions.
-
-**Why.** In Claude Code's team mode, the spawn prompt's output is NOT auto-relayed back to the spawning agent. The teammate finishes its work, writes a response, and that response goes into the void unless the teammate explicitly calls `SendMessage`. The spawning agent (team lead) cannot poll for results; it must be messaged.
-
-Without the explicit instruction, a teammate that follows its default "produce output and stop" pattern will silently stall the team — the team lead blocks waiting for an inbox message that never comes. The cycle hangs, often for hours, until a human intervenes.
-
-The cheap fix is the explicit instruction at the bottom of every spawn prompt. Make it boilerplate.
-
-**Originating incident.** Run 20 smoke / PR#31 (kaizen, 2026-05-23) — an architect teammate finished its analysis, wrote a polished output, and stopped. The team lead waited indefinitely. Filed as `feedback-cc-team-mode-async-pattern`.
-
-**See also.** F8 (the sibling CC-team-mode rule about TeamDelete); `internal/team-spawn/SKILL.md` for the canonical spawn-prompt template.
-
 ### F9 — Review-fix loop must not collapse
 
 **Rule.** Every cycle MUST run an independent reviewer subagent with a different persona from the implementer, and the `review → fix → review → fix → …` loop MUST run until no issues remain. Do not skip the loop because the implementer self-reviewed green. Do not stop at the first review if it found issues that were "trivially fixed" — re-review after the fix.
@@ -175,18 +161,6 @@ For kaizen specifically, the cycle architecture *requires* the PR — abandonmen
 
 **See also.** GitHub branch protection settings on this repo (currently: `main` requires PR, requires CI green).
 
-### F8 — TeamDelete is per-session
-
-**Rule.** `TeamDelete` uses the *current session's* team context. A fresh session cannot delete teams created in other sessions. Cross-session orphan cleanup uses filesystem removal (`rm -rf ~/.claude/teams/<name>/`) until a future `TeamAttach` primitive lands.
-
-**Why.** Team mode stores team state in the session that created the team. When the session ends, the team is orphaned at the harness level — `TeamDelete` from a new session can't see it. This is not a bug, it's a design choice in Claude Code's team primitives, but it bites whenever a kaizen run dies mid-cycle and the next session has to clean up.
-
-Without this rule, the next-session orchestrator will reach for `TeamDelete`, get a "team not found" error, and assume the orphan is already gone — leaving stale team directories on disk indefinitely.
-
-**Originating incident.** Run 24 smoke #3 / PR#35 (kaizen, 2026-05-23) — a previous session's team persisted as a `~/.claude/teams/<name>/` directory after the session ended. The next session's `TeamDelete` reported success but did not actually remove the directory (because it was operating on a fresh, empty team context). Manual `rm -rf` was needed. Filed as `feedback-cc-teamdelete-per-session`.
-
-**See also.** Claude Code documentation on team scoping; `scripts/cleanup_orphan_teams.py` (if/when written — see Deferred follow-ups).
-
 ### F12 — Delete merged branches
 
 **Rule.** When a branch is merged, delete it. This repo has `delete_branch_on_merge=true` configured at the GitHub level; hand-orchestrated branches that the maintainer creates outside the kaizen flow should be deleted at merge time as well.
@@ -241,7 +215,7 @@ The boundary is narrow: this is *not* a general "skip atelier" license. If `atel
 
 **Confabulated supervision.** A related failure observed at origin: reporting a subagent's runtime or liveness from a single terse harness message (e.g. treating a "tool use rejected" string as proof the agent "never ran") instead of measuring it. The harness message is not ground truth about what executed; when the actual state is unknown, say so and verify — do not narrate unobserved internal state with false confidence.
 
-**The guard fires "go observe," not "kill."** The most damaging failure at origin: when the deadline guard fired, the orchestrator treated it as an automatic kill switch and `TaskStop`'d the reviewer **without reading its transcript** — which had logged `"I have what I need. Let me grab the final tally quickly and clean up."`, i.e. it was ~30 seconds from delivering a complete review. The refusal to read was rationalized as "the JSONL will overflow my context," but the transcript was 37 lines / 128 KB — trivially readable. The rule: on guard-fire (or any anomaly), READ before acting. The `agent-<id>.jsonl` transcript holds the actual progress — current step, tool outputs, partial findings; extract `type==assistant` text blocks plus `tool_result` content with a small `python3`/`jq` pass rather than dumping the raw file. Decide from what you read: nearly done → wait; genuinely stuck → kill. And a killed agent is not lost work — its Iron-Law results and findings are recoverable from the transcript, so mine the JSONL instead of re-running. "Otherwise you will never know what happened and you will never fix the problem." Corollary: **size the budget to the work** — `team_executor`'s tests alone run ~98 s, so an Iron-Law review that runs them on both baseline and fix legitimately needs minutes; a 6-minute guard was too tight and the "why is it slow" was test runtime, not a hang.
+**The guard fires "go observe," not "kill."** The most damaging failure at origin: when the deadline guard fired, the orchestrator treated it as an automatic kill switch and `TaskStop`'d the reviewer **without reading its transcript** — which had logged `"I have what I need. Let me grab the final tally quickly and clean up."`, i.e. it was ~30 seconds from delivering a complete review. The refusal to read was rationalized as "the JSONL will overflow my context," but the transcript was 37 lines / 128 KB — trivially readable. The rule: on guard-fire (or any anomaly), READ before acting. The `agent-<id>.jsonl` transcript holds the actual progress — current step, tool outputs, partial findings; extract `type==assistant` text blocks plus `tool_result` content with a small `python3`/`jq` pass rather than dumping the raw file. Decide from what you read: nearly done → wait; genuinely stuck → kill. And a killed agent is not lost work — its Iron-Law results and findings are recoverable from the transcript, so mine the JSONL instead of re-running. "Otherwise you will never know what happened and you will never fix the problem." Corollary: **size the budget to the work** — some test modules run ~100 s, so an Iron-Law review that runs them on both baseline and fix legitimately needs minutes; a 6-minute guard was too tight and the "why is it slow" was test runtime, not a hang.
 
 **Mechanism.** Dispatch `Agent(run_in_background: true)` → note the agentId + dispatch time → arm a guard (`Bash` `run_in_background` with an `until` timer emitting one notification at the budget, or `Monitor` with `timeout_ms`). The agent's completion notification is the success path (cancel the guard via `TaskStop`); the guard firing first is the intervention trigger.
 
@@ -251,18 +225,18 @@ The boundary is narrow: this is *not* a general "skip atelier" license. If `atel
 
 ## F16 — Mandatory loom-agent-chat inter-agent comms
 
-**Rule.** When the Loom desktop app's agent-chat server is available (auto-detected; `KAIZEN_LOOM_COMMS=0` is the ONLY opt-out), every kaizen team-mode and subagent-mode dispatch MUST carry the loom-comms instruction block, and agents MUST route teammate-to-teammate communication (status updates, clarifications, conflict negotiation, findings summaries) over loom-agent-chat. F7 `SendMessage(to="team-lead", ...)` completion replies are unchanged and remain the ONLY completion signal in team mode. Loom failures degrade gracefully and never abort a cycle.
+**Rule.** When the Loom desktop app's agent-chat server is available (auto-detected; `KAIZEN_LOOM_COMMS=0` is the ONLY opt-out), every kaizen subagent dispatch MUST carry the loom-comms instruction block, and agents MUST route agent-to-agent communication (status updates, clarifications, conflict negotiation, findings summaries) over loom-agent-chat. Subagent completion replies (the dispatched `Agent`'s returned final message) are unchanged and remain the completion signal. Loom failures degrade gracefully and never abort a cycle.
 
-**Why it exists.** Direct user directive (2026-06-11): "when we use the kaizen skill in team/subagent mode, you must use the loom agent chat skill no matter what. this rule must be held as long as the loom is available." Before F16, kaizen had ZERO loom references — neither team mode (`scripts/team_executor.py` dispatches) nor subagent mode (`internal/cycle/SKILL.md`) mentioned loom, so spawned agents never used it even with Loom running. Loom gives the human a live, persistent observability surface over inter-agent chatter (the tmux panes only show each agent's own transcript), and gives agents a peer channel that does not consume the team-lead's context.
+**Why it exists.** Direct user directive (2026-06-11): "when we use the kaizen skill, you must use the loom agent chat skill no matter what. this rule must be held as long as the loom is available." Before F16, kaizen had ZERO loom references — `internal/cycle/SKILL.md` did not mention loom, so spawned agents never used it even with Loom running. Loom gives the human a live, persistent observability surface over inter-agent chatter (the tmux panes only show each agent's own transcript), and gives agents a peer channel that does not consume the orchestrator's context.
 
 **Mechanism.** A single stdlib-only module, `scripts/loom_comms.py`, owns the contract:
 
 1. `find_loom_client()` — locate the bundled `loom_chat.py` client: `KAIZEN_LOOM_CHAT` env pin → bounded-depth glob under `~/.claude/plugins/` → sibling-app fallback `~/apps/loom-agent-chat/`.
 2. `detect_loom()` — one timeout-bounded `detect` probe per process (cached); `KAIZEN_LOOM_COMMS=0` short-circuits to unavailable.
-3. `loom_comms_block(role, channel, client_path)` — the MANDATORY instruction block (register → join → send → inbox-at-phase-boundaries → ≤500-char bodies with `.loom/temp/` pointers for long content → deregister), ending with the load-bearing F7 caveat.
-4. `augment_dispatch(message, role=…, channel=…)` — splices the block immediately BEFORE the F7 trailer (mirroring `_inject_terse_before_trailer` so the trailer stays the prompt's last instruction). Bodies without the trailer — notably the GAP-7 `shutdown_request` STRUCTURED-JSON payload — pass through byte-exact. Never raises.
+3. `loom_comms_block(role, channel, client_path)` — the MANDATORY instruction block (register → join → send → inbox-at-phase-boundaries → ≤500-char bodies with `.loom/temp/` pointers for long content → deregister).
+4. `augment_dispatch(message, role=…, channel=…)` — splices the block immediately BEFORE the dispatch trailer (mirroring `_inject_terse_before_trailer` so the trailer stays the prompt's last instruction). Bodies without the trailer — notably the GAP-7 `shutdown_request` STRUCTURED-JSON payload — pass through byte-exact. Never raises.
 
-**Wiring.** Team mode: the `_TrackedTools` proxy in `scripts/team_executor.py` augments every outgoing `send_message` / `send_message_many` body (single choke point — no per-dispatch-site edits, no F14 template/`_trailer.md` changes, byte-frozen trailer parity preserved); the executor also best-effort registers `team-lead` and creates the per-team channel (`channel_for_team(team_name)`) at cycle start, and deregisters the team-lead's assigned name at cycle teardown. Subagent mode: `internal/cycle/SKILL.md` § "Loom comms — MANDATORY when available (F16)" has the orchestrator run `python3 scripts/loom_comms.py detect` at cycle start, obtain the canonical channel name via `python3 scripts/loom_comms.py channel --run-id <id> --cycle <n>` (single naming authority — `channel_for_run` matches team mode's derivation exactly), and embed `python3 scripts/loom_comms.py block --role <role> --channel <chan>` output in every dispatched Agent prompt.
+**Wiring.** `internal/cycle/SKILL.md` § "Loom comms — MANDATORY when available (F16)" has the orchestrator run `python3 scripts/loom_comms.py detect` at cycle start, obtain the canonical channel name via `python3 scripts/loom_comms.py channel --run-id <id> --cycle <n>` (single naming authority — `channel_for_run`), and embed `python3 scripts/loom_comms.py block --role <role> --channel <chan>` output in every dispatched Agent prompt.
 
 **Degradation contract.** Detect failure, register failure, channel failure, or any subprocess error → log one line, dispatch unaugmented, keep the cycle running. Loom is an observability/coordination layer, never a gate.
 

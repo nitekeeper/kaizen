@@ -5,11 +5,7 @@ Coverage layers (per feedback-test-the-production-caller-not-just-units):
   1. Units — find_loom_client precedence, detect_loom kill-switch /
      failure paths / caching, loom_comms_block content, augment_dispatch
      splice/no-op behaviour, channel slugging, team_lead_setup.
-  2. PRODUCTION CALLER — drive the real `team_cycle_executor` dispatch
-     path with a stubbed TeamTools and assert the wire body that reaches
-     `tools.send_message` carries the loom block and still ENDS with the
-     F7 trailer; GAP-7 shutdown JSON passes through byte-exact.
-  3. Guarded REAL integration — full register→channel→send→inbox→
+  2. Guarded REAL integration — full register→channel→send→inbox→
      deregister roundtrip against a live Loom (KAIZEN_LOOM_LIVE=1 only;
      auto-skips in CI).
 
@@ -25,7 +21,6 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -36,7 +31,6 @@ from scripts.dispatch_templates import (
     phase_2_preanalysis,
     phase_5d_shutdown,
 )
-from scripts.team_executor import team_cycle_executor
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -445,174 +439,6 @@ class TestCli:
         )
         assert proc.returncode == 3
         assert json.loads(proc.stdout)["error"] == "loom unavailable"
-
-
-# ── PRODUCTION CALLER — real team_executor dispatch path ─────────────────
-
-
-class _RecordingTools:
-    """Stub TeamTools that records FULL outgoing message bodies.
-
-    ``batch_sent`` records ONLY bodies that traveled the
-    ``send_message_many`` path so tests can positively pin the batch
-    augmentation independently of the singular path.
-    """
-
-    def __init__(self, scripted: dict[str, str]):
-        self.sent: list[tuple[str, str]] = []  # (to, full message) — all paths
-        self.batch_sent: list[tuple[str, str]] = []  # send_message_many only
-        self.scripted = scripted
-
-    def team_create(self, name, members):
-        return f"team-{name}"
-
-    def send_message(self, team_id, to, message):
-        self.sent.append((to, message))
-        for key, resp in self.scripted.items():
-            if key in message:
-                return resp
-        return "NO ISSUES"
-
-    def send_message_many(self, messages, *, quorum_floor=None):
-        self.batch_sent.extend((m["to"], m["message"]) for m in messages)
-        return [self.send_message(m["team_id"], m["to"], m["message"]) for m in messages]
-
-    def team_delete(self, team_id):
-        pass
-
-    def apply_layout(self, team_id):
-        pass
-
-
-def _run_executor(tmp_path, scripted: dict[str, str]) -> tuple[_RecordingTools, dict]:
-    tools = _RecordingTools(scripted=scripted)
-    with patch.dict(os.environ, {"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1"}):
-        outcome = team_cycle_executor(
-            clone_dir=tmp_path,
-            project={
-                "name": "test-project",
-                "git_url": "https://example.invalid/test.git",
-                "expert_roster": ["pm-1", "backend-engineer-1"],
-                "test_command": "pytest",
-            },
-            run_row={"id": 1, "subject": "loom wiring"},
-            cycle_n=1,
-            tools=tools,
-        )
-    return tools, outcome
-
-
-def _run_executor_phase1_abandon(tmp_path) -> _RecordingTools:
-    tools, outcome = _run_executor(tmp_path, scripted={"Phase 1": "ABANDON: stop here"})
-    assert outcome["status"] == "abandoned"
-    return tools
-
-
-@pytest.fixture
-def loom_lead_stubs(monkeypatch):
-    """Stub the team-lead subprocess helpers; record their calls."""
-    setup_calls: list[tuple[str, str]] = []
-    teardown_calls: list[tuple[str, str]] = []
-    monkeypatch.setattr(
-        loom_comms,
-        "team_lead_setup",
-        lambda client, channel, **kw: setup_calls.append((client, channel)) or "team-lead",
-    )
-    monkeypatch.setattr(
-        loom_comms,
-        "team_lead_teardown",
-        lambda client, assigned: teardown_calls.append((client, assigned)) or True,
-    )
-    return setup_calls, teardown_calls
-
-
-class TestProductionCallerTeamExecutor:
-    """The feature must be ALIVE in the real dispatch path — not just units."""
-
-    def test_dispatch_carries_loom_block_and_trailer_stays_terminal(
-        self, tmp_path, loom_available, loom_lead_stubs
-    ):
-        setup_calls, teardown_calls = loom_lead_stubs
-        tools = _run_executor_phase1_abandon(tmp_path)
-
-        # Team-lead side fired with the derived channel; teardown
-        # deregistered the ASSIGNED name at cycle end.
-        assert setup_calls == [("/fake/loom_chat.py", "kaizen-cycle-1-1")]
-        assert teardown_calls == [("/fake/loom_chat.py", "team-lead")]
-
-        # The Phase-1 dispatch that reached tools.send_message carries the
-        # loom block (exactly once, role + channel substituted) and STILL
-        # ends with the F7 trailer.
-        to, body = tools.sent[0]
-        assert to == "pm-1"
-        assert body.count(_MARKER) == 1
-        assert 'register "pm-1"' in body
-        assert "kaizen-cycle-1-1" in body
-        assert body.endswith(_TRAILER)
-        assert body.index(_MARKER) < body.rindex(_TRAILER)
-
-        # GAP-7 shutdown payload (sent via send_message_many in the cycle
-        # finally block) passes through clean — pure JSON, no loom block.
-        shutdown_bodies = [b for _, b in tools.sent if b.lstrip().startswith('{"type"')]
-        assert shutdown_bodies, "expected a GAP-7 shutdown_request dispatch"
-        for b in shutdown_bodies:
-            parsed = json.loads(b)
-            assert parsed["type"] == "shutdown_request"
-            assert _MARKER not in b
-
-    def test_batch_dispatch_send_message_many_carries_loom_block(
-        self, tmp_path, loom_available, loom_lead_stubs
-    ):
-        """POSITIVE pin on the `send_message_many` augmentation path.
-
-        Phase 2 briefs (and Phase 3 open/debate) travel
-        `tools.send_message_many`, NOT the singular `send_message` — a
-        regression that deletes the batch augmentation comprehension in
-        `_TrackedTools.send_message_many` is invisible to the Phase-1
-        test above. Drive the real executor through Phase 2/3 (Phase 3
-        close returns no JSON DAG → meeting abandon) and assert the
-        batch-dispatched brief carries the loom block EXACTLY once and
-        still ends with the F7 trailer.
-        """
-        tools, outcome = _run_executor(
-            tmp_path,
-            # PM produces two agenda items; everything else falls back to
-            # the "NO ISSUES" default, so Phase 3 close yields no JSON
-            # block and the cycle abandons with no_consensus.
-            scripted={"Phase 1": "improve docs\nfix flaky test"},
-        )
-        assert outcome["status"] == "abandoned"
-        assert outcome["reason"] == "no_consensus"
-
-        # The Phase-2 brief to the non-PM participant traveled the
-        # send_message_many path and was augmented exactly once.
-        phase_2 = [
-            (to, body)
-            for to, body in tools.batch_sent
-            if to == "backend-engineer-1" and "pre-analysis" in body.lower()
-        ]
-        assert phase_2, f"no Phase-2 batch brief found; batch recipients: {tools.batch_sent!r:.200}"
-        _to, body = phase_2[0]
-        assert body.count(_MARKER) == 1
-        assert 'register "backend-engineer-1"' in body
-        assert "kaizen-cycle-1-1" in body
-        assert body.endswith(_TRAILER), "F7 trailer must remain terminal on the batch path"
-        assert body.index(_MARKER) < body.rindex(_TRAILER)
-
-        # Every trailer-carrying batch body is augmented exactly once;
-        # trailer-less batch bodies (protocol payloads) are never touched.
-        for _, b in tools.batch_sent:
-            if b.endswith(_TRAILER):
-                assert b.count(_MARKER) == 1
-            else:
-                assert _MARKER not in b
-
-    def test_dispatch_unaugmented_when_loom_unavailable(self, tmp_path):
-        # autouse kill-switch is on: detect says unavailable.
-        tools = _run_executor_phase1_abandon(tmp_path)
-        _, body = tools.sent[0]
-        assert _MARKER not in body
-        assert body.endswith(_TRAILER)
 
 
 # ── Guarded REAL-integration roundtrip ────────────────────────────────────

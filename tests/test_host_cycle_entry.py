@@ -7,7 +7,7 @@ drive the PRODUCTION caller — ``scripts.host_cycle_entry.run_host_cycle`` (and
 
 Coverage:
   * transport guard REJECTS when ``KAIZEN_TRANSPORT`` resolves to something other
-    than ``host`` (explicit ``bridge`` / unknown), BEFORE any executor call — no
+    than ``host`` (explicit ``prose`` / unknown), BEFORE any executor call — no
     engine needed. NB (M8c): unset now DEFAULTS to host, so an unset env RUNS the
     host entry rather than rejecting (see the e2e default-unset test).
   * an engine-shaped / malformed DAG FAILS FAST with ``ActionItemsShapeError``
@@ -102,10 +102,10 @@ def test_require_wired_transport_entry_contract_allows_host():
     assert require_wired_transport({"KAIZEN_TRANSPORT": "host"}, allow_host=True) == "host"
 
 
-def test_require_wired_transport_bridge_explicit_both_ways():
-    """The explicit bridge opt-out resolves normally regardless of allow_host."""
-    assert require_wired_transport({"KAIZEN_TRANSPORT": "bridge"}) == "bridge"
-    assert require_wired_transport({"KAIZEN_TRANSPORT": "bridge"}, allow_host=True) == "bridge"
+def test_require_wired_transport_prose_explicit_both_ways():
+    """The explicit prose opt-out resolves normally regardless of allow_host."""
+    assert require_wired_transport({"KAIZEN_TRANSPORT": "prose"}) == "prose"
+    assert require_wired_transport({"KAIZEN_TRANSPORT": "prose"}, allow_host=True) == "prose"
 
 
 def test_require_wired_transport_default_allowed_resolves_host():
@@ -117,8 +117,8 @@ def test_require_wired_transport_default_allowed_resolves_host():
 # ── transport guard (no engine needed — fails before any executor call) ──────
 
 
-def test_entry_rejects_bridge_transport(tmp_path):
-    """KAIZEN_TRANSPORT=bridge must NOT run the host entry (NotImplementedError)."""
+def test_entry_rejects_prose_transport(tmp_path):
+    """KAIZEN_TRANSPORT=prose must NOT run the host entry (NotImplementedError)."""
     dag = _write_dag(tmp_path, _native_dag())
     with pytest.raises(NotImplementedError):
         run_host_cycle(
@@ -130,7 +130,7 @@ def test_entry_rejects_bridge_transport(tmp_path):
             cycle_n=1,
             run_id=None,
             test_command="true",
-            env={"KAIZEN_TRANSPORT": "bridge"},
+            env={"KAIZEN_TRANSPORT": "prose"},
         )
 
 
@@ -375,12 +375,12 @@ def test_entry_e2e_run_id_slug(tmp_path):
 
 def test_main_guard_rejection_exits_2(tmp_path, capsys, monkeypatch):
     """main() returns 2 + a stderr message when the transport guard rejects
-    (explicit KAIZEN_TRANSPORT=bridge → NotImplementedError), and prints NOTHING on
+    (explicit KAIZEN_TRANSPORT=prose → NotImplementedError), and prints NOTHING on
     stdout (so a caller never mistakes a guard error for an outcome dict).
 
-    M8c: unset now defaults to host, so we set bridge EXPLICITLY to exercise the
+    M8c: unset now defaults to host, so we set prose EXPLICITLY to exercise the
     guard-rejection-exits-2 path."""
-    monkeypatch.setenv("KAIZEN_TRANSPORT", "bridge")
+    monkeypatch.setenv("KAIZEN_TRANSPORT", "prose")
     dag = _write_dag(tmp_path, _native_dag())
     rc = main(
         [

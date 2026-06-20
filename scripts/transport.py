@@ -1,4 +1,4 @@
-"""``KAIZEN_TRANSPORT`` selector — host (default) vs bridge (M8 strangler-fig).
+"""``KAIZEN_TRANSPORT`` selector — host (default) vs prose (M8 strangler-fig).
 
 M8 replaces kaizen's SQLite queue-bridge with atelier v1.10.0's deterministic
 host engine via a strangler-fig migration. This module is the SINGLE place the
@@ -16,10 +16,12 @@ transport is resolved, so the wiring lands behind one flag:
     but still raises :class:`NotImplementedError` for the run.py Python
     ``cycle_executor`` slot, which has no host branch + no DAG source (M8c /
     Option-B territory). It deliberately does NOT silently fall back to
-    ``bridge`` — that would mask the flag.
-  * ``bridge`` — the legacy SQLite queue-bridge dispatch. This is now the
-    EXPLICIT opt-out (set ``KAIZEN_TRANSPORT=bridge``); still reachable +
-    byte-for-byte unchanged, and slated for removal in M8c-2.
+    ``prose`` — that would mask the flag.
+  * ``prose`` — the in-prose, hand-orchestrated subagent cycle (the Phase 4 /
+    5a / 5b / 5b' / 5c prose in ``internal/cycle/SKILL.md``). This is the
+    EXPLICIT opt-out from the default host engine (set
+    ``KAIZEN_TRANSPORT=prose``); it dispatches the cycle agents in-prose rather
+    than through the in-process engine, and is kept as a documented alternative.
 
 Any other value raises :class:`UnknownTransportError` (fail-loud, mirroring
 atelier's ``scripts.dispatch.resolve_transport``): a typo or a stale value in
@@ -36,9 +38,9 @@ import os
 from collections.abc import Mapping
 
 TRANSPORT_ENV_VAR = "KAIZEN_TRANSPORT"
-TRANSPORT_BRIDGE = "bridge"
+TRANSPORT_PROSE = "prose"
 TRANSPORT_HOST = "host"
-VALID_TRANSPORTS: frozenset[str] = frozenset({TRANSPORT_BRIDGE, TRANSPORT_HOST})
+VALID_TRANSPORTS: frozenset[str] = frozenset({TRANSPORT_PROSE, TRANSPORT_HOST})
 
 
 class UnknownTransportError(RuntimeError):
@@ -63,8 +65,8 @@ def resolve_transport(env: Mapping[str, str] | None = None) -> str:
     """Resolve the dispatch transport from ``KAIZEN_TRANSPORT``.
 
     Returns ``"host"`` when the var is unset / empty / whitespace (the M8c
-    DEFAULT). Returns ``"bridge"`` when explicitly set to ``bridge`` (the
-    legacy opt-out). Any other value raises :class:`UnknownTransportError`.
+    DEFAULT). Returns ``"prose"`` when explicitly set to ``prose`` (the
+    in-prose opt-out). Any other value raises :class:`UnknownTransportError`.
 
     ``env`` defaults to ``os.environ``; pass an explicit mapping in tests.
     """
@@ -101,7 +103,7 @@ def require_wired_transport(
       * ``allow_host=True`` — the :mod:`scripts.host_cycle_entry` contract: ``host``
         resolves cleanly (the DAG was produced upstream and is handed in).
 
-    ``bridge`` returns normally in both cases. Unknown values still raise
+    ``prose`` returns normally in both cases. Unknown values still raise
     :class:`UnknownTransportError` (via :func:`resolve_transport`). Centralizing the
     env semantics here keeps :data:`TRANSPORT_ENV_VAR` resolution in ONE place.
     """
@@ -114,7 +116,7 @@ def require_wired_transport(
             f"host_cycle_executor). The run.py Python cycle-executor slot "
             f"(mode=team) has NO host branch and NO DAG source — routing "
             f"{TRANSPORT_HOST!r} there is M8c (Option-B) territory and is NOT yet "
-            f"connected. Use the explicit {TRANSPORT_BRIDGE!r} transport here, or "
+            f"connected. Use the explicit {TRANSPORT_PROSE!r} transport here, or "
             f"invoke scripts.host_cycle_entry (which passes allow_host=True)."
         )
     return transport

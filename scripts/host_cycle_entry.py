@@ -160,14 +160,14 @@ def run_host_cycle(
     """
     # (a) Transport guard — host is wired ONLY for this entrypoint (RISK-4).
     # Unset/empty now resolves to host (the default), which this entry runs;
-    # explicit KAIZEN_TRANSPORT=bridge is rejected here (the bridge path runs
+    # explicit KAIZEN_TRANSPORT=prose is rejected here (the prose path runs
     # the cycle in-prose, not via this script) and a typo surfaces
     # UnknownTransportError.
     transport = require_wired_transport(env, allow_host=True)
     if transport != "host":
         raise NotImplementedError(
             f"scripts.host_cycle_entry runs ONLY under KAIZEN_TRANSPORT=host "
-            f"(now the default); resolved transport={transport!r}. The bridge "
+            f"(now the default); resolved transport={transport!r}. The prose "
             f"path runs the cycle in-prose (see internal/cycle/SKILL.md) — do "
             f"not invoke this entry for it."
         )

@@ -108,11 +108,18 @@ _WIRING_CASES = [
     (
         "phase_4_implementation.md",
         lambda: phase_4_implementer(
-            item={"id": "AI-1", "touches": ["foo.py"], "reads": ["bar.py"]}, wave_n=1
+            item={
+                "id": "AI-1",
+                "description": "Add a guard to foo().",
+                "touches": ["foo.py"],
+                "reads": ["bar.py"],
+            },
+            wave_n=1,
         ),
         {
             "wave_n": 1,
             "item.id": "AI-1",
+            "item.description": "Add a guard to foo().",
             "item.touches": ["foo.py"],
             "item.reads": ["bar.py"],
         },

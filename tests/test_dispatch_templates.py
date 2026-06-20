@@ -980,6 +980,7 @@ _AI2_RENDER_KWARGS = {
     "phase_4_implementation.md": {
         "wave_n": 1,
         "item.id": "AI-1",
+        "item.description": "Add a guard to foo().",
         "item.touches": ["foo.py"],
         "item.reads": ["bar.py"],
     },

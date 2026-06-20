@@ -537,6 +537,16 @@ def build_fix_tasks(
     """
     tasks: list[dict[str, Any]] = []
     for file_idx, file in enumerate(sorted(coalesced_by_file)):
+        # M8b Bug#4 defensive backstop: a directory/non-file target must NEVER
+        # reach the engine as a `writes` entry (it corrupts worktree carving →
+        # false-`done` reject → cycle abandon). The caller filters these out via
+        # `_coalesce_blockers_by_file`; fail loud if one slips through.
+        if not file or file.endswith("/"):
+            raise ValueError(
+                f"build_fix_tasks: refusing to emit a directory/non-file target in "
+                f"`writes`: {file!r} — only single-file fix targets are valid; "
+                f"non-routable findings must be surfaced, not routed to a writer"
+            )
         findings = list(coalesced_by_file[file])
         rep = findings[0]
         owner = _find_owner_for_finding(rep, dict(file_to_owner), pm)
@@ -976,20 +986,80 @@ class _ReviewHardAbandon(RuntimeError):
     abandonment dict. NEVER leaks out of :func:`_run_review_fix_loop`."""
 
 
-def _coalesce_blockers_by_file(blockers: Sequence[Finding]) -> dict[str, list[Finding]]:
-    """Group blocker/major findings by their file (the ``file_line`` path part).
+def _finding_path(f: Finding) -> str:
+    """Extract the file-path part of a finding's ``file_line`` ("file:line").
+
+    Mirrors :func:`scripts.fix_loop._find_owner_for_finding`'s split so the owner
+    lookup and the coalescing key agree on the path.
+    """
+    raw = f.file_line or ""
+    return raw.split(":", 1)[0] if ":" in raw else raw
+
+
+def _is_valid_file_target(path: str, clone_dir: str | Path | None = None) -> bool:
+    """True iff ``path`` is a plausible SINGLE-FILE fix-writer target.
+
+    M8b Bug#4: a fix-round writer task declares ``writes=[path]``; the engine's
+    write-disjointness gate + per-task worktree carving REQUIRE a real file, never
+    a directory. A reviewer may file a blocker against a DIRECTORY (``tests/``,
+    ``tests/:3``, or the no-trailing-slash form ``tests``) or an empty/non-file
+    target; routing that into ``writes`` carves a malformed worktree → false-`done`
+    reject → the whole cycle abandons. NON-routable findings are surfaced
+    separately, never dropped.
+
+    Two layers:
+      * STRING guard (always on): non-routable if empty or ends with a path
+        separator (``tests/``). The no-filesystem baseline.
+      * FILESYSTEM guard (when ``clone_dir`` is supplied — the production loop
+        always supplies it): a path resolving to an EXISTING directory inside the
+        clone is non-routable too, closing the no-trailing-slash hole (``tests``).
+        A path that does not yet exist (a NEW file the fix should create) has
+        ``is_dir() == False`` → stays routable, which is correct.
+    """
+    if not path or path.endswith("/"):
+        return False
+    if clone_dir is not None:
+        try:
+            if (Path(clone_dir) / path).is_dir():
+                return False
+        except OSError:
+            pass  # unreadable path → fall back to the string verdict (routable)
+    return True
+
+
+def _coalesce_blockers_by_file(
+    blockers: Sequence[Finding],
+    clone_dir: str | Path | None = None,
+) -> tuple[dict[str, list[Finding]], list[Finding]]:
+    """Group blocker/major findings into fix-writer file groups + non-routable ones.
 
     Per SKILL the fix round dispatches ONE writer per file (not one per finding) —
     several findings on the same file are coalesced so they are fixed in a single
     write-isolated worktree. The representative finding (first in input order)
     routes the owner; the rest are listed in the fix briefing's prose.
+
+    M8b Bug#4: a finding whose derived path is NOT a valid single-file target (a
+    directory like ``tests/`` / ``tests/:3`` / the no-slash ``tests`` when
+    ``clone_dir`` is supplied, or empty) CANNOT become a fix-writer (a directory in
+    ``writes`` corrupts the engine's worktree carving). Such findings are collected
+    into a SECOND return value (the non-routable list) and MUST be surfaced as
+    still-unresolved by the caller — NEVER silently dropped (dropping a real
+    blocker would make the review loop falsely converge). ``clone_dir`` (the
+    production loop always supplies it) enables the filesystem guard that catches
+    directory targets written without a trailing slash; see
+    :func:`_is_valid_file_target`.
+
+    Returns ``(by_file, non_routable)``.
     """
     by_file: dict[str, list[Finding]] = {}
+    non_routable: list[Finding] = []
     for f in blockers:
-        raw = f.file_line or ""
-        file = raw.split(":", 1)[0] if ":" in raw else raw
-        by_file.setdefault(file, []).append(f)
-    return by_file
+        path = _finding_path(f)
+        if _is_valid_file_target(path, clone_dir):
+            by_file.setdefault(path, []).append(f)
+        else:
+            non_routable.append(f)
+    return by_file, non_routable
 
 
 def _run_review_fix_loop(
@@ -1013,6 +1083,7 @@ def _run_review_fix_loop(
         [Mapping[str, Finding]], Callable[[Mapping[str, Any], int], str]
     ],
     is_failed_attempt: Callable[[Any], bool],
+    clone_dir: str | Path | None = None,
 ) -> dict[str, Any] | None:
     """Orchestrator-owned Phase 5b' review→fix loop (re-homed Star→Mesh→Star).
 
@@ -1169,21 +1240,42 @@ def _run_review_fix_loop(
             # (incl. an "ABANDON:" prefix) is a REJECT.
             pm_accepts = (pm_resp or "").strip().upper().startswith("ACCEPT")
 
+            # ── Coalesce into fix-writer file groups + non-routable findings ──
+            # M8b Bug#4: a blocker whose target is a DIRECTORY / non-file (e.g.
+            # `tests/`) can NEVER be auto-fixed by a file-owner writer (a directory
+            # in `writes` corrupts the engine's worktree carving). Such findings are
+            # carried OUT of the fix dispatch but REMAIN in `survivors`/history (so
+            # they persist as unresolved → the loop never falsely converges → it
+            # ultimately exhausts to a clean `review_unrecoverable` that NAMES them).
+            # They cannot be fixed, so they guarantee NON-convergence; termination
+            # is still bounded by MAX_ITERATIONS (no extra fix round for them).
+            coalesced, non_routable = _coalesce_blockers_by_file(latest_blockers, clone_dir)
+            non_routable_ids = {f.finding_id for f in non_routable}
+            if non_routable:
+                _log.warning(
+                    "host Phase 5b' round-%d: %d non-routable blocker(s) (directory/"
+                    "non-file target) carried as unresolved — cannot dispatch a "
+                    "file-owner writer: %s",
+                    iter_n,
+                    len(non_routable),
+                    ", ".join(f"{f.finding_id}({f.file_line!r})" for f in non_routable),
+                )
+
             if not should_continue(state, pm_accepts_remaining=pm_accepts):
                 if pm_accepts:
                     return None  # clean exit — PM ruled remaining issues acceptable.
                 # MAX_ITERATIONS reached with blockers still present. Pass the
-                # LATEST round's peer-unconfirmed map ONLY here (the exhaustion
-                # site) — fix-failed + HARD-abandon below pass None.
+                # LATEST round's peer-unconfirmed + non-routable maps ONLY here (the
+                # exhaustion site) — fix-failed + HARD-abandon below pass None.
                 return build_abandonment_outcome(
                     state,
                     subject=subject,
                     participants=list(participants),
                     peer_unconfirmed=unconfirmed_ids,
+                    non_routable=non_routable_ids,
                 )
 
-            # ── FIX round (writers, one per coalesced file) ──────────────────
-            coalesced = _coalesce_blockers_by_file(latest_blockers)
+            # ── FIX round (writers, one per coalesced ROUTABLE file) ─────────
             fix_tasks = build_fix_tasks(coalesced, file_to_owner, pm, iter_n=iter_n)
             # Map each fix task_id → its representative finding for the briefing.
             finding_by_task_id: dict[str, Finding] = {}
@@ -1707,6 +1799,7 @@ def host_cycle_executor(
                             pm_briefing_factory=_pm_fac,
                             fix_briefing_factory=_fix_fac,
                             is_failed_attempt=is_failed_attempt,
+                            clone_dir=clone_path,
                         )
         except _WorktreeError as exc:
             # Engine worktree create/merge failure → graceful abandon (phase

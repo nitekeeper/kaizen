@@ -41,6 +41,7 @@ from scripts.dispatch_templates import (
 from scripts.fix_loop import _CHECK_TO_REASON, Finding
 from scripts.host_executor import (
     _REVIEW_TERMINAL_RULE,
+    _coalesce_blockers_by_file,
     _collect_review_findings,
     _consolidate_mesh,
     _interpret_engine_results,
@@ -1175,6 +1176,109 @@ def test_fix_routes_to_implementer_not_reviewer_and_coalesces():
     assert t2["assigned_persona"] == "pm-1"
 
 
+# ── #13b — M8b Bug#4: directory/non-file finding targets never reach `writes` ─
+
+
+def test_coalesce_separates_directory_targets_from_file_targets():
+    """M8b Bug#4 regression. A reviewer blocker whose `file_line` points at a
+    DIRECTORY (e.g. `tests/` or `tests/:3`) or is empty/non-file must NOT be
+    grouped as a fix-writer file target (a directory in `writes` is malformed for
+    the engine's write-disjointness gate + worktree carving → merge conflict /
+    false-`done` reject → the whole cycle abandons). It MUST be returned as a
+    NON-ROUTABLE finding (never silently dropped — that would falsely converge the
+    review loop). A normal `file.py:42` target still routes.
+
+    Pre-fix bug: `_coalesce_blockers_by_file` returned `{"tests/": [...]}` and
+    `build_fix_tasks` then emitted `writes=["tests/"]`."""
+    good = _finding("R1-0-1", "blocker", "security-engineer-1", "scripts/foo.py:42")
+    dir_trailing = _finding("R1-0-2", "blocker", "security-engineer-1", "tests/")
+    dir_lined = _finding("R1-1-1", "major", "software-architect-1", "tests/:3")
+    empty = _finding("R1-1-2", "blocker", "software-architect-1", "")
+
+    by_file, non_routable = _coalesce_blockers_by_file([good, dir_trailing, dir_lined, empty])
+
+    # Only the real file target is a fix-writer group.
+    assert set(by_file) == {"scripts/foo.py"}
+    assert by_file["scripts/foo.py"] == [good]
+
+    # The three non-file targets are surfaced, not dropped.
+    non_routable_ids = {f.finding_id for f in non_routable}
+    assert non_routable_ids == {"R1-0-2", "R1-1-1", "R1-1-2"}
+
+
+def test_build_fix_tasks_never_emits_directory_in_writes():
+    """`build_fix_tasks` is a defensive backstop: a directory target must never
+    reach the engine as a `writes` entry. Feeding a directory raises fail-loud
+    rather than carving a malformed worktree."""
+    blocker = _finding("R1-0-1", "blocker", "security-engineer-1", "tests/")
+    with pytest.raises(ValueError, match=r"directory|non-file|writes"):
+        build_fix_tasks(
+            {"tests/": [blocker]},
+            {},
+            "pm-1",
+            iter_n=1,
+        )
+
+
+def test_coalesce_normal_file_targets_unaffected():
+    """No regression for the normal path: a `path/to/file.py:42` finding routes to
+    its file group and produces NO non-routable findings."""
+    f1 = _finding("R1-0-1", "blocker", "security-engineer-1", "scripts/a.py:42")
+    f2 = _finding("R1-1-1", "major", "software-architect-1", "scripts/b.py:7")
+    by_file, non_routable = _coalesce_blockers_by_file([f1, f2])
+    assert set(by_file) == {"scripts/a.py", "scripts/b.py"}
+    assert non_routable == []
+    tasks = build_fix_tasks(by_file, {}, "pm-1", iter_n=1)
+    for t in tasks:
+        for w in t["writes"]:
+            assert not w.endswith("/") and w, f"directory leaked into writes: {w!r}"
+
+
+def test_coalesce_fs_guard_catches_directory_without_trailing_slash(tmp_path):
+    """M8b Bug#4 hardening: a blocker targeting a directory written WITHOUT a
+    trailing slash (`tests`, not `tests/`) is invisible to the string guard but is
+    caught by the filesystem guard when `clone_dir` is supplied — the production
+    loop always supplies it. A path that does not yet exist (a NEW file the fix
+    creates) stays routable."""
+    (tmp_path / "tests").mkdir()
+    dir_no_slash = _finding("R1-0-1", "blocker", "security-engineer-1", "tests")
+    dir_no_slash_lined = _finding("R1-0-2", "major", "software-architect-1", "tests:9")
+    real_file = _finding("R1-1-1", "blocker", "security-engineer-1", "scripts/foo.py:42")
+    new_file = _finding("R1-1-2", "blocker", "software-architect-1", "tests/new_test.py:1")
+
+    by_file, non_routable = _coalesce_blockers_by_file(
+        [dir_no_slash, dir_no_slash_lined, real_file, new_file], tmp_path
+    )
+
+    # The existing directory (both spellings) is non-routable; the real file and a
+    # not-yet-existing new file under tests/ both route.
+    assert set(by_file) == {"scripts/foo.py", "tests/new_test.py"}
+    assert {f.finding_id for f in non_routable} == {"R1-0-1", "R1-0-2"}
+
+    # Without clone_dir the no-slash directory slips past the string-only baseline
+    # (documents the two-layer contract).
+    by_file_str, non_str = _coalesce_blockers_by_file([dir_no_slash])
+    assert set(by_file_str) == {"tests"} and non_str == []
+
+
+def test_coalesce_mixed_routable_and_non_routable_surfaces_both(tmp_path):
+    """A round with BOTH a routable blocker and a non-routable one must route the
+    fixable file AND surface the non-routable finding (never let one mask the
+    other). build_fix_tasks then emits a writer ONLY for the routable file, with no
+    directory in any `writes`."""
+    (tmp_path / "tests").mkdir()
+    routable = _finding("R1-0-1", "blocker", "security-engineer-1", "scripts/a.py:5")
+    non_routable_dir = _finding("R1-1-1", "blocker", "software-architect-1", "tests/")
+
+    by_file, non_routable = _coalesce_blockers_by_file([routable, non_routable_dir], tmp_path)
+    assert set(by_file) == {"scripts/a.py"}
+    assert [f.finding_id for f in non_routable] == ["R1-1-1"]
+
+    tasks = build_fix_tasks(by_file, {}, "pm-1", iter_n=1)
+    assert len(tasks) == 1
+    assert tasks[0]["writes"] == ["scripts/a.py"]
+
+
 # ── #14 — iter-2 round-1 brief carries iter-1 survivors as prior_findings ───
 
 
@@ -1764,6 +1868,67 @@ def test_consolidate_mesh_map_is_consumed_not_discarded(tmp_path):
     # Round-1 finding ids are stamped R{iter}-{reviewer_idx}-{k} with k starting at
     # 1, so the latest round's (iteration 5) reviewer-0 blocker is R5-0-1.
     assert "R5-0-1" in summary, f"peer-unconfirmed blocker id not named: {summary!r}"
+
+
+@_SKIP_ENGINE
+def test_non_routable_blocker_drives_review_unrecoverable_not_silent_success(tmp_path):
+    """M8b Bug#4 e2e regression. A single reviewer files a blocker whose target is
+    a DIRECTORY (`tests/`) every round. It can NEVER be auto-fixed by a file-owner
+    writer (a directory is not a valid `writes` target → would corrupt the engine's
+    worktree carving). The fix must NOT (a) crash by feeding a directory into
+    `writes`, nor (b) silently drop the blocker (which would falsely converge the
+    review loop to success). Instead the non-routable blocker persists as an
+    UNRESOLVED finding → the loop terminates at MAX_ITERATIONS → a clean
+    `review_unrecoverable` abandonment whose convergence_summary NAMES it.
+
+    Mut (pre-fix): `_coalesce_blockers_by_file` yields `{"tests/": [...]}`,
+    `build_fix_tasks` emits `writes=["tests/"]`, the engine merge conflicts → the
+    cycle abandons via the WorktreeError catch (NOT review_unrecoverable) — a
+    success-RATE bug. Mut (silent-drop): zero blockers → status=='success'."""
+    clone = _git_init_clone(tmp_path)
+    items = [
+        {
+            "id": "AI-1",
+            "touches": ["scripts/foo.py"],
+            "reads": [],
+            "depends_on": [],
+            "wave": 1,
+            "owner": "backend-engineer-1",
+        },
+    ]
+    # ONE reviewer files a DIRECTORY-targeted blocker every round (single reviewer →
+    # mesh is vacuous). No fix can ever resolve it → persists → exhaustion.
+    notes_by_task = {f"R{i}-0": "[blocker] tests/ — whole test tree is broken" for i in range(1, 6)}
+    runner = _PhaseAwareHostFakeRunner(
+        impl_writes={"AI-1": ["scripts/foo.py"]},
+        notes_by_task=notes_by_task,
+        pm_default="REJECT — keep iterating",
+    )
+
+    out = host_cycle_executor(
+        action_items=items,
+        existing_files=frozenset({"seed.txt"}),
+        clone_dir=clone,
+        roster=["backend-engineer-1", "security-engineer-1"],
+        subject="non-routable blocker",
+        runner=runner,
+        journal_path=tmp_path / "journal.json",
+        review=True,
+        test_command="true",
+    )
+
+    assert out["status"] == "abandoned", f"must NOT silently succeed: {out!r}"
+    assert out["reason"] == "review_unrecoverable", (
+        f"non-routable blocker must drive review_unrecoverable, not a worktree crash: {out!r}"
+    )
+    # The non-routable blocker is surfaced in the unresolved findings + summary.
+    unresolved = out["unresolved_findings"]
+    assert any(f["file_line"] == "tests/" for f in unresolved), (
+        f"non-routable blocker dropped from unresolved_findings: {unresolved!r}"
+    )
+    assert "Non-routable" in out["convergence_summary"], (
+        f"non-routable disclosure missing: {out['convergence_summary']!r}"
+    )
 
 
 def test_review_terminal_rule_placeholder_wording():

@@ -9,11 +9,15 @@ name: Release
 # and version bumps are editorial decisions made in PRs (see scripts/bump.py).
 # The tag push is the "I really mean it" signal.
 #
-# Kaizen-specific divergence from memex/atelier: there is NO "Notify agora
-# marketplace" step. Kaizen is personal-use only per CLAUDE.md — it is not
-# distributed via Agora and has no Agora dispatch secret. The GitHub Release
-# is the terminal artifact; users install by cloning the repo and registering
-# the plugin manually with Claude Code.
+# Kaizen is registered in Agora (see CLAUDE.md "Distribution"), so the final
+# step notifies the marketplace: it fires a repository_dispatch at
+# nitekeeper/agora so agora's plugin-update.yml opens a PR bumping kaizen's
+# pinned version — the same pattern memex/atelier use (agora's
+# docs/automation.md). It needs the AGORA_DISPATCH_TOKEN secret (a fine-grained
+# PAT for nitekeeper/agora), NOT GITHUB_TOKEN: events triggered by GITHUB_TOKEN
+# do not start downstream workflow runs, and the Release here is itself created
+# with GITHUB_TOKEN, so a separate release-triggered workflow would never fire —
+# hence the dispatch lives in this job. No-ops cleanly when the secret is absent.
 
 on:
   push:
@@ -118,3 +122,23 @@ jobs:
             "dist/kaizen-v${TAG}.zip" \
             --title "v${TAG}" \
             --notes-file "${BODY_PATH}"
+
+      - name: Notify agora marketplace
+        env:
+          # A PAT, NOT GITHUB_TOKEN (see header): events from GITHUB_TOKEN do
+          # not trigger agora's plugin-update.yml. Absent on forks -> no-op.
+          GH_TOKEN: ${{ secrets.AGORA_DISPATCH_TOKEN }}
+          # Pass values via env, never inline-interpolate into run:.
+          REPO_NAME: ${{ github.event.repository.name }}
+          TAG: ${{ steps.ver.outputs.version }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "AGORA_DISPATCH_TOKEN not set — skipping agora notification."
+            exit 0
+          fi
+          plugin=$(echo "$REPO_NAME" | tr 'A-Z' 'a-z')
+          gh api repos/nitekeeper/agora/dispatches \
+            -f event_type=plugin-released \
+            -f "client_payload[plugin]=$plugin" \
+            -f "client_payload[tag]=v${TAG}"
+          echo "Notified agora: plugin-released $plugin (v${TAG})."

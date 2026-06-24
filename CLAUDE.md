@@ -33,7 +33,7 @@ The setup script (`scripts/setup.py`) verifies all of these and fails loudly if 
 
    This verifies external dependencies and applies the schema migration to `.ai/memex.db`.
 
-4. Register Kaizen as a local plugin in Claude Code (manual step — Kaizen is not distributed via Agora).
+4. Install Kaizen via Agora (`kaizen` is registered in the marketplace), or register it as a local plugin in Claude Code.
 
 ## DB and storage
 
@@ -156,4 +156,4 @@ If you maintain a fork that diverges from this posture, override per-skill via C
 
 ## Distribution
 
-**Personal use only.** Kaizen is not published to Agora or PyPI. Install by cloning the repo and registering it manually with Claude Code.
+**Personal use.** Kaizen is registered in Agora (install via the marketplace) but is not published to PyPI. It can also be installed by cloning the repo and registering it manually with Claude Code.

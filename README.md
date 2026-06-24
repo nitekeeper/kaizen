@@ -65,13 +65,14 @@ Kaizen refuses to run if any of these are missing:
    PYTHONPATH=. python3 scripts/setup.py
    ```
 
-4. Register Kaizen as a local plugin in Claude Code (manual step — Kaizen is not
-   distributed via Agora).
+4. Install Kaizen via Agora (`kaizen` is registered in the marketplace), or
+   register it as a local plugin in Claude Code.
 
 ## Distribution
 
-**Personal use only.** Kaizen is not published to Agora or PyPI. Install by cloning
-the repo and registering it manually with Claude Code.
+**Personal use.** Kaizen is registered in Agora (install via the marketplace) but is
+not published to PyPI. It can also be installed by cloning the repo and registering it
+manually with Claude Code.
 
 ---
 

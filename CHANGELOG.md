@@ -9,6 +9,14 @@ All notable changes to Kaizen are recorded here.
 - Implementation plan (`docs/plan.md`) — 11-wave build order with parallel-eligible pairs marked.
 - Plugin scaffolding: `CLAUDE.md`, `requirements.txt`, `.claude-plugin/plugin.json`, `.gitignore` (with editor + OS metadata patterns).
 
+## v0.1.1 — 2026-06-24
+
+### Added
+- Release automation: `release.yml` now notifies the Agora marketplace on publish — it fires a `repository_dispatch` so Agora auto-opens a version-bump PR for kaizen.
+
+### Changed
+- Docs: record that Kaizen is registered in and distributed via Agora.
+
 ## v0.1.0 — TBD
 
 First end-to-end release. Targets:

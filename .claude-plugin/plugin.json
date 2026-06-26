@@ -1,6 +1,6 @@
 {
   "name": "kaizen",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "Multi-agent improvement plugin — runs Atelier's methodology against any git repository by URL",
   "author": {
     "name": "nitekeeper"

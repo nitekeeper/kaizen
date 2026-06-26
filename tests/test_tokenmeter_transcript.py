@@ -216,16 +216,12 @@ def test_across_file_first_wins_by_mtime():
     original = {
         "source": "original.jsonl",
         "mtime": 100.0,
-        "lines": [
-            _assistant_line(message_id="m", request_id="r", usage={"input_tokens": 11})
-        ],
+        "lines": [_assistant_line(message_id="m", request_id="r", usage={"input_tokens": 11})],
     }
     resumed_copy = {
         "source": "resumed.jsonl",
         "mtime": 200.0,  # later → its duplicate must be dropped
-        "lines": [
-            _assistant_line(message_id="m", request_id="r", usage={"input_tokens": 999})
-        ],
+        "lines": [_assistant_line(message_id="m", request_id="r", usage={"input_tokens": 999})],
     }
     # Pass later-first to prove ordering is by mtime, not input order.
     recs = aggregate_usage([resumed_copy, original])
@@ -247,8 +243,11 @@ def test_across_file_unkeyed_all_kept():
 
 
 def test_sidechain_counts_with_parent_session_and_label(tmp_path):
-    # Layout: <parent-sess>/subagents/agent-xyz.jsonl  +  agent-xyz.meta.json
-    parent = tmp_path / "parent-sess-123"
+    # Real layout: <parent-session-uuid>/subagents/agent-xyz.jsonl + agent-xyz.meta.json.
+    # The sidechain line's OWN sessionId field IS the parent session (verified across
+    # real on-disk transcripts). NON-CIRCULAR: the dir is named differently from the
+    # session id, so the assertion proves we read the sessionId field, not the dir.
+    parent = tmp_path / "dir-name-differs-from-session-id"
     subagents = parent / "subagents"
     subagents.mkdir(parents=True)
     jsonl = subagents / "agent-xyz.jsonl"
@@ -258,26 +257,43 @@ def test_sidechain_counts_with_parent_session_and_label(tmp_path):
         message_id="sm",
         request_id="sr",
         usage={"input_tokens": 42},
-        session_id="subagent-own-session",  # the sub-agent's OWN id, must be overridden
+        session_id="real-parent-session",  # the line's OWN sessionId IS the parent
         is_sidechain=True,
     )
     rec = parse_transcript_line(json.loads(line), jsonl, meta_lookup=read_agent_label)
     assert rec is not None
     assert rec.is_sidechain is True
     assert rec.usage.input_tokens == 42  # sidechain tokens still count
-    assert rec.session_id == "parent-sess-123"  # parent from path, not own sessionId
+    assert rec.session_id == "real-parent-session"  # from the sessionId field, not the dir
+    assert rec.session_id != "dir-name-differs-from-session-id"
     assert rec.agent_label == "Explore"
 
 
+def test_sidechain_session_falls_back_to_path_when_no_session_id():
+    # Defensive fallback: a sidechain line with NO sessionId recovers the parent from
+    # the on-disk layout (.../<parent-session-uuid>/subagents/agent-*.jsonl).
+    obj = {
+        "type": "assistant",
+        "isSidechain": True,
+        "message": {"id": "sm", "usage": {"input_tokens": 1}},
+        # NOTE: deliberately no "sessionId" key.
+    }
+    rec = parse_transcript_line(obj, "/x/recovered-parent-uuid/subagents/agent-xyz.jsonl")
+    assert rec.session_id == "recovered-parent-uuid"  # parent.parent.name fallback
+
+
 def test_sidechain_pure_without_meta_lookup():
-    # No injected resolver → no filesystem access → label stays None (purity).
+    # No injected resolver → no filesystem access → label stays None (purity). The
+    # session_id comes from the line's own sessionId field (the parent).
     line = _assistant_line(
-        message_id="sm", request_id="sr", usage={"input_tokens": 1}, is_sidechain=True
+        message_id="sm",
+        request_id="sr",
+        usage={"input_tokens": 1},
+        session_id="parent-sess",
+        is_sidechain=True,
     )
-    rec = parse_transcript_line(
-        json.loads(line), "/x/parent-sess/subagents/agent-xyz.jsonl"
-    )
-    assert rec.session_id == "parent-sess"
+    rec = parse_transcript_line(json.loads(line), "/x/some-dir/subagents/agent-xyz.jsonl")
+    assert rec.session_id == "parent-sess"  # the line's own sessionId, no fs access
     assert rec.agent_label is None
 
 

@@ -47,7 +47,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids a hard import cycle.
 # Date the base prices below were last reconciled against the claude-api skill.
 PRICING_AS_OF = "2026-06-25"
 
-# ── Category multipliers (× the model base *input* $/Mtok) ──────────────────
+# ── Category multipliers (x the model base *input* $/Mtok) ──────────────────
 # Cache reads are heavily discounted; cache writes carry a TTL premium.
 CACHE_READ = 0.10
 CACHE_WRITE_5M = 1.25
@@ -188,25 +188,40 @@ class CostBreakdown:
         return asdict(self)
 
 
-def cost_usd(usage: TokenUsage | Any, model: str | None) -> CostBreakdown:
+def cost_usd(
+    usage: TokenUsage | Any,
+    model: str | None,
+    *,
+    cache_creation: Any = None,
+) -> CostBreakdown:
     """Price one usage record for ``model`` into a :class:`CostBreakdown`.
 
     Unknown or ``<synthetic>`` models yield ``priced=False`` with all costs
     ``0.0`` while keeping the token counts. The cache-write TTL split is taken
     from the transcript when present (``source="exact"``) and approximated as a
     5-minute write otherwise (``source="approximated"``).
+
+    The four-category :class:`~scripts.tokenmeter_model.TokenUsage` deliberately
+    does NOT carry the cache-write TTL split, so a caller pricing a real record
+    passes it explicitly via ``cache_creation`` (a mapping/object exposing
+    ``ephemeral_5m_input_tokens`` / ``ephemeral_1h_input_tokens``). When that
+    argument is ``None`` we fall back to reading a ``cache_creation`` attribute off
+    ``usage`` itself (the duck-typed shape the unit tests use). Either way the split
+    is a pricing refinement WITHIN ``cache_creation_input_tokens`` — never a fifth
+    token category.
     """
     input_tokens = _as_int(_field(usage, "input_tokens"))
     output_tokens = _as_int(_field(usage, "output_tokens"))
     cache_read_tokens = _as_int(_field(usage, "cache_read_input_tokens"))
 
-    # Resolve the cache-write TTL split. Prefer the per-TTL breakdown from the
-    # transcript; otherwise fall back to the flat total and label it approximate.
-    cache_creation = _field(usage, "cache_creation")
+    # Resolve the cache-write TTL split. Prefer the split the caller passed
+    # explicitly (real records carry it on the UsageRecord, not on TokenUsage),
+    # then a ``cache_creation`` attribute on the usage object, then the flat total.
+    cc = cache_creation if cache_creation is not None else _field(usage, "cache_creation")
     e5 = e1 = None
-    if cache_creation is not None:
-        e5 = _field(cache_creation, "ephemeral_5m_input_tokens")
-        e1 = _field(cache_creation, "ephemeral_1h_input_tokens")
+    if cc is not None:
+        e5 = _field(cc, "ephemeral_5m_input_tokens")
+        e1 = _field(cc, "ephemeral_1h_input_tokens")
     if e5 is None:
         e5 = _field(usage, "ephemeral_5m_input_tokens")
     if e1 is None:

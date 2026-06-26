@@ -19,6 +19,11 @@ when ANY of these holds:
     measurable work — treating that as a free success would silently hide a
     broken run).
 
+A run that produced real tokens at a ``$0`` bill (an unpriced/synthetic model or a
+fully cache-served turn) is the distinct :attr:`RunStatus.SUCCESS_ZERO_COST` — a
+flavour of success, never a FAILURE — so the "ran fine, billed nothing" state stays
+visible rather than collapsing into plain SUCCESS. Any non-zero cost is SUCCESS.
+
 The runner is INJECTABLE (:func:`run_and_classify`) and matches the
 ``FakeCliRunner`` shape (``async __call__(argv, cwd)`` returning the result
 dict), so tests never spawn a real ``claude``.
@@ -52,6 +57,7 @@ except ImportError:  # pragma: no cover
 
     class RunStatus(Enum):  # type: ignore[no-redef]
         SUCCESS = "success"
+        SUCCESS_ZERO_COST = "success_zero_cost"
         FAILURE = "failure"
 
 
@@ -113,9 +119,7 @@ def _coerce_int(value: Any) -> int:
 def _usage_from(raw: Any) -> TokenUsage:
     """Build a hardened :class:`TokenUsage` from a raw ``usage`` mapping."""
     mapping = raw if isinstance(raw, Mapping) else {}
-    return TokenUsage(
-        **{name: _harden_token(mapping.get(name)) for name in _USAGE_FIELDS}
-    )
+    return TokenUsage(**{name: _harden_token(mapping.get(name)) for name in _USAGE_FIELDS})
 
 
 def parse_result(raw: Any) -> ResultObject:
@@ -161,11 +165,19 @@ def _is_zero_tokens(usage: TokenUsage) -> bool:
 def classify_result(raw: Any) -> RunStatus:
     """Classify a raw CLI result as :class:`RunStatus` (fail-loud).
 
-    FAILURE on: 0-byte/unparseable raw, ``is_error``, or
-    ``total_cost_usd == 0`` AND zero tokens. SUCCESS otherwise — note a run with
-    real tokens but $0 cost (e.g. fully cached) is a SUCCESS, and a terminal
-    ``blocked`` task outcome that still spent tokens is a SUCCESS *run* (the task
-    outcome is a separate concern from whether the run executed).
+    Three terminal states:
+
+    * **FAILURE** — 0-byte/unparseable raw, ``is_error``, or ``total_cost_usd == 0``
+      AND every token count is 0 (the CLI produced no measurable work; treating that
+      as a free success would hide a broken run).
+    * **SUCCESS_ZERO_COST** — real tokens were produced but the bill is ``$0`` (an
+      unpriced/synthetic model, or a fully cache-served turn). The run ran fine; the
+      distinct member keeps that visible instead of collapsing it into ``SUCCESS``.
+    * **SUCCESS** — a non-zero cost.
+
+    A terminal ``blocked`` task outcome that still spent tokens is a SUCCESS *run*
+    (the task outcome is a separate concern from whether the run executed); at $0 it
+    surfaces as SUCCESS_ZERO_COST.
     """
     try:
         result = parse_result(raw)
@@ -173,8 +185,10 @@ def classify_result(raw: Any) -> RunStatus:
         return RunStatus.FAILURE
     if result.is_error:
         return RunStatus.FAILURE
-    if result.total_cost_usd == 0 and _is_zero_tokens(result.usage):
-        return RunStatus.FAILURE
+    if result.total_cost_usd == 0:
+        if _is_zero_tokens(result.usage):
+            return RunStatus.FAILURE
+        return RunStatus.SUCCESS_ZERO_COST
     return RunStatus.SUCCESS
 
 

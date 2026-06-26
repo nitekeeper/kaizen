@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import pytest
 
+from scripts.tokenmeter_model import TokenUsage, UsageRecord
 from scripts.tokenmeter_schema import (
     CATEGORY_FIELDS,
     ControlDriftError,
@@ -25,25 +26,45 @@ from scripts.tokenmeter_schema import (
 MODEL = "claude-opus-4-7"
 
 
+def _usage_obj(spec):
+    if isinstance(spec, TokenUsage):
+        return spec
+    spec = spec or {}
+    return TokenUsage(**{field: int(spec.get(field, 0) or 0) for field in CATEGORY_FIELDS})
+
+
 def _rec(**overrides):
-    base = {
-        "usage": {
-            "input_tokens": 1000,
-            "output_tokens": 500,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 200,
-        },
+    """Build a REAL frozen UsageRecord (not a dict) so the test cannot pass while the
+    production type is missing the run / phase / model / timestamp / cache_creation
+    fields the schema reads — the whole point of the dead-path fix."""
+    usage = _usage_obj(
+        overrides.pop(
+            "usage",
+            {
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 200,
+            },
+        )
+    )
+    cc = overrides.pop("cache_creation", None)
+    e5 = cc.get("ephemeral_5m_input_tokens") if isinstance(cc, dict) else None
+    e1 = cc.get("ephemeral_1h_input_tokens") if isinstance(cc, dict) else None
+    fields = {
+        "session_id": "sess-1",
         "model": MODEL,
         "run": "run-1",
         "phase": "implement",
         "agent_label": "backend-engineer-1",
+        "timestamp": "2026-06-25T10:00:00+00:00",
         "is_sidechain": False,
         "kept_but_suspect": False,
-        "session_id": "sess-1",
-        "timestamp": "2026-06-25T10:00:00+00:00",
+        "cache_creation_5m": e5,
+        "cache_creation_1h": e1,
     }
-    base.update(overrides)
-    return base
+    fields.update(overrides)
+    return UsageRecord(usage=usage, **fields)
 
 
 def _meta(**overrides):
@@ -141,14 +162,54 @@ def test_assemble_overhead_rows_static():
 def test_assemble_derived_rows_present():
     report = assemble([_rec()], [], outcomes=_outcomes(), metadata=_meta())
     names = {d["row"] for d in report["derived"]}
+    # tokens-per-call is emitted PER CATEGORY (never one summed scalar) — and there
+    # is NO input+output "total".
     assert names == {
         "cache_hit_rate",
-        "tokens_per_call",
+        "tokens_per_call.input_tokens",
+        "tokens_per_call.output_tokens",
+        "tokens_per_call.cache_creation_input_tokens",
+        "tokens_per_call.cache_read_input_tokens",
         "cost_usd",
         "effective_unit_cost_per_accepted_cycle",
     }
+    assert "tokens_per_call" not in names  # the misleading summed scalar is gone
     cost_row = next(d for d in report["derived"] if d["row"] == "cost_usd")
     assert cost_row["source"] == "oracle"
+    # Every derived figure carries a mode (enforced consistently with rows).
+    assert all(d.get("mode") in ("static", "dynamic") for d in report["derived"])
+
+
+def test_assemble_multi_run_cv_and_per_phase_rows_are_live():
+    """Finding C: REAL UsageRecords tagged with run + phase produce a multi-run CV
+    (n>1, non-None) on the category figures AND per-phase cost rows. Both were
+    vacuous (n always 1, cv None; phase always None → no per-phase rows) when the
+    production UsageRecord carried no run/phase fields."""
+
+    def _u(inp):
+        return {
+            "input_tokens": inp,
+            "output_tokens": 100,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
+
+    records = [
+        _rec(run="run-1", phase="implement", usage=_u(1000)),
+        _rec(run="run-2", phase="implement", usage=_u(1400)),
+        _rec(run="run-3", phase="review", usage=_u(1200)),
+    ]
+    report = assemble(records, [], outcomes=_outcomes(), metadata=_meta())
+
+    # Category figure now spans 3 distinct runs → n>1 with a real (non-None) CV.
+    input_row = next(r for r in report["rows"] if r["row"] == "input_tokens")
+    assert input_row["after"]["n"] == 3
+    assert input_row["after"]["cv"] is not None
+    assert report["metadata"]["n_runs"] == 3
+
+    # Per-phase cost rows appear (phase is no longer always None → no collapse).
+    phase_rows = {r["row"] for r in report["rows"] if r["kind"] == "phase"}
+    assert phase_rows == {"implement", "review"}
 
 
 def test_assemble_outcome_block():

@@ -121,22 +121,29 @@ def test_classify_zero_cost_and_zero_tokens_is_failure():
     assert classify_result(raw) is RunStatus.FAILURE
 
 
-def test_classify_zero_cost_with_tokens_is_success():
-    # Real tokens but $0 cost (e.g. fully cached) is still a SUCCESS run.
+def test_classify_zero_cost_with_tokens_is_success_zero_cost():
+    # Real tokens but $0 cost (e.g. fully cached / unpriced model) is the distinct
+    # SUCCESS_ZERO_COST — a flavour of success (NOT a failure), kept visible rather
+    # than collapsed into plain SUCCESS.
     raw = _result(total_cost_usd=0.0)
-    assert classify_result(raw) is RunStatus.SUCCESS
+    status = classify_result(raw)
+    assert status is RunStatus.SUCCESS_ZERO_COST
+    assert status is not RunStatus.FAILURE
 
 
 def test_classify_blocked_outcome_with_tokens_is_success_run():
     # A terminal `blocked` task outcome that still spent tokens is a SUCCESS run
-    # (task outcome != run success). Mirrors the host FakeCliRunner blocked shape.
+    # (task outcome != run success). At $0 it surfaces as SUCCESS_ZERO_COST — still
+    # a success flavour, never FAILURE. Mirrors the host FakeCliRunner blocked shape.
     raw = {
         "usage": {"output_tokens": 5, "input_tokens": 3},
         "total_cost_usd": 0.0,
         "is_error": False,
         "structured_output": {"type": "task_result", "status": "blocked"},
     }
-    assert classify_result(raw) is RunStatus.SUCCESS
+    status = classify_result(raw)
+    assert status is RunStatus.SUCCESS_ZERO_COST
+    assert status is not RunStatus.FAILURE
 
 
 # ── injectable runner (no real claude) ───────────────────────────────────────

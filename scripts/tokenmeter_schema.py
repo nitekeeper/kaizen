@@ -36,7 +36,7 @@ Hard rules baked in here (each enforced by :func:`validate_report` or a guard):
   fills ``n=1``, ``cv=null``, ``confidence='directional'``.
 * **Cost-oracle reconciliation.** The Seam-B computed total is reconciled against
   the Seam-A oracle total with tolerance ``max(1% relative, $0.005 floor)``:
-  within tolerance AGREE; 1–5% SOFT (emitted, flagged approximated); >5% HARD
+  within tolerance AGREE; 1-5% SOFT (emitted, flagged approximated); >5% HARD
   (blocks the ``validated`` status). Both totals are ALWAYS recorded together
   with a ``subagent_gap`` discriminator that attributes the gap to a
   ``subagent-boundary`` (Seam A approximates the orchestrator-only share) or to
@@ -164,9 +164,24 @@ def _is_sidechain(rec):
 
 
 def _record_cost(rec, default_model):
-    """Price one record with the pricing model (record model → default)."""
+    """Price one record with the pricing model (record model → default).
+
+    The cache-write TTL split lives on the record (``cache_creation_5m`` /
+    ``cache_creation_1h``), NOT on the four-category ``usage``, so it is handed to
+    :func:`~scripts.tokenmeter_pricing.cost_usd` explicitly — that is what fires the
+    EXACT TTL-split pricing path (1h at 2.0x) on a real parsed record. When neither
+    is set we pass ``None`` and pricing falls back to the flat-5m approximation.
+    """
     usage = _get(rec, "usage", rec)
-    return cost_usd(usage, _rec_model(rec, default_model))
+    e5 = _get(rec, "cache_creation_5m")
+    e1 = _get(rec, "cache_creation_1h")
+    cache_creation = None
+    if e5 is not None or e1 is not None:
+        cache_creation = {
+            "ephemeral_5m_input_tokens": e5 or 0,
+            "ephemeral_1h_input_tokens": e1 or 0,
+        }
+    return cost_usd(usage, _rec_model(rec, default_model), cache_creation=cache_creation)
 
 
 # ── Dynamic aggregate shape ──────────────────────────────────────────────────
@@ -327,6 +342,11 @@ def _category_figure(records, field):
 
 
 def _category_rows(records, before_rows):
+    # Category rows are DYNAMIC (measured) figures. A static-only report carries no
+    # dynamic records, so emitting all-zero category rows tagged dynamic/measured
+    # would be a lie — suppress them entirely when there is nothing measured.
+    if not records:
+        return []
     suspect = any(_is_suspect(rec) for rec in records)
     rows = []
     for field in CATEGORY_FIELDS:
@@ -389,24 +409,37 @@ def _derived_rows(records, outcomes, cost_oracle, before_derived):
     cache_hit_rate = (total_read / denom) if denom else None
 
     n_calls = len(records)
-    # tokens_per_call is a DERIVED ratio (not a row total); the four-category
-    # never-sum rule governs the `rows` section, not this derived diagnostic.
-    total_tokens = sum(_usage_field(rec, field) for rec in records for field in CATEGORY_FIELDS)
-    tokens_per_call = (total_tokens / n_calls) if n_calls else None
+    # tokens-per-call is emitted PER CATEGORY — never as one summed scalar. A single
+    # summed "tokens_per_call" is dominated by cache_read (~99% of token COUNT) and
+    # is really "cache-reads per call"; tokens and cost rank the categories
+    # OPPOSITELY (cache_read dominates count, output dominates cost), so collapsing
+    # them hides the signal. We deliberately emit NO input+output "total".
+    specs = [("cache_hit_rate", cache_hit_rate, SOURCE_MEASURED, MODE_DYNAMIC)]
+    for field in CATEGORY_FIELDS:
+        total_field = sum(_usage_field(rec, field) for rec in records)
+        per_call = (total_field / n_calls) if n_calls else None
+        specs.append((f"tokens_per_call.{field}", per_call, SOURCE_MEASURED, MODE_DYNAMIC))
 
     headline_cost = cost_oracle["computed_total_cost_usd"]
     succeeded = int(_get(outcomes, "cycles_succeeded", 0) or 0)
     effective_unit_cost = (headline_cost / succeeded) if succeeded else None
 
-    specs = (
-        ("cache_hit_rate", cache_hit_rate, SOURCE_MEASURED),
-        ("tokens_per_call", tokens_per_call, SOURCE_MEASURED),
-        ("cost_usd", headline_cost, SOURCE_ORACLE),
-        ("effective_unit_cost_per_accepted_cycle", effective_unit_cost, SOURCE_ORACLE),
+    # cost figures carry SOURCE_ORACLE (validated against the Seam-A oracle) but are
+    # MODE_DYNAMIC — they are derived from the dynamic records, not a static estimate.
+    specs.append(("cost_usd", headline_cost, SOURCE_ORACLE, MODE_DYNAMIC))
+    specs.append(
+        ("effective_unit_cost_per_accepted_cycle", effective_unit_cost, SOURCE_ORACLE, MODE_DYNAMIC)
     )
+
     return [
-        {"row": name, "before": before_derived.get(name), "after": value, "source": source}
-        for name, value, source in specs
+        {
+            "row": name,
+            "before": before_derived.get(name),
+            "after": value,
+            "source": source,
+            "mode": mode,
+        }
+        for name, value, source, mode in specs
     ]
 
 
@@ -514,7 +547,8 @@ def validate_report(report):
 
     Checks: metadata keys present and non-null; every row has a non-null, valid
     ``source`` + ``mode`` + ``kind``; every derived figure has a non-null, valid
-    ``source``; the cost-oracle block records both totals + the verdict keys.
+    ``source`` + ``mode``; the cost-oracle block records both totals + the verdict
+    keys.
     """
     if not isinstance(report, Mapping):
         raise ReportValidationError("report must be a mapping")
@@ -546,6 +580,11 @@ def validate_report(report):
         source = entry.get("source")
         if source is None or source not in VALID_SOURCES:
             raise ReportValidationError(f"derived[{idx}].source null/invalid: {source!r}")
+        # Derived figures carry a mode too (enforced consistently with rows); they
+        # are dynamic-side diagnostics, never a static estimate.
+        mode = entry.get("mode")
+        if mode is None or mode not in VALID_MODES:
+            raise ReportValidationError(f"derived[{idx}].mode null/invalid: {mode!r}")
 
     cost_oracle = report.get("cost_oracle")
     if not isinstance(cost_oracle, Mapping):

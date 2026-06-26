@@ -63,7 +63,7 @@ def _figure_mean(value):
 
 
 def _local_day(timestamp):
-    """LOCAL-timezone ``%Y-%m-%d`` for an ISO string or epoch; ``unknown`` if unparseable."""
+    """LOCAL-timezone ``%Y-%m-%d`` for an ISO string or epoch SECONDS; ``unknown`` if unparseable."""
     if timestamp is None:
         return "unknown"
     try:
@@ -74,6 +74,23 @@ def _local_day(timestamp):
         return moment.strftime("%Y-%m-%d")
     except (ValueError, OverflowError, OSError):
         return "unknown"
+
+
+def _record_local_day(rec):
+    """LOCAL-tz ``%Y-%m-%d`` for a record, preferring the parsed ``ts_epoch_ms``.
+
+    Seam B parses the RFC3339 ``timestamp`` into ``ts_epoch_ms`` (epoch
+    MILLISECONDS); when present we bucket off it (converted to seconds), so the
+    daily rollup + LOCAL-tz bucketing are live on real records. Otherwise we fall
+    back to the raw ``timestamp`` string (the duck-typed dict-fixture path).
+    """
+    ms = _get(rec, "ts_epoch_ms")
+    if isinstance(ms, int | float) and not isinstance(ms, bool):
+        try:
+            return datetime.fromtimestamp(ms / 1000.0).astimezone().strftime("%Y-%m-%d")
+        except (ValueError, OverflowError, OSError):
+            return "unknown"
+    return _local_day(_get(rec, "timestamp"))
 
 
 def _saturate(value):
@@ -239,7 +256,7 @@ def to_daily_rollup(records, *, default_model=None):
     """Roll records up per (LOCAL day, model) with the four categories kept split."""
     buckets: dict = {}
     for rec in records:
-        key = (_local_day(_get(rec, "timestamp")), _get(rec, "model") or default_model or "")
+        key = (_record_local_day(rec), _get(rec, "model") or default_model or "")
         bucket = buckets.setdefault(key, dict.fromkeys(CATEGORY_FIELDS, 0))
         usage = _get(rec, "usage", rec)
         for field in CATEGORY_FIELDS:
@@ -258,7 +275,7 @@ def to_daily_rollup(records, *, default_model=None):
 
 def _group_value(rec, key):
     if key == "day":
-        return _local_day(_get(rec, "timestamp"))
+        return _record_local_day(rec)
     if key == "role":
         return _get(rec, "agent_label")
     return _get(rec, key)

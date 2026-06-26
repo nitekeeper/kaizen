@@ -382,7 +382,8 @@ def static_footprint(skill_dir: str | Path, tokenizer: TokenCounter | None = Non
 
     files: list[dict] = []
     tiers: dict[str, dict] = {
-        tier: {"char_count": 0, "token_count": 0, "file_count": 0} for tier in TIERS
+        tier: {"char_count": 0, "token_count": 0, "file_count": 0}  # nosec B105
+        for tier in TIERS
     }
     total_chars = 0
     total_tokens = 0
@@ -409,7 +410,8 @@ def static_footprint(skill_dir: str | Path, tokenizer: TokenCounter | None = Non
         )
 
         bucket = tiers.setdefault(
-            tier, {"char_count": 0, "token_count": 0, "file_count": 0}
+            tier,
+            {"char_count": 0, "token_count": 0, "file_count": 0},  # nosec B105
         )
         bucket["char_count"] += char_count
         bucket["token_count"] += token_count

@@ -9,6 +9,7 @@ import json
 
 import pytest
 
+from scripts.tokenmeter_model import TokenUsage, UsageRecord
 from scripts.tokenmeter_render import (
     aggregate,
     render_csv,
@@ -17,31 +18,45 @@ from scripts.tokenmeter_render import (
     render_markdown,
     to_daily_rollup,
 )
-from scripts.tokenmeter_schema import assemble
+from scripts.tokenmeter_schema import CATEGORY_FIELDS, assemble
 
 MODEL = "claude-opus-4-7"
 
 
+def _usage_obj(spec):
+    if isinstance(spec, TokenUsage):
+        return spec
+    spec = spec or {}
+    return TokenUsage(**{field: int(spec.get(field, 0) or 0) for field in CATEGORY_FIELDS})
+
+
 def _rec(**overrides):
-    base = {
-        "usage": {
-            "input_tokens": 1000,
-            "output_tokens": 500,
-            "cache_creation_input_tokens": 100,
-            "cache_read_input_tokens": 200,
-        },
+    """Build a REAL frozen UsageRecord (not a dict) so the rollup/jsonl/aggregate
+    tests exercise the production type's actual model / timestamp / run / phase
+    fields rather than a dict that papers over a dead field."""
+    usage = _usage_obj(
+        overrides.pop(
+            "usage",
+            {
+                "input_tokens": 1000,
+                "output_tokens": 500,
+                "cache_creation_input_tokens": 100,
+                "cache_read_input_tokens": 200,
+            },
+        )
+    )
+    fields = {
+        "session_id": "sess-1",
         "model": MODEL,
         "run": "run-1",
-        "cycle": "c1",
         "phase": "implement",
         "agent_label": "backend-engineer-1",
+        "timestamp": "2026-06-25T10:00:00+00:00",
         "is_sidechain": False,
         "kept_but_suspect": False,
-        "session_id": "sess-1",
-        "timestamp": "2026-06-25T10:00:00+00:00",
     }
-    base.update(overrides)
-    return base
+    fields.update(overrides)
+    return UsageRecord(usage=usage, **fields)
 
 
 def _meta(**overrides):
@@ -184,15 +199,6 @@ def test_aggregate_rejects_unknown_group_by():
 
 
 def test_aggregate_saturating_sum():
-    huge = {
-        "usage": {
-            "input_tokens": 2**62,
-            "output_tokens": 0,
-            "cache_creation_input_tokens": 0,
-            "cache_read_input_tokens": 0,
-        },
-        "model": MODEL,
-        "run": "r",
-    }
-    out = aggregate([huge, dict(huge)], ["run"])
+    huge = UsageRecord(usage=TokenUsage(input_tokens=2**62), model=MODEL, run="r")
+    out = aggregate([huge, huge], ["run"])
     assert out[0]["input_tokens"] == 2**63 - 1  # saturated, never overflows past ceiling

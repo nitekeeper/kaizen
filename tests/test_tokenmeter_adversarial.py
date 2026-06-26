@@ -141,11 +141,19 @@ def test_t2_resumed_session_cross_file_dup_first_wins():
 
 
 def test_t3_sidechain_included_and_reparented(tmp_path):
-    """T3: orch out=100 (sess-P) + sidechain out=200 → sum(out)==300, 2 rows,
-    sidechain.session_id=='sess-P', sidechain carries the meta agent label."""
-    sess = tmp_path / "projects" / "proj" / "sess-P"
+    """T3: orch out=100 + sidechain out=200 → sum(out)==300, 2 rows, sidechain
+    reparented to the PARENT session via the line's OWN sessionId, agent label
+    from sibling meta.
+
+    NON-CIRCULAR: the session DIRECTORY is named differently from the session id, so
+    asserting ``session_id == 'sess-P'`` proves we read the line's ``sessionId``
+    field (the parent, per the verified on-disk contract) and NOT the directory name.
+    """
+    # Real layout: projects/<proj>/<parent-session-uuid>/subagents/agent-<child>.jsonl
+    # Here the dir is deliberately NOT named 'sess-P' to break circularity.
+    sess = tmp_path / "projects" / "proj" / "dir-name-is-not-the-session-id"
     sess.mkdir(parents=True)
-    (sess / "sess-P.jsonl").write_text(
+    (sess / "orchestrator.jsonl").write_text(
         _assistant(message_id="m-orch", session_id="sess-P", usage=_usage(output_tokens=100))
         + "\n",
         encoding="utf-8",
@@ -155,7 +163,7 @@ def test_t3_sidechain_included_and_reparented(tmp_path):
     (subagents / "agent-x.jsonl").write_text(
         _assistant(
             message_id="m-sub",
-            session_id="sess-S",
+            session_id="sess-P",  # the sidechain line's OWN sessionId IS the parent
             is_sidechain=True,
             usage=_usage(output_tokens=200),
         )
@@ -172,7 +180,9 @@ def test_t3_sidechain_included_and_reparented(tmp_path):
 
     sidechains = [r for r in records if r.is_sidechain]
     assert len(sidechains) == 1
-    assert sidechains[0].session_id == "sess-P"  # reparented from the path, not 'sess-S'
+    # 'sess-P' is the line's own sessionId (the parent) — NOT the dir name.
+    assert sidechains[0].session_id == "sess-P"
+    assert sidechains[0].session_id != "dir-name-is-not-the-session-id"
     assert sidechains[0].agent_label == "backend-engineer-1"  # tagged from sibling meta
 
 
@@ -195,18 +205,21 @@ def test_t4_malformed_and_empty_lines_do_not_raise():
 
 def test_t5_unknown_model_keeps_tokens_zero_cost_success():
     """T5: <synthetic> model in=1000 out=500 → tokens kept (sum 1500), cost==$0,
-    run classifies SUCCESS (zero-cost success), NOT failure."""
+    run classifies SUCCESS_ZERO_COST (the distinct zero-cost-with-tokens state),
+    NOT failure and NOT plain SUCCESS."""
     usage = _usage(input_tokens=1000, output_tokens=500)
     breakdown = cost_usd(usage, "<synthetic>")
     assert breakdown.priced is False
     assert breakdown.total_cost == 0.0
     assert breakdown.input_tokens + breakdown.output_tokens == 1500  # tokens kept
 
-    # A run that spent real tokens at $0 (e.g. unpriced/synthetic) is SUCCESS.
+    # A run that spent real tokens at $0 (e.g. unpriced/synthetic) is the distinct
+    # SUCCESS_ZERO_COST — a success flavour, never FAILURE, never collapsed to SUCCESS.
     status = classify_result(
         _result(usage={"input_tokens": 1000, "output_tokens": 500}, total_cost_usd=0.0)
     )
-    assert status is RunStatus.SUCCESS
+    assert status is RunStatus.SUCCESS_ZERO_COST
+    assert status is not RunStatus.FAILURE
 
 
 def test_t6_unkeyed_lines_never_deduped():

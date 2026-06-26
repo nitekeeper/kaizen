@@ -29,10 +29,19 @@ An unkeyed line (no ``message.id``) is NEVER deduped — we cannot prove it is a
 duplicate, and dropping it would under-count.
 
 SIDECHAIN = INCLUDE: a sub-agent ("sidechain") line still spends real tokens, so
-it is counted. But its own ``sessionId`` is the sub-agent's, not the parent run's,
-so the parent session id is recovered from the path
-(``agent-*.jsonl`` → ``<parent>/subagents/agent-*.jsonl`` → ``parent.parent.name``)
-and the agent label is read from the sibling ``agent-<id>.meta.json`` ``agentType``.
+it is counted. CONFIRMED on-disk layout (empirically verified against 1046 real
+subagent transcripts under ``~/.claude/projects`` on 2026-06-25):
+
+    projects/<encoded-project>/<parent-session-uuid>/subagents/agent-<child-id>.jsonl
+
+and — contrary to an earlier assumption — the sidechain line's OWN ``sessionId``
+field is the PARENT session uuid (it equalled the ``<parent-session-uuid>``
+directory in 100% of the sample); the CHILD id is carried separately in
+``agentId`` (it matches the ``agent-<child-id>`` filename). So per tokscale's
+verified contract we set the record's ``session_id`` directly from the line's own
+``sessionId`` (the parent), and fall back to the path's ``parent.parent.name`` only
+when the line carries no ``sessionId``. The agent label is read from the sibling
+``agent-<id>.meta.json`` ``agentType``.
 
 PURITY: the parsing/aggregation functions are pure — they take the file list,
 line strings, and an injected ``meta_lookup`` resolver as arguments and never
@@ -52,6 +61,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -81,6 +91,13 @@ except ImportError:  # pragma: no cover
         agent_label: str | None = None
         is_sidechain: bool = False
         kept_but_suspect: bool = False
+        model: str | None = None
+        timestamp: str | None = None
+        ts_epoch_ms: int | None = None
+        run: str | None = None
+        phase: str | None = None
+        cache_creation_5m: int | None = None
+        cache_creation_1h: int | None = None
 
 
 # A token count above this is implausible for a single line — kept, but flagged
@@ -184,6 +201,47 @@ def _token_usage_from(usage: Mapping[str, Any]) -> tuple[TokenUsage, bool]:
     return TokenUsage(**values), suspect
 
 
+def _cache_write_ttl(usage: Mapping[str, Any]) -> tuple[int | None, int | None]:
+    """Extract the cache-write TTL split from a raw usage mapping.
+
+    Real transcripts carry the split nested under
+    ``message.usage.cache_creation.{ephemeral_5m_input_tokens,
+    ephemeral_1h_input_tokens}`` (verified live). When that nested block is present
+    we return ``(5m, 1h)`` hardened to non-negative ints (a missing bucket → 0) so
+    the pricing layer can fire its EXACT TTL-split path. When the block is absent we
+    return ``(None, None)`` so pricing falls back to the flat-as-5m approximation.
+    This is a pricing refinement WITHIN ``cache_creation_input_tokens`` — never a
+    fifth token category.
+    """
+    if not isinstance(usage, Mapping):
+        return None, None
+    block = usage.get("cache_creation")
+    if not isinstance(block, Mapping):
+        return None, None
+    e5, _ = _harden_token(block.get("ephemeral_5m_input_tokens"))
+    e1, _ = _harden_token(block.get("ephemeral_1h_input_tokens"))
+    return e5, e1
+
+
+def _parse_timestamp_ms(value: Any) -> int | None:
+    """Parse an RFC3339 ``timestamp`` string to epoch milliseconds (PURE).
+
+    Pure: it relies on the offset embedded in the string (real transcripts stamp a
+    ``Z``/``+00:00`` suffix) and NEVER reads a wall clock or the local tz, so the
+    result is deterministic. A naive (offset-less) value is assumed UTC rather than
+    silently picking up the host tz. Unparseable / non-string input → ``None``.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return int(moment.timestamp() * 1000)
+
+
 # ── per-line parse (PURE) ───────────────────────────────────────────────────
 
 
@@ -229,18 +287,27 @@ def parse_transcript_line(
     raw_usage = message.get("usage")
     usage_map = raw_usage if isinstance(raw_usage, Mapping) else {}
     token_usage, suspect = _token_usage_from(usage_map)
+    cache_5m, cache_1h = _cache_write_ttl(usage_map)
     dedup_key = _dedup_key(message, obj)
+
+    raw_model = message.get("model")
+    model = raw_model if isinstance(raw_model, str) and raw_model else None
+    raw_ts = obj.get("timestamp")
+    timestamp = raw_ts if isinstance(raw_ts, str) and raw_ts else None
+    ts_epoch_ms = _parse_timestamp_ms(raw_ts)
 
     src_path = Path(source)
     is_sidechain = obj.get("isSidechain") is True
+    sid = obj.get("sessionId")
+    session_id: str | None = sid if isinstance(sid, str) and sid else None
     if is_sidechain:
-        # The sidechain line carries the sub-agent's OWN sessionId; the parent
-        # run is recovered from the path (.../<parent>/subagents/agent-*.jsonl).
-        session_id: str | None = src_path.parent.parent.name
+        # The sidechain line's OWN sessionId field IS the parent session (verified
+        # against real on-disk transcripts — see the module docstring). Fall back to
+        # the path's <parent-session-uuid> dir only when no sessionId is present.
+        if session_id is None:
+            session_id = src_path.parent.parent.name or None
         agent_label = meta_lookup(src_path) if meta_lookup is not None else None
     else:
-        sid = obj.get("sessionId")
-        session_id = sid if isinstance(sid, str) and sid else None
         agent_label = None
 
     return UsageRecord(
@@ -251,10 +318,24 @@ def parse_transcript_line(
         agent_label=agent_label,
         is_sidechain=is_sidechain,
         kept_but_suspect=suspect,
+        model=model,
+        timestamp=timestamp,
+        ts_epoch_ms=ts_epoch_ms,
+        cache_creation_5m=cache_5m,
+        cache_creation_1h=cache_1h,
     )
 
 
 # ── dedup / aggregation (PURE) ──────────────────────────────────────────────
+
+
+def _max_opt(first: int | None, second: int | None) -> int | None:
+    """Per-field MAX of two optional counts; ``None`` only when BOTH are ``None``."""
+    if first is None:
+        return second
+    if second is None:
+        return first
+    return max(first, second)
 
 
 def _merge_max(first: UsageRecord, second: UsageRecord) -> UsageRecord:
@@ -284,6 +365,15 @@ def _merge_max(first: UsageRecord, second: UsageRecord) -> UsageRecord:
         agent_label=first.agent_label or second.agent_label,
         is_sidechain=first.is_sidechain or second.is_sidechain,
         kept_but_suspect=first.kept_but_suspect or second.kept_but_suspect,
+        model=first.model or second.model,
+        timestamp=first.timestamp or second.timestamp,
+        ts_epoch_ms=first.ts_epoch_ms if first.ts_epoch_ms is not None else second.ts_epoch_ms,
+        run=first.run or second.run,
+        phase=first.phase or second.phase,
+        # Streaming partials grow, so the TTL split (like the token counts) merges
+        # by per-field MAX; ``None`` only when neither partial carried a split.
+        cache_creation_5m=_max_opt(first.cache_creation_5m, second.cache_creation_5m),
+        cache_creation_1h=_max_opt(first.cache_creation_1h, second.cache_creation_1h),
     )
 
 
@@ -338,9 +428,7 @@ def aggregate_usage(
     seen: set[str] = set()
     out: list[UsageRecord] = []
     for entry in ordered:
-        records = parse_transcript_file(
-            entry["lines"], entry["source"], meta_lookup=meta_lookup
-        )
+        records = parse_transcript_file(entry["lines"], entry["source"], meta_lookup=meta_lookup)
         for record in records:
             if record.dedup_key is None:
                 out.append(record)

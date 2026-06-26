@@ -13,7 +13,9 @@ from pathlib import Path
 import pytest
 
 from scripts.tokenmeter_scenario import (
+    DIFFERENTIATION_FILTER_CLAUSE,
     Scenario,
+    auto_generate_scenario,
     compute_scenario_hash,
     from_mapping,
     load_scenario,
@@ -147,3 +149,132 @@ def test_example_scenario_file_is_valid_and_targets_a_real_skill():
     assert s.source == "user"
     assert (REPO_ROOT / s.target / "SKILL.md").is_file()
     assert s.scenario_hash == compute_scenario_hash(s.prompt, s.target)
+
+
+# ── auto-generated scenarios (Cycle-3; heuristic-first, NO LLM) ───────────────
+
+
+def _make_skill(
+    root,
+    *,
+    description="Use this skill to summarize a target file in exactly three sentences.",
+    with_usage=True,
+):
+    """Build an inline plugin tree → the skill dir under ``root`` (repo root)."""
+    (root / ".claude-plugin").mkdir(parents=True)
+    (root / ".claude-plugin" / "plugin.json").write_text(
+        json.dumps({"name": "demo"}), encoding="utf-8"
+    )
+    skill_dir = root / "skills" / "widget"
+    skill_dir.mkdir(parents=True)
+    body = "# widget\n\nDoes a representative thing.\n"
+    if with_usage:
+        body += "\n## Usage\n\n```\nwidget:run <path> --mode fast\n```\n"
+    (skill_dir / "SKILL.md").write_text(
+        f"---\ndescription: {description}\n---\n\n{body}", encoding="utf-8"
+    )
+    return skill_dir
+
+
+class _FakeRunner:
+    """Async injectable claude runner returning a fixed ``result`` envelope."""
+
+    def __init__(self, text):
+        self.text = text
+        self.calls = []
+
+    async def __call__(self, argv, cwd=None):
+        self.calls.append(list(argv))
+        return json.dumps({"result": self.text, "total_cost_usd": 0.01, "is_error": False})
+
+
+class _BoomRunner:
+    async def __call__(self, argv, cwd=None):
+        raise RuntimeError("synthesis failed")
+
+
+def test_auto_generate_heuristic_is_stable_and_valid(tmp_path):
+    """Heuristic auto-gen (NO LLM) yields a stable Scenario(source='auto') with a
+    non-empty prompt + a valid 16-hex hash, and is deterministic across calls."""
+    skill_dir = _make_skill(tmp_path)
+
+    s1 = auto_generate_scenario(skill_dir)
+    s2 = auto_generate_scenario(skill_dir)
+
+    assert s1.source == "auto"
+    assert s1.target == "skills/widget"  # made repo-relative
+    assert s1.prompt  # non-empty
+    assert len(s1.scenario_hash) == 16
+    assert all(c in "0123456789abcdef" for c in s1.scenario_hash)
+    assert s1.scenario_hash == compute_scenario_hash(s1.prompt, s1.target)
+
+    # Deterministic: same skill dir → identical prompt + hash (no wall clock / randomness).
+    assert s1.prompt == s2.prompt
+    assert s1.scenario_hash == s2.scenario_hash
+
+    # The prompt mines the description + the documented example + the differentiation filter.
+    assert "three sentences" in s1.prompt
+    assert "widget:run" in s1.prompt
+    assert DIFFERENTIATION_FILTER_CLAUSE in s1.prompt
+    assert "do not modify any files" in s1.prompt
+
+
+def test_auto_generate_works_with_no_skill_md(tmp_path):
+    """A skill dir lacking SKILL.md still produces a non-empty, valid auto Scenario."""
+    skill_dir = tmp_path / "skills" / "bare"
+    skill_dir.mkdir(parents=True)
+    (tmp_path / "pyproject.toml").write_text("[tool.x]\n", encoding="utf-8")
+
+    s = auto_generate_scenario(skill_dir)
+    assert s.source == "auto"
+    assert s.prompt
+    assert s.scenario_hash == compute_scenario_hash(s.prompt, s.target)
+    assert DIFFERENTIATION_FILTER_CLAUSE in s.prompt
+
+
+def test_user_and_auto_feed_the_same_set_of_interests(tmp_path):
+    """Both sources produce the SAME-shaped Scenario the runner/schema consume — only
+    the ``source`` label (and how the prompt is produced) differ."""
+    skill_dir = _make_skill(tmp_path)
+
+    auto = auto_generate_scenario(skill_dir)
+    user = Scenario.create(name="hand", target=auto.target, prompt="hand-written prompt")
+
+    assert auto.source == "auto"
+    assert user.source == "user"
+    # Identical dataclass shape (same fields) → both flow through load/run/schema the same.
+    assert {f.name for f in auto.__dataclass_fields__.values()} == {
+        f.name for f in user.__dataclass_fields__.values()
+    }
+    for s in (auto, user):
+        assert s.prompt
+        assert len(s.scenario_hash) == 16
+        assert s.scenario_hash == compute_scenario_hash(s.prompt, s.target)
+
+
+def test_auto_generate_optional_runner_enriches_prompt(tmp_path):
+    """The OPTIONAL injectable runner synthesizes a richer prompt via ONE claude call,
+    with the guardrail clauses appended; source stays 'auto' and the hash stays valid."""
+    skill_dir = _make_skill(tmp_path)
+    runner = _FakeRunner("Refactor the widget loader and add a focused regression test.")
+
+    s = auto_generate_scenario(skill_dir, runner=runner)
+
+    assert len(runner.calls) == 1  # exactly one synthesis call
+    argv = runner.calls[0]
+    assert argv[0] == "claude" and "--output-format" in argv  # headless json, injectable
+    assert "Refactor the widget loader" in s.prompt  # the synthesized text is used
+    assert DIFFERENTIATION_FILTER_CLAUSE in s.prompt  # guardrails still appended
+    assert s.source == "auto"
+    assert s.scenario_hash == compute_scenario_hash(s.prompt, s.target)
+
+
+def test_auto_generate_runner_failure_falls_back_to_heuristic(tmp_path):
+    """A failing runner NEVER breaks auto-gen — it falls back to the heuristic prompt."""
+    skill_dir = _make_skill(tmp_path)
+
+    heuristic = auto_generate_scenario(skill_dir)
+    fallback = auto_generate_scenario(skill_dir, runner=_BoomRunner())
+
+    assert fallback.source == "auto"
+    assert fallback.prompt == heuristic.prompt  # identical to the NO-LLM path

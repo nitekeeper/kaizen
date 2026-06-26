@@ -99,6 +99,94 @@ Per kaizen's process-artifact policy these reports are gitignored; capture the c
 JSON + per-call evidence to Memex (`memex:run capture`) and mirror the delta table into the
 PR body. Query past benchmark runs via `memex:run ask`.
 
+## Cycle-3 extras
+
+These are **additive** conveniences layered on the Cycle-1/2 engine; the before/after
+procedure above is unchanged.
+
+### Auto-generated scenarios (heuristic-first, no LLM required)
+
+Instead of hand-writing `benchmark/scenarios/<name>.json`, kaizen can synthesize a
+representative workload from the target's own docs:
+
+```python
+from scripts.tokenmeter_scenario import auto_generate_scenario
+
+scenario = auto_generate_scenario("skills/improve")          # source="auto", NO LLM
+# optional richer prompt via ONE injectable claude call (falls back to heuristic):
+scenario = auto_generate_scenario("skills/improve", runner=real_claude_runner)
+```
+
+The default path is pure stdlib: it mines the target `SKILL.md`'s YAML `description`
+plus its documented `## Usage` / `## Example` invocations into a deterministic,
+mid-difficulty prompt (a **differentiation filter** keeps it neither trivial nor
+impossible). The same skill dir always yields the same `prompt` + `scenario_hash`, so an
+auto baseline is as comparable as a user one. Passing a `runner` (the injectable
+headless-`claude` shape from `scripts/tokenmeter_run.py`) synthesizes a richer prompt via
+one call; **any failure silently falls back to the heuristic**, and that synthesis call's
+cost is excluded from the target measurement (the benchmark scopes by the target run's own
+`session_id`). Regardless of source (`user` or `auto`), both feed the **same** measured
+"set of interests" — auto-gen only changes how the prompt is produced, never what is
+measured.
+
+### Daily rollup CLI (`daily`) — the atelier feature-2 feed
+
+```
+PYTHONPATH=. python3 scripts/tokenmeter.py daily [--config-dir DIR] [--since YYYY-MM-DD]
+```
+
+Walks the transcript root (`--config-dir`, else `$CLAUDE_CONFIG_DIR` / `~/.claude`) and
+emits the tokscale-compatible `to_daily_rollup`: one entry per **LOCAL-tz day × model**
+with the four token categories kept split (`input_tokens` / `output_tokens` /
+`cache_creation_input_tokens` / `cache_read_input_tokens`). `--since` keeps only days on
+or after the given date (`unknown`-day buckets are retained — they can't be proven to
+predate the cutoff). JSON to stdout; the walk is **read-only**.
+
+### OckScore — OPTIONAL calibrated composite
+
+`scripts/tokenmeter_schema.ockscore(outcome_score, total_tokens, *, lam=0.1, C=1e6)` =
+`outcome_score − λ·ln(T/C)`. It augments — **never replaces** — the raw cost/token
+figures, and surfaces as a clearly-labelled optional derived row
+(`ockscore_optional_composite`) **only** when an `outcome_score` is present. `C` is
+**recalibrated for kaizen scale** (`1e6`, vs OckBench's ~`1e4`) so the log term is ~0 at a
+typical run. `T` is the **per-run-mean total** — the sum of the four per-run-mean category
+figures (equivalently, the gross all-category token count divided by `n_runs`) — so it is
+consistent with the headline per-category rows and the single-run `C=1e6` anchor holds at
+any `N` (it is **not** the gross sum across runs, which would drift by `ln(N)`). Monotone by
+construction: more tokens at equal outcome → lower score; a better outcome at fewer tokens →
+higher.
+
+**Reaching it from the CLI.** The `benchmark` subcommand supplies the `outcome_score` so the
+row appears on a real run (otherwise the composite is dead in prod — nothing fed it):
+
+- `--outcome-score FLOAT` sets it explicitly (a `0..1` unit-of-work outcome), or
+- when omitted, it is **derived** from the run's outcome anchors:
+  `base = 1.0 if --tests-green else 0.0`, scaled by the cycle-success ratio
+  `--cycles-succeeded / (--cycles-succeeded + --cycles-abandoned)` when cycle counts are
+  present. With **no** outcome info at all (tests not green and no cycle counts) no score is
+  derived and the OPTIONAL row stays absent.
+
+So `tokenmeter benchmark <scenario> --tests-green --cycles-succeeded 3` (or
+`--outcome-score 0.9`) emits the ockscore row, while a bare run with no outcome flags does
+not.
+
+### Subagent-aggregation open question — status
+
+Design §4 flags an OPEN QUESTION: does the Seam-A `claude --output-format json` result
+object aggregate **subagent (sidechain)** usage, or only the orchestrator session?
+Resolution stance for this build:
+
+- **Seam B is ALWAYS authoritative** — the transcript walk INCLUDES sidechain tokens and
+  is the headline total + per-agent/per-phase breakdown. Seam A is the cost oracle
+  (validation only), never the headline.
+- `tests/test_seam_a_aggregation.py` proves the reconciliation is **correct under BOTH
+  regimes** (Seam-A-aggregates vs orchestrator-only): when the oracle covers only the
+  orchestrator share, the gap is attributed to the `subagent-boundary` discriminator, not
+  to `pricing`.
+- The **live reconciliation residual** (`cost_oracle.divergence_cause` on a real run) is
+  the production discriminator. We deliberately do **NOT** run an expensive live two-arm
+  probe to settle the question abstractly — the residual answers it for free on every run.
+
 ## Notes
 
 - The headless `claude` subprocess is the ONLY external call and is INJECTABLE: tests pass

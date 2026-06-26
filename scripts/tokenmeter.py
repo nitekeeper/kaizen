@@ -25,6 +25,13 @@ four subcommands, mirroring the :mod:`scripts.codegraph_recon` CLI shape
   ``BEFORE | AFTER | Δ`` view, REFUSING the delta (control-vector gate,
   :func:`scripts.tokenmeter_schema.assert_controls_match`) if model / effort /
   scenario / cycles / transport / rate-table drifted between the two.
+* ``daily [--config-dir DIR] [--since YYYY-MM-DD]`` — the tokscale-compatible per-day
+  token rollup (the atelier feature-2 feed). Walks the transcript root (``--config-dir``
+  or the default ``$CLAUDE_CONFIG_DIR`` / ``~/.claude``,
+  :func:`scripts.tokenmeter_transcript.collect_usage_records`), buckets the four token
+  categories per LOCAL-tz day + model
+  (:func:`scripts.tokenmeter_render.to_daily_rollup`), and emits JSON to stdout. Read-only
+  — it never mutates the transcript tree.
 
 Output: canonical JSON to stdout by default; ``--format md|csv`` for the human table.
 Diagnostics (run status, errors) go to stderr; on any error a single
@@ -41,10 +48,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from scripts.tokenmeter_render import render_csv, render_json, render_markdown
+from scripts.tokenmeter_render import render_csv, render_json, render_markdown, to_daily_rollup
 from scripts.tokenmeter_result import classify_result, parse_result
 from scripts.tokenmeter_run import (
     DEFAULT_PERMISSION_MODE,
@@ -53,7 +61,7 @@ from scripts.tokenmeter_run import (
     real_claude_runner,
 )
 from scripts.tokenmeter_scenario import load_scenario
-from scripts.tokenmeter_schema import assemble, assert_controls_match
+from scripts.tokenmeter_schema import assemble, assert_controls_match, derive_outcome_score
 from scripts.tokenmeter_static import static_footprint
 from scripts.tokenmeter_transcript import collect_usage_records
 
@@ -154,13 +162,29 @@ def _benchmark_outcomes(args: argparse.Namespace) -> dict[str, Any]:
     tokens-to-green anchor. Without these flags the outcome footer was always
     all-zero; here the operator supplies them so a token win that abandoned more
     cycles or shipped worse is visible in the same report.
+
+    OckScore (design §5) is an OPTIONAL composite that only surfaces when an
+    ``outcome_score`` is present. We honour an explicit ``--outcome-score`` and
+    otherwise DERIVE a ``0..1`` score from the anchors above (``--tests-green``
+    scaled by the cycle-success ratio — see
+    :func:`scripts.tokenmeter_schema.derive_outcome_score`), so the
+    ``ockscore_optional_composite`` row appears on a normal run that carries outcome
+    info and stays absent when it carries none. Without this the row was unreachable
+    from the CLI (the feature was dead in prod).
     """
-    return {
+    outcomes: dict[str, Any] = {
         "cycles_succeeded": args.cycles_succeeded,
         "cycles_abandoned": args.cycles_abandoned,
         "pr_opened": args.pr_opened,
         "tests_green": args.tests_green,
     }
+    if args.outcome_score is not None:
+        outcomes["outcome_score"] = args.outcome_score
+    else:
+        derived = derive_outcome_score(outcomes)
+        if derived is not None:
+            outcomes["outcome_score"] = derived
+    return outcomes
 
 
 def _warn_failed_runs(report: dict[str, Any]) -> None:
@@ -272,6 +296,40 @@ def cmd_dynamic(args: argparse.Namespace) -> int:
         raise FileNotFoundError(f"no such transcript root or result json: {source}")
 
     _emit_report(report, args.format)
+    return 0
+
+
+def _validate_since(value: str) -> str:
+    """Validate a ``--since`` value is a ``YYYY-MM-DD`` date; raise ``ValueError`` else."""
+    try:
+        datetime.strptime(value, "%Y-%m-%d")  # a date-only key, never a wall-clock moment
+    except ValueError as exc:
+        raise ValueError(f"--since must be YYYY-MM-DD, got {value!r}") from exc
+    return value
+
+
+def cmd_daily(args: argparse.Namespace) -> int:
+    """``daily`` — tokscale-compatible per-day token rollup (atelier feature-2 feed).
+
+    Harvests :func:`scripts.tokenmeter_transcript.collect_usage_records` over the
+    ``--config-dir`` transcript root (or the default ``$CLAUDE_CONFIG_DIR`` / ``~/.claude``
+    when omitted) and emits :func:`scripts.tokenmeter_render.to_daily_rollup` — one bucket
+    per (LOCAL-tz ``%Y-%m-%d``, model) with the four token categories kept SPLIT, using the
+    tokscale-compatible field names. ``--since YYYY-MM-DD`` keeps only days on
+    or after that date (``unknown``-day buckets — records with no/unparseable timestamp —
+    are retained, since they cannot be proven to predate the cutoff). JSON to stdout; the
+    walk is read-only and never mutates the transcript tree.
+    """
+    records = collect_usage_records(config_dir=args.config_dir)
+    rollup = to_daily_rollup(records)
+    if args.since:
+        since = _validate_since(args.since)
+        rollup = [
+            entry
+            for entry in rollup
+            if entry.get("day") == "unknown" or str(entry.get("day")) >= since
+        ]
+    print(json.dumps(rollup, indent=2, sort_keys=True, default=str))
     return 0
 
 
@@ -418,12 +476,37 @@ def main(argv: list[str], *, runner: Any = None) -> int:
     p_benchmark.add_argument(
         "--tests-green", action="store_true", help="mark that the target's tests were green"
     )
+    p_benchmark.add_argument(
+        "--outcome-score",
+        type=float,
+        default=None,
+        help=(
+            "explicit 0..1 unit-of-work outcome for the OPTIONAL OckScore composite "
+            "(design §5); when omitted it is DERIVED from --tests-green + the cycle-success "
+            "ratio so the ockscore row still appears on a normal run with outcome info"
+        ),
+    )
     _add_meta_args(p_benchmark)
 
     p_report = sub.add_parser("report", help="delta two emitted reports (BEFORE | AFTER | delta)")
     p_report.add_argument("before", help="baseline report JSON")
     p_report.add_argument("after", help="improved report JSON")
     p_report.add_argument("--format", choices=_FORMATS, default="json")
+
+    p_daily = sub.add_parser(
+        "daily",
+        help="tokscale-compatible per-day token rollup (the atelier feature-2 feed)",
+    )
+    p_daily.add_argument(
+        "--config-dir",
+        default=None,
+        help="transcript root to walk ($CLAUDE_CONFIG_DIR); default ~/.claude",
+    )
+    p_daily.add_argument(
+        "--since",
+        default=None,
+        help="keep only LOCAL-tz days on or after this YYYY-MM-DD",
+    )
 
     args = parser.parse_args(argv)
 
@@ -436,6 +519,8 @@ def main(argv: list[str], *, runner: Any = None) -> int:
             return cmd_benchmark(args, runner=runner)
         if args.cmd == "report":
             return cmd_report(args)
+        if args.cmd == "daily":
+            return cmd_daily(args)
         return 2  # unreachable: required subparser
     except Exception as exc:
         print(json.dumps({"status": "error", "reason": str(exc)}))

@@ -49,6 +49,7 @@ records; it never evals, execs, or shells out. Stdlib-only.
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Mapping
 from datetime import datetime
 
@@ -126,6 +127,37 @@ _STABLE_CV = 0.15
 
 #: Saturating ceiling for aggregate sums (kept far above any real workload).
 SATURATION_MAX = 2**63 - 1
+
+# ── OckScore composite (OPTIONAL derived figure; design §5) ──────────────────
+#
+# An OckBench-style cost-adjusted outcome: ``outcome_score - lam * log(T / C)``. It is
+# an OPTIONAL, clearly-labelled composite that pairs a unit-of-work OUTCOME with the
+# token cost ``T`` so a "cheaper" run that shipped worse cannot read as a win. It NEVER
+# replaces the raw four-category token figures or the cost rows — it is an extra derived
+# row, emitted only when an ``outcome_score`` is supplied.
+#
+# CALIBRATION (the load-bearing recalibration): OckBench's reference scale ``C`` is
+# ~1e4 tokens, but a kaizen run is ~1e6-3.5e6 tokens. We therefore set ``C = 1e6`` so the
+# log term is ~0 at a typical kaizen run (neither rewarding nor penalising the baseline)
+# and grows/shrinks as a run costs more/less than that reference. ``T`` here is the
+# PER-RUN-MEAN total (the sum of the four per-run-mean category figures, i.e. the gross
+# all-category token count divided by the number of runs) — consistent with the headline
+# per-category rows so the single-run ``C=1e6`` anchor holds at any ``N`` rather than
+# drifting by ``ln(N)`` on the gross sum. It is computed for THIS composite only; it is
+# NOT presented as a headline "token total" (the per-category figures remain split and
+# authoritative).
+
+#: Reference token scale for OckScore, RECALIBRATED for kaizen (~1e6 run, not OckBench's
+#: ~1e4). ``log(T/C) == 0`` when ``T == C``, so a typical run neither gains nor loses.
+OCKSCORE_C = 1_000_000.0
+
+#: Default penalty weight ``lambda`` on the log-token term. Modest: a 10x token blow-up
+#: at equal outcome costs ``lam * ln(10) ~= 0.23`` outcome points. Advisory, overridable.
+OCKSCORE_LAMBDA = 0.1
+
+#: Floor applied to ``T`` before ``log`` so a zero/negative token count cannot blow up
+#: (``log(0)`` is undefined). One token is a harmless, monotone-preserving floor.
+_OCKSCORE_T_FLOOR = 1.0
 
 
 class ReportValidationError(ValueError):
@@ -211,6 +243,56 @@ def dynamic_figure(values):
     cv = (std / mean) if mean else None
     confidence = "stable" if (cv is not None and cv < _STABLE_CV) else "noisy"
     return {"n": n, "mean": mean, "cv": cv, "confidence": confidence}
+
+
+def ockscore(outcome_score, total_tokens, *, lam=OCKSCORE_LAMBDA, C=OCKSCORE_C):
+    """OckBench-style cost-adjusted outcome: ``outcome_score - lam * ln(T / C)``.
+
+    An OPTIONAL composite (design §5) that discounts an outcome by its token cost so a
+    cheaper-but-worse run cannot masquerade as a win. ``C`` is RECALIBRATED for kaizen
+    scale (:data:`OCKSCORE_C` = 1e6, vs OckBench's ~1e4), so the log term is ~0 at a
+    typical kaizen run. ``total_tokens`` is floored at :data:`_OCKSCORE_T_FLOOR` (so a
+    zero count can't hit ``log(0)``) and ``C`` is clamped positive.
+
+    Monotonicity (the contract): at a FIXED ``outcome_score``, MORE tokens -> a LOWER
+    score (the penalty grows with ``ln T``); at FIXED tokens, a HIGHER outcome -> a
+    higher score. It never replaces the raw cost/token figures; it only augments them.
+    """
+    outcome = float(outcome_score)
+    t = max(float(total_tokens), _OCKSCORE_T_FLOOR)
+    c = max(float(C), _OCKSCORE_T_FLOOR)
+    return outcome - float(lam) * math.log(t / c)
+
+
+def derive_outcome_score(outcomes):
+    """Derive a ``0..1`` ``outcome_score`` from a run's outcome anchors, or ``None``.
+
+    OckScore (design §5) is OPTIONAL — its row only surfaces when an ``outcome_score`` is
+    present. The CLI seldom has an explicit one, so this derives a sensible score from the
+    anchors the benchmark already records (so the composite is reachable on a normal run
+    instead of dead in prod):
+
+    * ``base = 1.0`` when ``tests_green`` else ``0.0`` (a green target is the delivered
+      unit of work);
+    * when cycle counts are present (``cycles_succeeded + cycles_abandoned > 0``) the base
+      is SCALED by the cycle-success ratio
+      ``cycles_succeeded / (cycles_succeeded + cycles_abandoned)`` so a run that abandoned
+      cycles scores below one that did not.
+
+    Returns ``None`` when there is NO gradeable outcome signal at all (tests not green AND
+    no cycle counts) — so the OPTIONAL row stays absent on a run with no outcome info. The
+    result is always within ``[0, 1]`` (a base in ``{0, 1}`` times a ratio in ``[0, 1]``).
+    """
+    tests_green = bool(_get(outcomes, "tests_green", False))
+    succeeded = max(0, int(_get(outcomes, "cycles_succeeded", 0) or 0))
+    abandoned = max(0, int(_get(outcomes, "cycles_abandoned", 0) or 0))
+    total = succeeded + abandoned
+    if not tests_green and total <= 0:
+        return None
+    base = 1.0 if tests_green else 0.0
+    if total > 0:
+        return base * (succeeded / total)
+    return base
 
 
 def _figure_value(fig):
@@ -436,7 +518,7 @@ def _derived_rows(records, outcomes, cost_oracle, before_derived):
         ("effective_unit_cost_per_accepted_cycle", effective_unit_cost, SOURCE_ORACLE, MODE_DYNAMIC)
     )
 
-    return [
+    rows = [
         {
             "row": name,
             "before": before_derived.get(name),
@@ -446,6 +528,52 @@ def _derived_rows(records, outcomes, cost_oracle, before_derived):
         }
         for name, value, source, mode in specs
     ]
+    ock = _ockscore_row(records, outcomes, before_derived)
+    if ock is not None:
+        rows.append(ock)
+    return rows
+
+
+def _ockscore_row(records, outcomes, before_derived):
+    """Build the OPTIONAL OckScore derived row, or ``None`` when not applicable.
+
+    Emitted ONLY when an ``outcome_score`` is supplied in ``outcomes`` AND there are
+    measured tokens — it is a labelled, calibrated composite (design §5) that augments,
+    never replaces, the raw cost/token figures. ``T`` is the PER-RUN-MEAN total (the sum
+    of the four per-run-mean category figures, i.e. gross tokens / n_runs) — consistent
+    with the headline per-category rows so the single-run ``C=1e6`` anchor holds at any
+    ``N`` rather than drifting by ``ln(N)`` on the gross sum. The row name flags it OPTIONAL
+    and the entry carries the calibration (``lam`` / ``C``) so a reader can see exactly how
+    it was computed. SOURCE_APPROX (advisory composite), MODE_DYNAMIC.
+    """
+    outcome_score = _get(outcomes, "outcome_score")
+    if outcome_score is None:
+        return None
+    # T is the PER-RUN-MEAN total (sum over the four per-run-mean category figures), NOT
+    # the gross sum across all N runs — so it matches the headline category rows (which
+    # ARE per-run means) and keeps the C=1e6 anchor (calibrated to ONE ~1e6-token run)
+    # valid at any N. Equivalent to gross_tokens / n_runs; still monotone in token volume,
+    # so the ockscore monotonicity contract is preserved.
+    total_tokens = sum(_category_figure(records, field)["mean"] for field in CATEGORY_FIELDS)
+    if total_tokens <= 0:
+        return None
+    name = "ockscore_optional_composite"
+    return {
+        "row": name,
+        "before": before_derived.get(name),
+        "after": ockscore(outcome_score, total_tokens),
+        "source": SOURCE_APPROX,
+        "mode": MODE_DYNAMIC,
+        "optional": True,
+        "note": (
+            "OPTIONAL composite outcome - lam*ln(T/C); T is the per-run-mean total; "
+            "augments, never replaces, the raw cost/token figures (design §5)"
+        ),
+        "outcome_score": float(outcome_score),
+        "total_tokens": round(total_tokens),
+        "lam": OCKSCORE_LAMBDA,
+        "C": OCKSCORE_C,
+    }
 
 
 def _index_rows(rows):

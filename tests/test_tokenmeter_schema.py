@@ -7,18 +7,24 @@ the transcript-tree reconciliation tests.
 
 from __future__ import annotations
 
+import math
+
 import pytest
 
 from scripts.tokenmeter_model import TokenUsage, UsageRecord
 from scripts.tokenmeter_schema import (
     CATEGORY_FIELDS,
+    OCKSCORE_C,
+    OCKSCORE_LAMBDA,
     ControlDriftError,
     ReportValidationError,
     assemble,
     assert_controls_match,
     controls_match,
+    derive_outcome_score,
     dynamic_figure,
     is_validated,
+    ockscore,
     reconcile_cost,
     validate_report,
 )
@@ -331,3 +337,130 @@ def test_reconcile_hard_blocks_validated():
     assert block["reconciled"] == "hard"
     assert block["blocks_validated"] is True
     assert is_validated({"cost_oracle": block}) is False
+
+
+# ── OckScore (OPTIONAL calibrated composite; design §5) ──────────────────────
+
+
+def test_ockscore_log_term_is_zero_at_C():
+    """``T == C`` → ``log(T/C) == 0`` → the score is the raw outcome (calibration anchor)."""
+    assert ockscore(0.8, OCKSCORE_C) == pytest.approx(0.8)
+    assert ockscore(1.0, OCKSCORE_C, lam=0.5) == pytest.approx(1.0)
+
+
+def test_ockscore_formula_matches_definition():
+    """``outcome - lam * ln(T/C)`` exactly (a known point: T = C·e)."""
+    t = OCKSCORE_C * math.e  # ln(T/C) == 1
+    assert ockscore(1.0, t) == pytest.approx(1.0 - OCKSCORE_LAMBDA)
+    assert ockscore(1.0, t, lam=0.25) == pytest.approx(0.75)
+
+
+def test_ockscore_monotonic_in_tokens_at_equal_outcome():
+    """MORE tokens at the SAME outcome → a strictly LOWER score (the cost penalty)."""
+    cheap = ockscore(1.0, 500_000)
+    mid = ockscore(1.0, 1_000_000)
+    expensive = ockscore(1.0, 3_000_000)
+    assert cheap > mid > expensive
+
+
+def test_ockscore_monotonic_in_outcome_at_equal_tokens():
+    """A BETTER outcome at the SAME token cost → a strictly HIGHER score."""
+    assert ockscore(0.9, 1_000_000) > ockscore(0.8, 1_000_000)
+
+
+def test_ockscore_floors_tokens_so_zero_does_not_blow_up():
+    """``T <= 0`` is floored (``log(0)`` is undefined) and stays finite + monotone."""
+    floored = ockscore(1.0, 0)
+    assert math.isfinite(floored)
+    assert floored == ockscore(1.0, 1)  # floored to one token
+    assert floored > ockscore(1.0, OCKSCORE_C)  # fewer tokens → higher than the anchor
+
+
+def test_ockscore_optional_row_present_only_with_outcome_score():
+    """The OckScore derived row is emitted ONLY when an ``outcome_score`` is supplied,
+    is clearly labelled OPTIONAL, and NEVER replaces the raw cost/token figures."""
+    records = [_rec(), _rec(run="run-2")]
+
+    with_score = assemble(
+        records, [], outcomes=_outcomes(outcome_score=0.85), oracle=None, metadata=_meta()
+    )
+    derived = {d["row"]: d for d in with_score["derived"]}
+    assert "ockscore_optional_composite" in derived
+    ock = derived["ockscore_optional_composite"]
+    assert ock["optional"] is True
+    assert ock["source"] == "approximated"
+    assert ock["mode"] == "dynamic"
+    assert ock["C"] == OCKSCORE_C
+    assert ock["lam"] == OCKSCORE_LAMBDA
+    assert ock["total_tokens"] > 0
+    # The raw cost + category figures still stand alongside it (never replaced).
+    assert "cost_usd" in derived
+    cats = {r["row"] for r in with_score["rows"] if r["kind"] == "category"}
+    assert cats == set(CATEGORY_FIELDS)
+    assert validate_report(with_score) is True
+
+    without_score = assemble(records, [], outcomes=_outcomes(), oracle=None, metadata=_meta())
+    assert "ockscore_optional_composite" not in {d["row"] for d in without_score["derived"]}
+
+
+def test_ockscore_row_omitted_when_no_tokens_measured():
+    """An ``outcome_score`` with NO measured tokens emits no OckScore row (nothing to
+    cost-adjust) — static-only/empty harvests stay clean."""
+    report = assemble([], [], outcomes=_outcomes(outcome_score=0.9), oracle=None, metadata=_meta())
+    assert "ockscore_optional_composite" not in {d["row"] for d in report["derived"]}
+
+
+def test_ockscore_T_is_per_run_mean_total_not_gross_at_n3():
+    """MINOR fix: ``T`` is the PER-RUN-MEAN total, so a ~1e6-token/run workload at N=3
+    has ``T ~= 1e6`` (the ``C=1e6`` anchor) — NOT the ~3e6 gross sum that was off by
+    ``ln(N)``. With ``T == C`` the log term is 0, so the score is the raw outcome."""
+
+    def _u():
+        return {
+            "input_tokens": 1_000_000,
+            "output_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+        }
+
+    records = [
+        _rec(run="run-1", usage=_u()),
+        _rec(run="run-2", usage=_u()),
+        _rec(run="run-3", usage=_u()),
+    ]
+    report = assemble(
+        records, [], outcomes=_outcomes(outcome_score=1.0), oracle=None, metadata=_meta()
+    )
+    ock = next(d for d in report["derived"] if d["row"] == "ockscore_optional_composite")
+    # PER-RUN-MEAN total ~= 1e6 (gross 3e6 / 3 runs), NOT the gross ~3e6.
+    assert ock["total_tokens"] == pytest.approx(1_000_000, rel=1e-9)
+    assert ock["total_tokens"] < 2_000_000
+    # T == C → ln(T/C) == 0 → the score is exactly the raw outcome (anchor holds at N=3).
+    assert ock["after"] == pytest.approx(1.0)
+
+
+def test_derive_outcome_score_from_anchors():
+    """The CLI-side derivation: ``tests_green`` base scaled by the cycle-success ratio,
+    and ``None`` when there is no gradeable outcome signal at all."""
+    # tests green + all cycles succeeded → 1.0
+    assert derive_outcome_score(
+        {"tests_green": True, "cycles_succeeded": 3, "cycles_abandoned": 0}
+    ) == pytest.approx(1.0)
+    # tests green, 2 of 3 cycles succeeded → scaled by the success ratio
+    assert derive_outcome_score(
+        {"tests_green": True, "cycles_succeeded": 2, "cycles_abandoned": 1}
+    ) == pytest.approx(2 / 3)
+    # tests green, no cycle counts → base only
+    assert derive_outcome_score({"tests_green": True}) == pytest.approx(1.0)
+    # tests NOT green → base 0.0 even when cycles succeeded (a valid score → row appears)
+    assert derive_outcome_score(
+        {"tests_green": False, "cycles_succeeded": 3, "cycles_abandoned": 0}
+    ) == pytest.approx(0.0)
+    # NO outcome info at all → None (the OPTIONAL row stays absent)
+    assert derive_outcome_score({}) is None
+    assert (
+        derive_outcome_score(
+            {"tests_green": False, "cycles_succeeded": 0, "cycles_abandoned": 0, "pr_opened": False}
+        )
+        is None
+    )

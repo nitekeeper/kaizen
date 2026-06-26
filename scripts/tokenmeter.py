@@ -1,7 +1,7 @@
 """tokenmeter CLI — the user-facing front door for kaizen's token-usage benchmark.
 
-Composes the six tokenmeter modules (collect -> price -> assemble -> render) behind
-three subcommands, mirroring the :mod:`scripts.codegraph_recon` CLI shape
+Composes the tokenmeter modules (collect -> price -> assemble -> render) behind
+four subcommands, mirroring the :mod:`scripts.codegraph_recon` CLI shape
 (``def main(argv) -> int`` + argparse sub-parsers + a ``sys.exit(main(...))`` guard):
 
 * ``static <skill_dir>`` — the deterministic static footprint of a skill/plugin
@@ -14,6 +14,13 @@ three subcommands, mirroring the :mod:`scripts.codegraph_recon` CLI shape
   a ``claude --output-format json`` result envelope (Seam A cost oracle,
   :func:`scripts.tokenmeter_result.parse_result`) and validates our rate math against
   the CLI's own ``total_cost_usd``.
+* ``benchmark <scenario.json>`` — the before/after harness. Loads a
+  :class:`scripts.tokenmeter_scenario.Scenario`, replays its prompt N times via an
+  injectable headless ``claude`` runner, and emits ONE static+dynamic
+  ``BenchmarkReport`` (:func:`scripts.tokenmeter_run.benchmark_target`). With
+  ``--out before.json`` then ``--out after.json`` around an improvement, the EXISTING
+  ``report`` subcommand renders the delta (the control-vector gate guarantees the
+  comparison is attributable to the edit, since both share the scenario_hash).
 * ``report <before.json> <after.json>`` — deltas two previously-emitted reports into a
   ``BEFORE | AFTER | Δ`` view, REFUSING the delta (control-vector gate,
   :func:`scripts.tokenmeter_schema.assert_controls_match`) if model / effort /
@@ -39,15 +46,25 @@ from typing import Any
 
 from scripts.tokenmeter_render import render_csv, render_json, render_markdown
 from scripts.tokenmeter_result import classify_result, parse_result
+from scripts.tokenmeter_run import (
+    DEFAULT_PERMISSION_MODE,
+    PERMISSION_MODES,
+    benchmark_target,
+    real_claude_runner,
+)
+from scripts.tokenmeter_scenario import load_scenario
 from scripts.tokenmeter_schema import assemble, assert_controls_match
 from scripts.tokenmeter_static import static_footprint
 from scripts.tokenmeter_transcript import collect_usage_records
 
 _FORMATS = ("json", "md", "csv")
 
-#: The CLI carries no run outcomes (cycles succeeded/abandoned, PR opened); those are
-#: a kaizen-run concern. ``assemble`` defaults every outcome field, so an empty dict
-#: yields a valid report.
+#: The ``static`` / ``dynamic`` subcommands carry no run outcomes (cycles
+#: succeeded/abandoned, PR opened) — those are a kaizen-run concern with no meaning
+#: for a one-shot footprint/transcript read. ``assemble`` defaults every outcome
+#: field, so an empty dict yields a valid report. The ``benchmark`` subcommand DOES
+#: accept them (see :func:`_benchmark_outcomes` + the ``--cycles-succeeded`` etc.
+#: flags) so its report honours design §5 "never report cost alone".
 _NO_OUTCOMES: dict[str, Any] = {}
 
 
@@ -86,14 +103,81 @@ def _metadata(args: argparse.Namespace, default_target: str) -> dict[str, Any]:
     }
 
 
+def _render(report: dict[str, Any], fmt: str) -> str:
+    """Render an assembled (or delta) report to a string in the requested format."""
+    if fmt == "md":
+        return render_markdown(report)
+    if fmt == "csv":
+        return render_csv(report)
+    return render_json(report)
+
+
 def _emit_report(report: dict[str, Any], fmt: str) -> None:
     """Render an assembled (or delta) report in the requested format to stdout."""
-    if fmt == "md":
-        print(render_markdown(report))
-    elif fmt == "csv":
-        sys.stdout.write(render_csv(report))
+    text = _render(report, fmt)
+    if fmt == "csv":
+        sys.stdout.write(text)
     else:
-        print(render_json(report))
+        print(text)
+
+
+def _benchmark_metadata(args: argparse.Namespace) -> dict[str, Any]:
+    """Build the caller-supplied metadata for ``benchmark`` (scenario fills the rest).
+
+    Only the descriptors the scenario does NOT own are set here: ``model`` (pricing
+    + control vector), ``transport`` / ``effort`` (control vector), and
+    ``target_commit`` (the before/after VERSION discriminator — NOT a control, so it
+    is expected to differ across a delta). ``target`` / ``subject`` / ``cycles``
+    override the scenario only when explicitly supplied.
+    """
+    md: dict[str, Any] = {
+        "model": args.model or "",
+        "transport": args.transport or "",
+        "effort": args.effort or "",
+    }
+    if args.target:
+        md["target"] = args.target
+    if args.subject:
+        md["subject"] = args.subject
+    if args.cycles:
+        md["cycles"] = args.cycles
+    if getattr(args, "target_commit", None):
+        md["target_commit"] = args.target_commit
+    return md
+
+
+def _benchmark_outcomes(args: argparse.Namespace) -> dict[str, Any]:
+    """Build the run-outcome dict for ``benchmark`` from the CLI flags.
+
+    Design §5 "never report cost alone" pairs the token figures with the run's
+    outcome (cycles succeeded/abandoned, PR opened, tests green) — the
+    tokens-to-green anchor. Without these flags the outcome footer was always
+    all-zero; here the operator supplies them so a token win that abandoned more
+    cycles or shipped worse is visible in the same report.
+    """
+    return {
+        "cycles_succeeded": args.cycles_succeeded,
+        "cycles_abandoned": args.cycles_abandoned,
+        "pr_opened": args.pr_opened,
+        "tests_green": args.tests_green,
+    }
+
+
+def _warn_failed_runs(report: dict[str, Any]) -> None:
+    """Print a fail-loud stderr summary if any dynamic run FAILED (design §4).
+
+    The report's ``runs`` block already carries the failure marker; this surfaces it
+    on stderr so an operator reading the terminal sees the broken run immediately,
+    not just whoever later parses the JSON.
+    """
+    runs = report.get("runs", {})
+    if runs.get("any_failed"):
+        print(
+            f"[tokenmeter] WARNING: {runs.get('runs_failed')}/{runs.get('n_runs')} "
+            f"benchmark run(s) FAILED — statuses={runs.get('statuses')}; the report's "
+            "measured rows reflect ONLY the runs that produced a transcript",
+            file=sys.stderr,
+        )
 
 
 # ── delta helpers (report subcommand) ────────────────────────────────────────
@@ -191,6 +275,46 @@ def cmd_dynamic(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_benchmark(args: argparse.Namespace, *, runner: Any = None) -> int:
+    """``benchmark`` — static+dynamic report for a scenario (the before/after harness).
+
+    ``runner`` is the INJECTABLE headless-``claude`` runner; tests pass a fake so
+    no real ``claude`` is spawned. When ``None`` the default
+    :func:`scripts.tokenmeter_run.real_claude_runner` shells the real binary. With
+    ``--out`` the report is written to a file (so ``before.json`` / ``after.json``
+    can feed the ``report`` delta); otherwise it is printed to stdout.
+    """
+    scenario = load_scenario(args.scenario)
+    eff_runner = runner if runner is not None else real_claude_runner
+    report = benchmark_target(
+        scenario,
+        n=args.n,
+        runner=eff_runner,
+        cwd=args.cwd,
+        config_dir=args.config_dir,
+        cycle=args.cycle,
+        repo_root=args.repo_root,
+        metadata=_benchmark_metadata(args),
+        outcomes=_benchmark_outcomes(args),
+        permission_mode=args.permission_mode,
+        evidence_out=args.evidence_out,
+        rollup_out=args.rollup_out,
+    )
+    _warn_failed_runs(report)
+    text = _render(report, args.format)
+    if args.out:
+        body = text if text.endswith("\n") else text + "\n"
+        Path(args.out).write_text(body, encoding="utf-8")
+        print(
+            f"[tokenmeter] benchmark report ({args.format}) written to {args.out}", file=sys.stderr
+        )
+    elif args.format == "csv":
+        sys.stdout.write(text)
+    else:
+        print(text)
+    return 0
+
+
 def cmd_report(args: argparse.Namespace) -> int:
     """``report`` — delta two emitted reports (refuses across a drifted control vector)."""
     before = _load_report(args.before)
@@ -204,11 +328,14 @@ def cmd_report(args: argparse.Namespace) -> int:
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 
-def main(argv: list[str]) -> int:
+def main(argv: list[str], *, runner: Any = None) -> int:
     """CLI entry. stdout = canonical output; diagnostics + errors → stderr.
 
-    On any error a single ``{"status": "error", "reason": ...}`` line is printed to
-    stdout and 1 is returned (the codegraph_recon idiom).
+    ``runner`` (keyword-only) is the injectable headless-``claude`` runner threaded
+    into the ``benchmark`` subcommand; tests pass a fake so no real ``claude`` is
+    spawned. It is ignored by the other subcommands. On any error a single
+    ``{"status": "error", "reason": ...}`` line is printed to stdout and 1 is
+    returned (the codegraph_recon idiom).
     """
     parser = argparse.ArgumentParser(
         prog="tokenmeter",
@@ -230,6 +357,69 @@ def main(argv: list[str]) -> int:
     p_dynamic.add_argument("--format", choices=_FORMATS, default="json")
     _add_meta_args(p_dynamic)
 
+    p_benchmark = sub.add_parser(
+        "benchmark",
+        help="static+dynamic report for a scenario JSON (the before/after harness)",
+    )
+    p_benchmark.add_argument("scenario", help="path to a benchmark/scenarios/<name>.json")
+    p_benchmark.add_argument("--format", choices=_FORMATS, default="json")
+    p_benchmark.add_argument(
+        "--out", default=None, help="write the report to this file (e.g. before.json)"
+    )
+    p_benchmark.add_argument("--n", type=int, default=3, help="number of dynamic runs (default 3)")
+    p_benchmark.add_argument("--cycle", default=None, help="kaizen cycle label to tag records with")
+    p_benchmark.add_argument(
+        "--cwd", default=None, help="working dir the headless claude runs in (default: process CWD)"
+    )
+    p_benchmark.add_argument(
+        "--config-dir",
+        default=None,
+        help=(
+            "OPTIONAL seeded-credentials $CLAUDE_CONFIG_DIR override; by DEFAULT the "
+            "harness does NOT relocate it (so subscription auth works) and scopes the "
+            "harvest by session_id instead"
+        ),
+    )
+    p_benchmark.add_argument(
+        "--repo-root",
+        default=None,
+        help="root the scenario target path resolves against (default: CWD)",
+    )
+    p_benchmark.add_argument(
+        "--target-commit", default=None, help="target version/commit (before/after discriminator)"
+    )
+    p_benchmark.add_argument(
+        "--permission-mode",
+        choices=PERMISSION_MODES,
+        default=DEFAULT_PERMISSION_MODE,
+        help=f"headless claude permission mode (default {DEFAULT_PERMISSION_MODE})",
+    )
+    p_benchmark.add_argument(
+        "--evidence-out",
+        default=None,
+        help="write the per-call Seam-B JSONL evidence (§5) to this path",
+    )
+    p_benchmark.add_argument(
+        "--rollup-out",
+        default=None,
+        help="write the tokscale-compatible daily-rollup (§7) JSON to this path",
+    )
+    # Run-outcome flags (design §5 — never report cost alone). Thread into the
+    # report's outcome footer; absent flags default to 0 / False as before.
+    p_benchmark.add_argument(
+        "--cycles-succeeded", type=int, default=0, help="cycles that succeeded this run"
+    )
+    p_benchmark.add_argument(
+        "--cycles-abandoned", type=int, default=0, help="cycles that were abandoned this run"
+    )
+    p_benchmark.add_argument(
+        "--pr-opened", action="store_true", help="mark that a PR was opened for this run"
+    )
+    p_benchmark.add_argument(
+        "--tests-green", action="store_true", help="mark that the target's tests were green"
+    )
+    _add_meta_args(p_benchmark)
+
     p_report = sub.add_parser("report", help="delta two emitted reports (BEFORE | AFTER | delta)")
     p_report.add_argument("before", help="baseline report JSON")
     p_report.add_argument("after", help="improved report JSON")
@@ -242,6 +432,8 @@ def main(argv: list[str]) -> int:
             return cmd_static(args)
         if args.cmd == "dynamic":
             return cmd_dynamic(args)
+        if args.cmd == "benchmark":
+            return cmd_benchmark(args, runner=runner)
         if args.cmd == "report":
             return cmd_report(args)
         return 2  # unreachable: required subparser

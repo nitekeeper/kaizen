@@ -110,6 +110,11 @@ VALID_MODES = (MODE_STATIC, MODE_DYNAMIC)
 
 VALID_KINDS = ("category", "phase", "role", "overhead")
 
+#: The :class:`~scripts.tokenmeter_result.RunStatus` FAILURE value, duplicated here
+#: as a literal so this assembly layer stays import-light (it never imports the
+#: Seam-A result/model layer). Kept in lockstep with ``RunStatus.FAILURE.value``.
+RUN_FAILURE = "failure"
+
 #: Reconciliation tolerance: relative 1% OR a $0.005 absolute floor (whichever
 #: is larger) is considered AGREEMENT.
 RECONCILE_REL_TOL = 0.01
@@ -461,10 +466,34 @@ def _scenario_hash(scenario_source):
     return hashlib.sha256((scenario_source or "").encode("utf-8")).hexdigest()[:16]
 
 
+def _runs_block(run_statuses):
+    """Summarize the per-run Seam-A classifications into the report's ``runs`` block.
+
+    ALWAYS present (an empty summary when no statuses are threaded) so a report can
+    never look CLEAN while a run silently FAILED (design §4, fail-loud): an
+    all-FAILURE harvest yields empty category rows + ``reconciled='unreconciled'``,
+    which on its own reads exactly like a no-op clean run — this ``runs`` block is
+    the explicit failure marker that prevents that masking. Each status normalizes
+    to its ``RunStatus.value`` string ("success" / "success_zero_cost" / "failure"),
+    so the emitted JSON stays clean (never ``"RunStatus.FAILURE"``).
+    """
+    statuses = [getattr(st, "value", None) or str(st) for st in (run_statuses or [])]
+    failed = sum(1 for s in statuses if s == RUN_FAILURE)
+    return {
+        "n_runs": len(statuses),
+        "statuses": statuses,
+        "runs_failed": failed,
+        "any_failed": failed > 0,
+        "all_failed": bool(statuses) and failed == len(statuses),
+    }
+
+
 # ── Assembly ─────────────────────────────────────────────────────────────────
 
 
-def assemble(records, static_rows, *, outcomes, oracle=None, before=None, metadata=None):
+def assemble(
+    records, static_rows, *, outcomes, oracle=None, before=None, metadata=None, run_statuses=None
+):
     """Assemble a ``BenchmarkReport`` (pure dict) from the upstream seams.
 
     ``records`` are Seam-B :class:`UsageRecord`-shaped objects (or dicts);
@@ -474,7 +503,10 @@ def assemble(records, static_rows, *, outcomes, oracle=None, before=None, metada
     ``oracle`` is the Seam-A :class:`ResultObject` (or any object exposing
     ``total_cost_usd``) used for reconciliation only; ``before`` is a prior report
     to delta against — its presence triggers the control-vector equality gate;
-    ``metadata`` supplies the run descriptors.
+    ``metadata`` supplies the run descriptors; ``run_statuses`` is the per-run
+    :class:`~scripts.tokenmeter_result.RunStatus` list from the dynamic harness
+    (folded into the top-level ``runs`` block so an all-FAILURE harvest can never
+    emit a report that reads clean — design §4 fail-loud).
 
     The returned report is validated by :func:`validate_report` before return, so
     a structurally-invalid report raises rather than escaping silently.
@@ -534,6 +566,7 @@ def assemble(records, static_rows, *, outcomes, oracle=None, before=None, metada
         "derived": derived,
         "outcome": outcome,
         "cost_oracle": cost_oracle,
+        "runs": _runs_block(run_statuses),
     }
     validate_report(report)
     return report
@@ -548,7 +581,8 @@ def validate_report(report):
     Checks: metadata keys present and non-null; every row has a non-null, valid
     ``source`` + ``mode`` + ``kind``; every derived figure has a non-null, valid
     ``source`` + ``mode``; the cost-oracle block records both totals + the verdict
-    keys.
+    keys; the ``runs`` block records the per-run status summary (the fail-loud
+    marker).
     """
     if not isinstance(report, Mapping):
         raise ReportValidationError("report must be a mapping")
@@ -598,6 +632,15 @@ def validate_report(report):
     ):
         if key not in cost_oracle:
             raise ReportValidationError(f"cost_oracle.{key} missing")
+
+    # The per-run status block — the fail-loud marker that stops an all-FAILURE
+    # harvest from emitting a report that reads clean (design §4).
+    runs = report.get("runs")
+    if not isinstance(runs, Mapping):
+        raise ReportValidationError("runs block missing")
+    for key in ("n_runs", "statuses", "runs_failed", "any_failed", "all_failed"):
+        if key not in runs:
+            raise ReportValidationError(f"runs.{key} missing")
     return True
 
 

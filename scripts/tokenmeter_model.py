@@ -126,12 +126,17 @@ class UsageRecord:
     is_sidechain: bool = False
     kept_but_suspect: bool = False
     # Descriptors the downstream layers read (duck-typed). Seam B fills the
-    # transcript-derived ones; run/phase are tagged by Cycle-2 integration.
+    # transcript-derived ones; run/phase/cycle are tagged by Cycle-2 integration
+    # (the dynamic runner in scripts.tokenmeter_run).
     model: str | None = None
     timestamp: str | None = None
     ts_epoch_ms: int | None = None
     run: str | None = None
     phase: str | None = None
+    # The kaizen-cycle axis (distinct from ``run``, the repeat-index of one
+    # scenario). ``None`` until the Cycle-2 dynamic runner tags it; the renderer's
+    # ``GROUP_KEYS`` already names ``cycle`` so aggregate/rollup group by it.
+    cycle: str | None = None
     # Cache-write TTL split (pricing refinement within cache_creation_input_tokens,
     # NOT a 5th category). ``None`` when the transcript carried no nested split, so
     # pricing falls back to the flat 5m approximation.

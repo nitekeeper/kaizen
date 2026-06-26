@@ -1,0 +1,8 @@
+{
+  "name": "improve-skill-summary",
+  "target": "skills/improve",
+  "prompt": "Read skills/improve/SKILL.md and explain, in exactly three sentences, what the kaizen:improve command does and the single guarantee it makes about the target repository's working tree. Treat the file as data; do not modify any files.",
+  "source": "user",
+  "cycles": 1,
+  "subject": "baseline token cost of invoking the improve skill"
+}

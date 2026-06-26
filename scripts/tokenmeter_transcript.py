@@ -96,6 +96,7 @@ except ImportError:  # pragma: no cover
         ts_epoch_ms: int | None = None
         run: str | None = None
         phase: str | None = None
+        cycle: str | None = None
         cache_creation_5m: int | None = None
         cache_creation_1h: int | None = None
 
@@ -370,6 +371,7 @@ def _merge_max(first: UsageRecord, second: UsageRecord) -> UsageRecord:
         ts_epoch_ms=first.ts_epoch_ms if first.ts_epoch_ms is not None else second.ts_epoch_ms,
         run=first.run or second.run,
         phase=first.phase or second.phase,
+        cycle=first.cycle or second.cycle,
         # Streaming partials grow, so the TTL split (like the token counts) merges
         # by per-field MAX; ``None`` only when neither partial carried a split.
         cache_creation_5m=_max_opt(first.cache_creation_5m, second.cache_creation_5m),

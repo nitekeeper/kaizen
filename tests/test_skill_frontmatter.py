@@ -78,9 +78,9 @@ def _parse_minimal_yaml(fm_body: str) -> dict[str, str]:
 
 def test_skill_files_discovered() -> None:
     """Sanity: globbing finds the expected count of SKILL.md files."""
-    # 1 public + 10 internal = 11
-    assert len(SKILL_FILES) == 11, (
-        f"Expected 11 SKILL.md files, found {len(SKILL_FILES)}: {SKILL_FILES}"
+    # 1 public + 11 internal = 12 (internal/benchmark added in tokenmeter Cycle-2)
+    assert len(SKILL_FILES) == 12, (
+        f"Expected 12 SKILL.md files, found {len(SKILL_FILES)}: {SKILL_FILES}"
     )
 
 

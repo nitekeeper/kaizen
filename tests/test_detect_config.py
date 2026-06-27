@@ -89,7 +89,7 @@ def test_detect_language_unknown(tmp_path):
 
 
 def test_detect_test_command_python(tmp_path):
-    assert detect_test_command(tmp_path, "python") == "pytest -v --tb=short"
+    assert detect_test_command(tmp_path, "python") == "pytest -q --tb=short"
 
 
 def test_detect_test_command_javascript_uses_package_script(tmp_path):
@@ -177,7 +177,7 @@ def test_detect_all_python(tmp_path):
     _make_python_repo(tmp_path)
     out = detect_all(tmp_path)
     assert out["language"] == "python"
-    assert out["test_command"] == "pytest -v --tb=short"
+    assert out["test_command"] == "pytest -q --tb=short"
     assert out["read_paths"] == [
         "scripts/*.py",
         "tests/*.py",

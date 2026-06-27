@@ -179,58 +179,38 @@ def build_engine_tasks(
 # ── Deliverable 2 — pre-bound closures (F7-trailer stripped) ────────────────
 
 
-# Stable anchor phrases for the THREE team-mode comms paragraphs a rendered
+# Stable anchor phrases for the TWO team-mode comms paragraphs a rendered
 # kaizen briefing can carry, in document order:
 #   1. the per-template "Reply format" paragraph (OK:/BLOCKED: + SendMessage) —
 #      present on `phase_4_implementation.md`, ABSENT on the Phase-5 review/mesh
 #      templates;
-#   2. the always-on terse-output rule (`_inject_terse_before_trailer`), which
-#      references the SendMessage / shutdown_response JSON protocol body — present
-#      on EVERY teammate-bound template that routes through the terse injection;
-#   3. the F7 trailer (TEAMMATE_REPLY_RULE — SendMessage(to="team-lead") + shutdown).
-# ALL THREE are team-mode-only and reference comms primitives that do not exist in
+#   2. the F7 trailer (TEAMMATE_REPLY_RULE — SendMessage(to="team-lead") + shutdown).
+# BOTH are team-mode-only and reference comms primitives that do not exist in
 # host mode (no team-lead, no SendMessage, no shutdown handshake), so host mode
 # cuts at the EARLIEST of them. The anchors are the byte-frozen openings of those
 # paragraphs.
-#
-# M8a-2b: the terse-rule anchor was ADDED to the candidate set. The Phase-4
-# implementer template carries the "Reply format" paragraph BEFORE the terse rule,
-# so for Phase-4 the cut point is unchanged (reply-format is still earliest). But
-# the Phase-5 review / mesh templates have NO "Reply format" paragraph — their
-# earliest comms anchor IS the terse rule, which references "SendMessage /
-# shutdown_response JSON protocol body". Without the terse anchor a review brief
-# would cut only the F7 trailer and SHIP the terse rule's SendMessage reference to
-# a host worker that has no SendMessage. Generalizing the cut to the earliest of
-# {reply-format, terse-rule, F7 trailer} fixes both phases with one rule.
 _REPLY_FORMAT_ANCHOR = "IMPORTANT — Reply format:"
-# Byte-frozen opening of `dispatch_templates._TERSE_OUTPUT_RULE` (B1 / caveman).
-_TERSE_OUTPUT_ANCHOR = "IMPORTANT — Output shape (terse):"
 
 
 def _strip_f7_trailer(rendered: str, trailer: str) -> str:
     """Strip ALL team-mode comms paragraphs from a rendered teammate briefing.
 
-    The team-mode rendered body carries up to three trailing team-only paragraphs
-    — the "Reply format" OK:/BLOCKED: rule (Phase-4 only), the always-on
-    terse-output rule (references the SendMessage / shutdown_response JSON), and
-    the F7 trailer (``SendMessage(to="team-lead")`` + shutdown JSON). ALL are
-    MEANINGLESS in host mode: the engine worker emits a terminal ``task_result``
-    envelope, not a SendMessage; there is no team-lead and no shutdown handshake.
-    Leaving ANY of them would instruct a host worker to use a primitive it does
-    not have.
+    The team-mode rendered body carries up to two trailing team-only paragraphs
+    — the "Reply format" OK:/BLOCKED: rule (Phase-4 only) and the F7 trailer
+    (``SendMessage(to="team-lead")`` + shutdown JSON). BOTH are MEANINGLESS in
+    host mode: the engine worker emits a terminal ``task_result`` envelope, not a
+    SendMessage; there is no team-lead and no shutdown handshake. Leaving EITHER
+    of them would instruct a host worker to use a primitive it does not have.
 
     We cut at the EARLIEST comms anchor found — the "Reply format" paragraph
-    opener, the terse-output-rule opener, or the F7 trailer span — whichever
-    appears first. The caller re-appends a host-specific terminal-envelope
-    instruction. Returns the surviving body, right-stripped.
+    opener or the F7 trailer span — whichever appears first. The caller
+    re-appends a host-specific terminal-envelope instruction. Returns the
+    surviving body, right-stripped.
     """
     candidates: list[int] = []
     rf_idx = rendered.find(_REPLY_FORMAT_ANCHOR)
     if rf_idx != -1:
         candidates.append(rf_idx)
-    terse_idx = rendered.find(_TERSE_OUTPUT_ANCHOR)
-    if terse_idx != -1:
-        candidates.append(terse_idx)
     t_idx = rendered.rfind(trailer)
     if t_idx != -1:
         candidates.append(t_idx)
@@ -606,8 +586,8 @@ def _make_review_briefing_for(
     window: the kaizen template fn, the (immutable) Action-Items list, the
     carry-forward prior-findings list, and the F7 trailer to strip. The closure
     does NO ``scripts.*`` import at call time. ``attempt`` is ignored for content
-    (the prompt is iteration-stamped, not attempt-stamped). The F7/terse/reply-
-    format trailer is cut via :func:`_strip_f7_trailer` and replaced by the host
+    (the prompt is iteration-stamped, not attempt-stamped). The F7/reply-format
+    trailer is cut via :func:`_strip_f7_trailer` and replaced by the host
     read-only terminal rule (which includes the C1 `git diff` instruction).
 
     The prior-findings carry-forward is the SAME ``prior_findings`` the team-mode

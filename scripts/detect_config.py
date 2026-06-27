@@ -61,7 +61,7 @@ def detect_test_command(repo_root: Path, language: str) -> str | None:
     """Return the test command for the language, or None for unknown."""
     repo_root = Path(repo_root)
     if language == "python":
-        return "pytest -v --tb=short"
+        return "pytest -q --tb=short"
     if language == "javascript":
         package_json = repo_root / "package.json"
         if package_json.exists():

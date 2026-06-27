@@ -13,8 +13,7 @@ module is the single implementation point:
   - :func:`loom_comms_block` — the MANDATORY instruction block injected
     into agent prompts.
   - :func:`augment_dispatch` — splice the block into a teammate-bound
-    dispatch body immediately BEFORE the F7 reply-rule trailer
-    (mirrors ``dispatch_templates._inject_terse_before_trailer`` so the
+    dispatch body immediately BEFORE the F7 reply-rule trailer (so the
     trailer stays terminal). Bodies WITHOUT the trailer (e.g. the GAP-7
     ``shutdown_request`` STRUCTURED-JSON payload) pass through
     unchanged — protocol messages must never grow prose.
@@ -227,9 +226,8 @@ def augment_dispatch(message: str, *, role: str, channel: str) -> str:
 
     - Loom unavailable (or any error) → ``message`` unchanged.
     - F7 trailer (``dispatch_templates.TEAMMATE_REPLY_RULE``) present →
-      insert the block immediately BEFORE the trailer (mirrors
-      ``_inject_terse_before_trailer``: the trailer stays the prompt's
-      LAST instruction).
+      insert the block immediately BEFORE the trailer (the trailer stays
+      the prompt's LAST instruction).
     - No trailer → unchanged. This is the protocol-payload guard: GAP-7
       ``shutdown_request`` JSON bodies (and any other control payloads)
       must pass through byte-exact.

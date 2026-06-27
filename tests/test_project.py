@@ -36,7 +36,7 @@ def _make(db, **overrides) -> dict:
         "git_url": "https://github.com/owner/repo.git",
         "name": "repo",
         "base_branch": "main",
-        "test_command": "pytest -v --tb=short",
+        "test_command": "pytest -q --tb=short",
         "read_paths": ["scripts/*.py", "tests/*.py"],
         "expert_roster": ["agent-systems-architect-1", "backend-engineer-1"],
         "language": "python",

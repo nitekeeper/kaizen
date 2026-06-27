@@ -794,6 +794,89 @@ def test_parse_pytest_pass_count_quiet_output():
     assert ci_runner.parse_pytest_pass_count("cargo test: ok. 12 passed; 0 failed\n") == 0
 
 
+# ── PASS-path output trim (token reduction Cut #2) ────────────────────────
+
+
+def _verbose_pytest_output(summary: str, n_progress: int = 2000) -> str:
+    """Build a realistic verbose pytest run: per-test progress + a summary."""
+    body = "\n".join(
+        f"tests/test_mod.py::test_case_{i} PASSED                  [{i:>3}%]"
+        for i in range(n_progress)
+    )
+    return (
+        "============================= test session starts =====\n"
+        f"collected {n_progress} items\n" + body + "\n" + summary + "\n"
+    )
+
+
+def _run_tests_branch(tmp_path, monkeypatch, returncode, stdout, stderr=""):
+    """Drive run_ci_checks so only the tests branch is exercised."""
+    clone = tmp_path / "c"
+    clone.mkdir()
+    (clone / "pyproject.toml").write_text('[project]\nname = "x"\n')
+
+    def fake_run(argv, *args, **kwargs):
+        if argv and argv[0] == "pytest":
+            return _mk_completed(returncode, stdout, stderr)
+        return _mk_completed(0, "", "")
+
+    monkeypatch.setattr(ci_runner.subprocess, "run", fake_run)
+    monkeypatch.setenv("KAIZEN_SKIP_PIP_AUDIT", "1")
+    _all, results = run_ci_checks(clone, "pytest -q")
+    return results
+
+
+def test_pass_output_trimmed_to_summary_but_parse_count_survives(tmp_path, monkeypatch):
+    """On PASS only the summary line is retained, yet parse_pytest_pass_count
+    still extracts the count and the bulk verbose body is dropped."""
+    summary = "2000 passed in 12.34s"
+    full = _verbose_pytest_output(summary, n_progress=2000)
+    results = _run_tests_branch(tmp_path, monkeypatch, 0, full)
+
+    assert results["tests"]["status"] == "pass"
+    out = results["tests"]["output"]
+    assert out == summary
+    # the per-test progress flood is gone
+    assert "PASSED" not in out
+    assert len(out) < len(full)
+    # the commit-message pass count still works off the trimmed output
+    assert ci_runner.parse_pytest_pass_count(out) == 2000
+
+
+def test_pass_output_keeps_warnings_summary_variant(tmp_path, monkeypatch):
+    """The `, 1 warning in ...` summary variant is preserved verbatim."""
+    full = _verbose_pytest_output("5 passed, 1 warning in 0.30s", n_progress=10)
+    results = _run_tests_branch(tmp_path, monkeypatch, 0, full)
+    out = results["tests"]["output"]
+    assert "5 passed, 1 warning in 0.30s" in out
+    assert ci_runner.parse_pytest_pass_count(out) == 5
+
+
+def test_fail_output_retained_verbatim(tmp_path, monkeypatch):
+    """On FAIL the full stdout+stderr is kept byte-for-byte for diagnosis."""
+    stdout = _verbose_pytest_output("1 failed, 1 passed in 0.20s", n_progress=50)
+    stderr = "Traceback (most recent call last):\n  AssertionError\n"
+    results = _run_tests_branch(tmp_path, monkeypatch, 1, stdout, stderr)
+    assert results["tests"]["status"] == "fail"
+    assert results["tests"]["output"] == stdout + stderr
+
+
+def test_pass_output_no_summary_falls_back_to_tail(tmp_path, monkeypatch):
+    """A passing runner that emits no recognizable summary line falls back to
+    the last few non-empty lines (never an empty string)."""
+    weird = "line one\nline two\n\nline three\nline four\n"
+    results = _run_tests_branch(tmp_path, monkeypatch, 0, weird)
+    out = results["tests"]["output"]
+    assert out != ""
+    assert out == "line two\nline three\nline four"
+
+
+def test_summarize_pass_output_no_tests_ran():
+    """`no tests ran in ...` counts as a summary line and is retained."""
+    full = "============================= test session starts =====\nno tests ran in 0.01s\n"
+    assert ci_runner._summarize_pass_output(full) == "no tests ran in 0.01s"
+
+
 # ── anti-resurrection guard (Finding 2 — test_runner.py deleted) ──────────
 
 REPO_ROOT = Path(__file__).resolve().parent.parent

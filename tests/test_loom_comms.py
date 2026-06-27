@@ -26,7 +26,6 @@ import pytest
 
 import scripts.loom_comms as loom_comms
 from scripts.dispatch_templates import (
-    _TERSE_OUTPUT_RULE,
     TEAMMATE_REPLY_RULE,
     phase_2_preanalysis,
     phase_5d_shutdown,
@@ -35,7 +34,6 @@ from scripts.dispatch_templates import (
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 _TRAILER = TEAMMATE_REPLY_RULE.strip()
-_TERSE = _TERSE_OUTPUT_RULE.strip()
 _MARKER = loom_comms._BLOCK_MARKER
 
 # ── fake loom_chat.py clients ─────────────────────────────────────────────
@@ -319,16 +317,15 @@ class TestAugmentDispatch:
 
     def test_exact_count_and_ordering_of_all_mechanisms(self, loom_available):
         """Exact-count rule (feedback-multi-mechanism-test-exact-count):
-        phase body + terse block + loom block + F7 trailer — each exactly
-        once, in that order."""
+        phase body + loom block + F7 trailer — each exactly once, in that
+        order."""
         out = loom_comms.augment_dispatch(
             _rendered_phase_2(), role="backend-engineer-1", channel="kaizen-c"
         )
-        assert out.count(_TERSE) == 1
         assert out.count(_MARKER) == 1
         assert out.count(_TRAILER) == 1
         body_idx = out.index("backend-engineer-1")  # phase body opener mentions participant
-        assert body_idx < out.index(_TERSE) < out.index(_MARKER) < out.index(_TRAILER)
+        assert body_idx < out.index(_MARKER) < out.index(_TRAILER)
         assert out.endswith(_TRAILER)
 
 

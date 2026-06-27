@@ -324,8 +324,12 @@ def test_abandonment_reason_taxonomy_is_nine_codes_in_docs():
 def test_phase_5c_minutes_not_committed_to_clone():
     """Phase 5c must NOT instruct writing minutes into the clone pre-commit:
     commit_cycle runs `git add -A`, so the minutes would land in the target
-    repo's PR diff. Memex is the canonical store (Phase 5d / CLAUDE.md)."""
-    text = (REPO_ROOT / "internal" / "cycle" / "SKILL.md").read_text(encoding="utf-8")
+    repo's PR diff. Memex is the canonical store (Phase 5d / CLAUDE.md).
+
+    The prose Phase 5c lives in the lazily-read `internal/cycle/prose-transport.md`
+    (the KAIZEN_TRANSPORT=prose opt-out path); the default host path never reads
+    it. The guard follows the content to its file."""
+    text = (REPO_ROOT / "internal" / "cycle" / "prose-transport.md").read_text(encoding="utf-8")
     assert "Also write the full meeting minutes into the clone" not in text
     assert "Do **NOT** write the minutes file into the clone" in text
 

@@ -1931,14 +1931,21 @@ def test_non_routable_blocker_drives_review_unrecoverable_not_silent_success(tmp
 def test_review_terminal_rule_placeholder_wording():
     """#11 (LOW-2) — the read-only review terminal rule names
     `review-noop.placeholder` (matching the FakeCliRunner's `{tid}.noop` no-write
-    artifact convention), NOT `review-notes.md`, and explains the path is an inert
-    schema placeholder that no consumer reads. Mut (revert prose): the old
-    `review-notes.md` wording / missing placeholder clause fails these asserts."""
+    artifact convention), NOT `review-notes.md`. Mut (revert prose): the old
+    `review-notes.md` wording fails the placeholder asserts. The load-bearing
+    substance — the C1 `git diff` inspection directive, the read-only
+    (write-NO-files) contract, and the verdict-in-`notes_md` requirement — MUST
+    survive any prose trim of the explanatory rationale."""
     assert "review-noop.placeholder" in _REVIEW_TERMINAL_RULE
     assert "review-notes.md" not in _REVIEW_TERMINAL_RULE
-    assert "schema placeholder" in _REVIEW_TERMINAL_RULE
-    assert "no consumer reads it" in _REVIEW_TERMINAL_RULE
-    assert "verdict lives entirely in `notes_md`" in _REVIEW_TERMINAL_RULE
+    # Load-bearing: the C1 git-diff inspection directive (reviewer inspects the
+    # merged change set in its cwd) survives — removing it is a BLOCKER.
+    assert "git diff" in _REVIEW_TERMINAL_RULE
+    assert "merged into HEAD" in _REVIEW_TERMINAL_RULE
+    # Load-bearing: the read-only contract survives.
+    assert "write NO files" in _REVIEW_TERMINAL_RULE
+    # Load-bearing: the verdict/finding lines are routed to notes_md.
+    assert "verdict/finding lines in `notes_md`" in _REVIEW_TERMINAL_RULE
 
 
 # ── M8a-2c #3/#4 — self-contained commit + journal-survives-commit (e2e) ─────

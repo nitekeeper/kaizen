@@ -541,7 +541,11 @@ def phase_1_agenda(*, subject: str | None, cycle_n: int) -> str:
 
 
 def phase_2_preanalysis(
-    *, agenda_items: list[str], participant: str, codegraph_available: bool = False
+    *,
+    agenda_items: list[str],
+    participant: str,
+    codegraph_available: bool = False,
+    subagent_mode: bool = False,
 ) -> str:
     """Renders templates/phase_2_audit.md; see that file for the kwargs contract.
 
@@ -566,6 +570,25 @@ def phase_2_preanalysis(
     Default False keeps every existing caller valid under strict equality
     and the rendered body byte-identical to the pre-codegraph golden; True
     appends the code-nav-graph query-CLI guidance.
+
+    ``subagent_mode`` (default False) is a pure POST-render switch — it does
+    NOT enter the ``_render`` ctx, so it never participates in the strict
+    frontmatter ⇄ kwarg equality check. Phase 2 pre-analysis runs IN-PROSE
+    as fire-and-forget ``Agent`` dispatches (subagent mode) on BOTH the
+    default host transport AND the prose transport. In that mode there is
+    NO team, NO ``SendMessage(to="team-lead")``, and NO
+    ``TeamDelete``/shutdown handshake — so the F7 trailer
+    (:data:`TEAMMATE_REPLY_RULE`) that the rendered body ends with is dead
+    weight injected into every Phase-2 participant prompt. When
+    ``subagent_mode=True`` the trailing F7 trailer paragraph is cut, mirroring
+    the host engine's own strip of this exact trailer
+    (``host_executor._strip_f7_trailer``): locate the trailer via ``rfind``
+    on ``TEAMMATE_REPLY_RULE.strip()`` and cut from there to the end,
+    right-stripping trailing whitespace. The participant's task instructions,
+    the code-nav-graph guidance, and the untrusted-input boundary clause (all
+    of which precede the trailer) survive intact. Default False keeps the
+    rendered output BYTE-IDENTICAL to today; the strip is strictly OPT-IN.
+    Team mode keeps the trailer (real ``SendMessage``/``TeamDelete`` exist).
     """
     _require("agenda_items", agenda_items, list)
     _require("participant", participant, str)
@@ -594,6 +617,19 @@ def phase_2_preanalysis(
         # rendered body is byte-identical to the pre-codegraph golden.
         CODEGRAPH_AVAILABLE=codegraph_available,
     )
+    if subagent_mode:
+        # Mirror host_executor._strip_f7_trailer's F7-trailer branch exactly:
+        # rfind the byte-frozen trailer span and cut from there to the end,
+        # right-stripping trailing whitespace. The trailer is the rendered
+        # body's terminal paragraph (the .md ends with `{{ include: _trailer.md }}`),
+        # so everything above it — task instructions, codegraph guidance, and the
+        # untrusted-input boundary clause — survives. rfind (not find) matches the
+        # host helper and targets the trailing span even if the anchor prose were
+        # to appear earlier. -1 (absent) leaves the body untouched.
+        trailer = TEAMMATE_REPLY_RULE.strip()
+        t_idx = rendered.rfind(trailer)
+        if t_idx != -1:
+            rendered = rendered[:t_idx].rstrip()
     return rendered
 
 

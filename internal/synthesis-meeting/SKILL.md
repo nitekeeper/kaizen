@@ -44,15 +44,7 @@ When `outcome == "abandon"`, every agenda item was dropped — the caller (`inte
 
 ## Meeting Responsibilities
 
-The meeting has four responsibilities beyond reaching consensus:
-
-1. **Validate proposals** — catch false positives. A proposal may be based on stale documentation rather than actual code; on a misread API signature; on an assumption another agent can immediately refute. Example: in run 6 a dev-qa hard-stop was triggered by a proposal grounded in outdated docs — a mesh exchange between the architect and the QA agent would have caught it before implementation. Agents must verify each other's factual premises, not just their recommendations.
-
-2. **Detect ripple effects** — task A modifying a shared utility affects task B. The mesh phase surfaces these as explicit `depends_on` edges or as new Action Items when the effect is large enough.
-
-3. **Build the DAG** — Action Items are grouped into waves by topological level of the dependency graph. Wave 1 has no predecessors; Wave 2 depends only on Wave 1; and so on. This DAG drives Phase 4 parallel implementation.
-
-4. **Apply validation gates** before locking in (see below).
+The lead's responsibilities (broadcast proposals, run the mesh debate, write the Decisions Log + Action-Items DAG, and apply the validation gates) are defined operationally in the Steps below.
 
 ## Procedure
 
@@ -148,15 +140,12 @@ waves = result.waves  # use this for Phase 4 dispatch
 
 The helper raises `ValueError` ONLY for malformed Action Item shapes (missing required keys) — those are agent bugs to fix in the source, not DAG-validation failures. The 4 validation gates produce `DAGValidationError` subclasses collected into `result.errors`.
 
-The per-gate prose below is the contract the helper enforces:
+`validate_dag` enforces each gate and returns failures in `result.errors`; the per-gate **remediation** below is the load-bearing part (it is NOT in the helper's error strings):
 
-1. **DAG is acyclic** — perform a topological sort; if a cycle is detected, identify the cycle members and ask the relevant owners to break it (typically by splitting one Action Item or reversing a `depends_on` edge).
-
-2. **No file contention within a wave** — two Action Items in the same wave may not both appear in each other's `touches` for the same file. If contention is found, push the lower-priority item to the next wave by adding a `depends_on` edge.
-
-3. **All `Reads` are satisfiable** — every file listed in a `reads` field must either exist in the current codebase OR be produced by an earlier wave's Action Item. If a `reads` entry is unsatisfiable, the owning agent must either remove the dependency or add a new Action Item to produce the file.
-
-4. **No orphan dependencies** — every ID listed in a `depends_on` field must exist in the Action Items table. If an item depends on something nobody proposed, flag it and either add the missing item or remove the orphan edge.
+1. **Cycle** — split one Action Item or reverse a `depends_on` edge (ask the cycle members' owners).
+2. **File contention within a wave** — push the lower-priority item to the next wave by adding a `depends_on` edge.
+3. **Unsatisfiable `reads`** — the owning agent removes the dependency or adds a new Action Item to produce the file.
+4. **Orphan `depends_on`** — add the missing item or remove the orphan edge.
 
 ### Step 6 — Compute Outcome and Return
 

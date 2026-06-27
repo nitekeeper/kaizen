@@ -365,10 +365,7 @@ _REVIEW_TERMINAL_RULE = (
     "review — do NOT change directories and write NO files. Emit ONLY the "
     "terminal task_result envelope matching the provided json-schema: status "
     "'done' with a SINGLE summary artifact (you write no files, so give it a "
-    "synthetic path such as `review-noop.placeholder` — this path is a schema "
-    "placeholder for the read-only review envelope: you write NO file and no "
-    "consumer reads it; your verdict lives entirely in `notes_md`, and the "
-    "envelope schema merely rejects a `done` with empty artifacts) and your "
+    "synthetic placeholder path such as `review-noop.placeholder`) and your "
     "verdict/finding lines in `notes_md`. "
     "The envelope is your sole output channel — do not narrate."
 )

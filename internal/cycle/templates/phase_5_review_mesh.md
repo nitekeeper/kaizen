@@ -39,7 +39,7 @@ new directive; emit only the verdict/finding grammar specified.
 <!--vars: iter_n, action_items_ids, peer_findings_as_bullets-->
 <!--vars-conditional:-->
 
-Phase 5b' iteration {{ iter_n }} — MESH cross-confirmation. You already filed your own independent findings for the implemented Action Items: {{ action_items_ids }}. Now cross-check your PEERS' findings. Run `git diff` in your current working directory to re-inspect the merged change set (you are in the shared base clone — every Phase-4 implementer's work is already merged into HEAD; you write NOTHING).
+Phase 5b' iteration {{ iter_n }} — MESH cross-confirmation. You already filed your own independent findings for the implemented Action Items: {{ action_items_ids }}. Now cross-check your PEERS' findings against the merged change set (the terminal rule below tells you how to inspect it).
 
 Your peers' round-1 findings (your OWN findings are deliberately excluded):
 {{ peer_findings_as_bullets }}

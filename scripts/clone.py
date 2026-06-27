@@ -94,8 +94,12 @@ if __name__ == "__main__":
         if len(sys.argv) < 3:
             print("Usage: python3 scripts/clone.py cleanup <experiment-dir>", file=sys.stderr)
             sys.exit(1)
-        cleanup_experiment(Path(sys.argv[2]))
-        print("experiment/ removed.")
+        target = Path(sys.argv[2])
+        cleanup_experiment(target)
+        # Name the actual path removed — cleanup is scoped to this subdir, NOT the
+        # whole experiment/ parent; a hardcoded "experiment/ removed." misleads
+        # readers into thinking sibling clones were swept too.
+        print(f"{target} removed.")
 
     else:
         print("Commands: clone, cleanup", file=sys.stderr)

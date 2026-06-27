@@ -156,6 +156,40 @@ def _timeout_output(exc: subprocess.TimeoutExpired) -> str:
     return header + partial
 
 
+# Matches pytest's terminal SUMMARY line only. The summary grammar is a count
+# word (``5 passed``) followed — possibly via a ``, <more>`` chain — by the
+# timing tail ``in <number>s``; the trailing ``in \d`` anchor is what keeps
+# verbose per-test progress lines (``...::test_case_0 PASSED [ 0%]``) from
+# false-matching. ``no tests ran`` is the count-less summary variant.
+_PYTEST_SUMMARY_RE = re.compile(
+    r"\d+\s+(?:passed|failed|errors?|skipped|deselected|xfailed|xpassed|"
+    r"warnings?)\b.*\bin\s+\d|no tests ran",
+    re.IGNORECASE,
+)
+
+
+def _summarize_pass_output(text: str, tail_lines: int = 3) -> str:
+    """Reduce a GREEN pytest run's verbose output to its summary line(s).
+
+    On a passing gate the full ``stdout+stderr`` (up to ~115KB of per-test
+    progress) floods agent/engine context for no diagnostic value — only the
+    final summary (e.g. ``5 passed in 0.12s`` / ``7 passed, 1 warning in
+    0.34s`` / ``no tests ran in 0.01s``) is needed, and it is the line
+    :func:`parse_pytest_pass_count` consumes for the commit-message count.
+
+    Returns the matched pytest summary line(s) joined by newlines. If no
+    summary line is found (an unusual / non-pytest runner), falls back to the
+    last ``tail_lines`` non-empty lines (empty only if the runner produced no
+    output at all). This is a PASS-path-only trim — the FAIL path keeps the
+    full output verbatim so agents can diagnose the failure.
+    """
+    summary = [line.strip() for line in text.splitlines() if _PYTEST_SUMMARY_RE.search(line)]
+    if summary:
+        return "\n".join(summary)
+    nonempty = [line.strip() for line in text.splitlines() if line.strip()]
+    return "\n".join(nonempty[-tail_lines:])
+
+
 def parse_pytest_pass_count(output: str) -> int:
     """Parse the number of passed tests from captured pytest output.
 
@@ -458,10 +492,17 @@ def run_ci_checks(
                 check=False,
                 timeout=_TESTS_TIMEOUT_S,
             )
-            results["tests"] = _result(
-                PASS if proc.returncode == 0 else FAIL,
-                output=(proc.stdout or "") + (proc.stderr or ""),
-            )
+            full_output = (proc.stdout or "") + (proc.stderr or "")
+            if proc.returncode == 0:
+                # GREEN gate: retain only the pytest summary line(s) so a
+                # passing run does not flood agent/engine context with ~115KB
+                # of verbose per-test output. The FAIL path keeps everything.
+                results["tests"] = _result(
+                    PASS,
+                    output=_summarize_pass_output(full_output),
+                )
+            else:
+                results["tests"] = _result(FAIL, output=full_output)
         except subprocess.TimeoutExpired as exc:
             results["tests"] = _result(
                 FAIL,

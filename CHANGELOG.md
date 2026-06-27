@@ -9,6 +9,16 @@ All notable changes to Kaizen are recorded here.
 - Implementation plan (`docs/plan.md`) — 11-wave build order with parallel-eligible pairs marked.
 - Plugin scaffolding: `CLAUDE.md`, `requirements.txt`, `.claude-plugin/plugin.json`, `.gitignore` (with editor + OS metadata patterns).
 
+## v0.2.1 — 2026-06-27
+
+### Changed
+- **Token-usage reduction across the cycle workflow** (kaizen-on-kaizen run 2, PR #14). Three behavior-preserving cuts, measured before/after with the deterministic footprint signal:
+  - **Quiet the default Python test gate** — `detect_config.py` now emits `pytest -q --tb=short` instead of `-v`. A passing gate's captured output drops from ~115KB/~28.8k tokens to ~1.4KB/~354 tokens. Verdict stays returncode-based; `parse_pytest_pass_count` already handles the `-q` summary, and `--tb=short` preserves failure tracebacks.
+  - **Cap green-gate retained output** — `ci_runner.run_ci_checks` now retains only the pytest summary line(s) on a PASS (new `_summarize_pass_output` + `_PYTEST_SUMMARY_RE`), while FAIL keeps full output verbatim for diagnosis. ~69KB → 81 B (−99.9%), independent of the target's `-v`/`-q` config.
+  - **Remove the B1 terse/"caveman" per-spawn rule** — deleted `_TERSE_OUTPUT_RULE` + `_inject_terse_before_trailer` from `dispatch_templates.py` (and the now-dead anchor in `host_executor.py`), saving ~754 chars/~189 tokens per teammate spawn in prose/team mode. Mirrors atelier's removal of the same net-token-loss instruction; the F7 trailer renders byte-identically and the B2 `caveman_codec` digest path is unchanged.
+
+  Combined, a green test gate drops from ~28.8k tokens to ~20 tokens regardless of the target repo's config. Net −135 LOC; full suite green.
+
 ## v0.2.0 — 2026-06-26
 
 ### Added

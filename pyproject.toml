@@ -1,6 +1,6 @@
 [project]
 name = "kaizen"
-version = "0.2.0"
+version = "0.2.1"
 description = "Kaizen: multi-agent improvement plugin — runs Atelier's methodology against any git repository by URL."
 requires-python = ">=3.11"
 # Kaizen is stdlib-only at runtime (sqlite3, subprocess, pathlib, json,

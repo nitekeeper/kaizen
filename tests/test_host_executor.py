@@ -218,8 +218,6 @@ def test_briefing_strips_f7_trailer():
     assert '{"type":"shutdown_request"' not in body
     # The "Reply format" SendMessage paragraph is gone too (team-mode only).
     assert "IMPORTANT — Reply format:" not in body
-    # The terse-rule's "SendMessage / shutdown_response JSON" reference is gone.
-    assert "shutdown_response JSON protocol body" not in body
     # But the actual task body + untrusted-input boundary survive.
     assert "implement Action Item AI-1" in body
     assert "Untrusted-input boundary" in body
@@ -1313,7 +1311,7 @@ def test_mesh_iter2_carries_prior_survivors_forward():
 
 def test_pm_and_fix_briefing_closures_strip_f7_and_render():
     """The PM and fix briefing closures render the canonical templates, STRIP the
-    F7/terse/reply-format comms trailer (host workers have no SendMessage), and
+    F7/reply-format comms trailer (host workers have no SendMessage), and
     append the host terminal rule. Extends the closure-coverage contract to the
     mesh/PM/fix factories (spec §156). Mut: leaving the F7 trailer would instruct a
     host worker to use a primitive it does not have."""
@@ -1326,7 +1324,6 @@ def test_pm_and_fix_briefing_closures_strip_f7_and_render():
     assert "PM acceptance" in pm_body  # the PM template body survives
     assert "R1-0-1" in pm_body  # the blocker is rendered for the PM
     assert 'SendMessage(to="team-lead"' not in pm_body  # F7 stripped
-    assert "shutdown_response JSON protocol body" not in pm_body  # terse rule stripped
     assert "terminal task_result envelope" in pm_body  # host terminal rule appended
 
     fix_briefing = _make_fix_briefing_for(

@@ -33,7 +33,6 @@ from __future__ import annotations
 import pytest
 
 from scripts.dispatch_templates import (
-    _inject_terse_before_trailer,
     _render,
     phase_1_agenda,
     phase_2_preanalysis,
@@ -45,17 +44,6 @@ from scripts.dispatch_templates import (
     phase_5b_prime_reviewer,
 )
 from scripts.fix_loop import Finding
-
-# B1 — these high-volume reply-phase templates additionally have
-# ``_TERSE_OUTPUT_RULE`` injected before the F7 trailer by their wrapper. The
-# .md is still the single source of truth for the PHASE BODY; the terse rule is
-# a deterministic always-on wrapper-layer append (see
-# ``scripts.dispatch_templates._inject_terse_before_trailer``). The wiring test
-# below accounts for this by applying the same transform to the expected
-# ``_render`` output for these templates.
-_TERSE_INJECTED_TEMPLATES = frozenset(
-    {"phase_2_audit.md", "phase_4_implementation.md", "phase_5_review.md"}
-)
 
 _FINDING = Finding(
     finding_id="R1-1",
@@ -157,26 +145,16 @@ _WIRING_CASES = [
 )
 def test_render_equals_function_output(template_name, fn_call, render_kwargs):
     """The ``phase_*`` wrapper must produce byte-identical output to a
-    direct ``_render(<template_filename>, **kwargs)`` call — modulo the B1
-    always-on terse-output append for the high-volume reply phases.
+    direct ``_render(<template_filename>, **kwargs)`` call.
 
     This proves there is no second source of truth for the PHASE BODY — the
     wrapper genuinely routes through the loader rather than maintaining a
     parallel inline Python prose string. Any future drift between the
     wrapper's computed kwargs and the .md's declared vars will surface here
     loudly.
-
-    B1 exception: three templates (`phase_2_audit.md`, `phase_4_implementation.md`,
-    `phase_5_review.md`) additionally get `_TERSE_OUTPUT_RULE` spliced in
-    before the F7 trailer by a deterministic wrapper-layer transform. For
-    those, the expected output is `_inject_terse_before_trailer(_render(...))`
-    — the .md remains the single source for the body; the terse rule is a
-    well-defined append, not a parallel body.
     """
     fn_output = fn_call()
     render_output = _render(template_name, **render_kwargs)
-    if template_name in _TERSE_INJECTED_TEMPLATES:
-        render_output = _inject_terse_before_trailer(render_output)
     assert fn_output == render_output, (
         f"{template_name}: function output and _render output diverged. "
         "Either the wrapper is duplicating prose (parallel source of truth) "

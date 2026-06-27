@@ -269,3 +269,33 @@ class TestCLI:
         )
         assert result.returncode == 0
         assert not exp.exists()
+
+    def test_cleanup_cli_is_scoped_and_names_the_removed_path(self, tmp_path):
+        """cleanup removes ONLY the named subdir (parent + siblings survive) and the
+        CLI output names the actual path removed — not a hardcoded 'experiment/'.
+
+        Regression: the old hardcoded ``print("experiment/ removed.")`` implied the
+        whole experiment/ parent was deleted, which is false and misleading.
+        """
+        experiment = tmp_path / "experiment"
+        sub_a = experiment / "nitekeeper-target-a"
+        sub_b = experiment / "nitekeeper-target-b"
+        sub_a.mkdir(parents=True)
+        sub_b.mkdir(parents=True)
+        (sub_a / "f").write_text("a")
+        (sub_b / "f").write_text("b")
+
+        result = subprocess.run(
+            [sys.executable, str(Path.cwd() / "scripts" / "clone.py"), "cleanup", str(sub_a)],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONPATH": str(Path.cwd())},
+        )
+        assert result.returncode == 0, f"stderr: {result.stderr}"
+        # scoped: only the named subdir is gone; parent + sibling survive
+        assert not sub_a.exists()
+        assert sub_b.exists()
+        assert experiment.exists()
+        # the message names the actual path removed, never the misleading literal
+        assert str(sub_a) in result.stdout
+        assert result.stdout.strip() != "experiment/ removed."

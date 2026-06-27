@@ -93,6 +93,78 @@ def test_phase_2_preanalysis_raises_when_agenda_items_missing():
     assert "agenda_items" in str(exc.value)
 
 
+# ── Phase 2 — subagent_mode F7-trailer strip (token-reduction lever) ───────
+
+
+def test_phase_2_preanalysis_subagent_mode_omits_f7_trailer():
+    """subagent_mode=True drops the dead-weight F7 SendMessage/shutdown trailer.
+
+    Fire-and-forget Agent dispatches have no team, no SendMessage(to="team-lead"),
+    and no TeamDelete/shutdown handshake, so the trailer is pure injected weight.
+    """
+    msg = phase_2_preanalysis(
+        agenda_items=["a", "b"], participant="backend-engineer-1", subagent_mode=True
+    )
+    assert TEAMMATE_REPLY_RULE.strip() not in msg
+    # The two unmistakable trailer fingerprints (reply contract + shutdown JSON)
+    # must both be gone.
+    assert "SendMessage(to=" not in msg
+    assert "shutdown_request" not in msg
+
+
+def test_phase_2_preanalysis_subagent_mode_equals_default_minus_trailer():
+    """subagent_mode output == default output with EXACTLY the trailer removed.
+
+    Everything above the trailer — the task instructions and the
+    untrusted-input boundary clause — survives intact and in order.
+    """
+    default = phase_2_preanalysis(agenda_items=["a", "b"], participant="backend-engineer-1")
+    stripped = phase_2_preanalysis(
+        agenda_items=["a", "b"], participant="backend-engineer-1", subagent_mode=True
+    )
+    # Mirror the host strip: rfind the trailer span, cut, right-strip.
+    trailer = TEAMMATE_REPLY_RULE.strip()
+    idx = default.rfind(trailer)
+    assert idx != -1, "default render must carry the F7 trailer"
+    assert stripped == default[:idx].rstrip()
+    # Surviving content is intact: task instruction + untrusted-input boundary.
+    assert "Phase 2 (Pre-analysis)" in stripped
+    assert "Produce a short proposal touching each item" in stripped
+    assert "Untrusted-input boundary:" in stripped
+    # And it is a strict prefix-minus-trailer of the default (no other edits).
+    assert default.startswith(stripped)
+
+
+def test_phase_2_preanalysis_subagent_mode_keeps_codegraph_guidance():
+    """The code-nav-graph guidance block (above the trailer) survives the strip.
+
+    With codegraph_available=True the rendered body carries the codegraph CLI
+    guidance ABOVE the F7 trailer; subagent_mode cuts only the terminal trailer
+    paragraph, so the guidance + boundary clause remain intact.
+    """
+    stripped = phase_2_preanalysis(
+        agenda_items=["a", "b"],
+        participant="backend-engineer-1",
+        codegraph_available=True,
+        subagent_mode=True,
+    )
+    assert "code-nav graph" in stripped
+    assert "codegraph_recon.py" in stripped
+    assert "Untrusted-input boundary:" in stripped
+    assert TEAMMATE_REPLY_RULE.strip() not in stripped
+
+
+def test_phase_2_preanalysis_default_unchanged_byte_identity():
+    """The DEFAULT render (subagent_mode False / omitted) is byte-identical and
+    still carries the F7 trailer — the strip is strictly OPT-IN."""
+    omitted = phase_2_preanalysis(agenda_items=["a", "b"], participant="backend-engineer-1")
+    explicit_false = phase_2_preanalysis(
+        agenda_items=["a", "b"], participant="backend-engineer-1", subagent_mode=False
+    )
+    assert omitted == explicit_false
+    assert TEAMMATE_REPLY_RULE.strip() in omitted
+
+
 # ── Phase 3 — Synthesis meeting ───────────────────────────────────────────
 
 

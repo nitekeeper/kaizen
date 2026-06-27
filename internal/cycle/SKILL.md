@@ -123,6 +123,8 @@ Dispatch every participant in parallel (one agent per role from the resolved ros
 
 Collect every proposal before Phase 3 begins. Do not let one slow agent block the others — give each a bounded budget; if an agent fails to respond, drop them from this cycle's roster and note in the minutes.
 
+**Dispatch (subagent mode).** Phase 2 runs as fire-and-forget `Agent` dispatches — there is no team, no `SendMessage(to="team-lead")`, and no `TeamDelete`/shutdown handshake — so render each participant briefing with the F7 SendMessage/shutdown trailer OMITTED: call `phase_2_preanalysis(..., subagent_mode=True)`. Team mode keeps the trailer (real `SendMessage`/`TeamDelete` exist there), so call without the flag (or `subagent_mode=False`).
+
 The participants who complete Phase 2 carry through as teammates into Phase 3 — their pre-analysis context and skin-in-the-game ownership of their proposals are exactly what the synthesis meeting needs.
 
 ### Phase 3 — Synthesis meeting

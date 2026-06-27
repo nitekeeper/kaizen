@@ -9,6 +9,18 @@ All notable changes to Kaizen are recorded here.
 - Implementation plan (`docs/plan.md`) — 11-wave build order with parallel-eligible pairs marked.
 - Plugin scaffolding: `CLAUDE.md`, `requirements.txt`, `.claude-plugin/plugin.json`, `.gitignore` (with editor + OS metadata patterns).
 
+## v0.2.2 — 2026-06-27
+
+### Changed
+- **Token-footprint reduction across orchestrator context + per-spawn briefings** (kaizen-on-kaizen run 3, PR #16). Five behavior-preserving cuts, measured before/after with the deterministic static-footprint signal — the `skills/improve` footprint (what `kaizen:improve` injects into context) drops **25,011 → 20,700 tokens (−17.2%)**:
+  - **Extract the `KAIZEN_TRANSPORT=prose` opt-out procedure** — the prose Phase-4/5a/5b/5b'/5c block never executes on the default host path yet was read into orchestrator context every cycle. Moved verbatim out of `internal/cycle/SKILL.md` into a lazily-read `internal/cycle/prose-transport.md` (read only when `KAIZEN_TRANSPORT=prose`); the file's footprint falls 8,601 → 4,315 tokens. A short pointer routes prose-transport runs to it.
+  - **Mode-gate the F7 SendMessage/shutdown trailer** — `phase_2_preanalysis` gains an opt-in `subagent_mode` kwarg that strips the 1,850-char F7 trailer from fire-and-forget subagent dispatches (mirrors `host_executor._strip_f7_trailer`). Default output stays byte-identical (2,117 → 267 chars in subagent mode); team mode keeps the trailer.
+  - **Trim the host reviewer terminal rule** — `_REVIEW_TERMINAL_RULE` drops 811 → 596 chars (schema-placeholder rationale removed; the `git diff`, read-only, and verdict directives preserved) plus a mesh git-diff dedup.
+  - **Extract the Loom-comms procedure** — moved the F16 mandatory-when-available procedure body to a lazily-read `internal/cycle/loom-comms.md`, keeping the F16 statement, `detect`, and the `available:false` early-exit inline.
+  - **Trim resident SKILL.md prose** — collapsed `synthesis-meeting` overview/gate-definition restatements (keeping every remediation verb), replaced the `open-pr` body sample with a `render_pr_body` pointer, and dropped one duplicate `run` teardown guardrail.
+
+  Per-spawn (dynamic, invisible to the static footprint): −1,850 chars per Phase-2 participant, −215 chars per host review-spawn. Tests 1,178 → 1,182 (4 added, none weakened); ruff + ruff-format + bandit + CodeQL green. Zero behavior lost — every opt-out/procedure/trailer/directive preserved via lazily-read files or opt-in render paths.
+
 ## v0.2.1 — 2026-06-27
 
 ### Changed

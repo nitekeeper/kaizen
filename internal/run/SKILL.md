@@ -140,7 +140,7 @@ Read `internal/clone-target/SKILL.md` and follow its `teardown` operation with `
 
 This step runs AFTER teardown (Step 10) and is **informational only**. The poll's return value is printed for the user but does not control teardown, the run row, or any downstream behaviour. See `scripts/pr.py::wait_and_report_ci` for the failure-mode rationale (Safety hard-stop in kaizen#17 against conditional teardown).
 
-After teardown completes, poll `gh pr checks` to surface the CI outcome to the user. This step is informational only — it does NOT control teardown (which already happened in Step 10).
+After teardown completes, poll `gh pr checks` to surface the CI outcome to the user.
 
 ```python
 from scripts.pr import wait_and_report_ci
